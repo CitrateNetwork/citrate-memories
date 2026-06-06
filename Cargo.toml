@@ -1,0 +1,22 @@
+# citrate-memories — federated agent memory DAG ("git for agents").
+# v1 first-pass workspace. See PLANSET/ for the full design.
+[workspace]
+resolver = "2"
+members = [
+    "crates/mem-core",
+    "crates/mem-store",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Citrate Network / Citrate Inc."]
+repository = "https://github.com/CitrateNetwork/citrate-memories"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+hex = "0.4"
+thiserror = "1"
