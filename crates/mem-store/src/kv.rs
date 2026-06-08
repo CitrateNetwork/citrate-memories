@@ -120,9 +120,50 @@ impl KvStore for InMemoryKv {
     }
 }
 
+/// Shared contract every `KvStore` backend must satisfy. Called by both the
+/// in-memory tests here and the RocksDB tests, so the two backends are held to
+/// the identical contract.
+#[cfg(test)]
+pub(crate) fn run_conformance(kv: &dyn KvStore) {
+    // put / get / exists / delete
+    assert_eq!(kv.kv_get("cf", b"k").expect("get"), None);
+    kv.kv_put("cf", b"k", b"v").expect("put");
+    assert_eq!(kv.kv_get("cf", b"k").expect("get"), Some(b"v".to_vec()));
+    assert!(kv.kv_exists("cf", b"k").expect("exists"));
+    // overwrite in place
+    kv.kv_put("cf", b"k", b"v2").expect("overwrite");
+    assert_eq!(kv.kv_get("cf", b"k").expect("get"), Some(b"v2".to_vec()));
+    kv.kv_delete("cf", b"k").expect("delete");
+    assert!(!kv.kv_exists("cf", b"k").expect("exists"));
+
+    // iteration is key-sorted
+    kv.kv_put("it", b"b", b"2").expect("put");
+    kv.kv_put("it", b"a", b"1").expect("put");
+    kv.kv_put("it", b"c", b"3").expect("put");
+    let keys: Vec<_> = kv.kv_iter_cf("it").expect("iter").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+
+    // atomic batch: all puts land, the delete removes
+    kv.kv_put("ba", b"old", b"x").expect("put");
+    let ops = vec![
+        KvOp::Put { cf: "ba".into(), key: b"a".to_vec(), value: b"1".to_vec() },
+        KvOp::Put { cf: "ba".into(), key: b"b".to_vec(), value: b"2".to_vec() },
+        KvOp::Delete { cf: "ba".into(), key: b"old".to_vec() },
+    ];
+    kv.kv_write_batch(&ops).expect("batch");
+    assert_eq!(kv.kv_get("ba", b"a").expect("get"), Some(b"1".to_vec()));
+    assert_eq!(kv.kv_get("ba", b"b").expect("get"), Some(b"2".to_vec()));
+    assert_eq!(kv.kv_get("ba", b"old").expect("get"), None);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_memory_satisfies_kvstore_contract() {
+        run_conformance(&InMemoryKv::new());
+    }
 
     #[test]
     fn put_get_delete_exists() {

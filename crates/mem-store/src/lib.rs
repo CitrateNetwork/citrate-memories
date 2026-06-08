@@ -10,6 +10,8 @@
 //! merge (a later WP): re-adding the same node/edge is idempotent.
 
 pub mod kv;
+#[cfg(feature = "rocksdb")]
+pub mod rocks;
 
 use std::collections::{HashSet, VecDeque};
 
@@ -25,6 +27,9 @@ pub mod cf {
     pub const EDGES_OUT: &str = "mem_edges_out"; // key: from ‖ to ‖ kind
     pub const EDGES_IN: &str = "mem_edges_in"; // key: to ‖ from ‖ kind
 }
+
+/// Every column family a [`MemoryDagStore`] uses. Pass to `RocksKv::open`.
+pub const ALL_CFS: &[&str] = &[cf::NODES, cf::EDGES_OUT, cf::EDGES_IN];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -60,6 +65,14 @@ where
             kv,
             _node: std::marker::PhantomData,
         }
+    }
+
+    /// Open a durable RocksDB-backed store at `path`, wiring all required column
+    /// families. Requires the `rocksdb` feature.
+    #[cfg(feature = "rocksdb")]
+    pub fn open_rocksdb<P: AsRef<std::path::Path>>(path: P) -> Result<Self, StoreError> {
+        let kv = crate::rocks::RocksKv::open(path, ALL_CFS).map_err(StoreError::Backend)?;
+        Ok(Self::new(Box::new(kv)))
     }
 
     // ---- nodes ----

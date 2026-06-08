@@ -1,0 +1,12 @@
+[package]
+name = "mem-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "citrate-memories vector layer: embedders and model-version-guarded vector index."
+
+[dependencies]
+mem-core = { path = "../mem-core" }
+blake3.workspace = true

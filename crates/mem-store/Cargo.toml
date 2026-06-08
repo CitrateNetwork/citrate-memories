@@ -12,3 +12,10 @@ mem-core = { path = "../mem-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+rocksdb = { version = "0.22", optional = true, default-features = false, features = ["snappy"] }
+
+[features]
+default = []
+# Durable RocksDB backend (same KvStore trait). Off by default so the standard
+# `cargo test` stays fast and the in-memory backend is the test default.
+rocksdb = ["dep:rocksdb"]
