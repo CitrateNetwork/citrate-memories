@@ -19,6 +19,8 @@ thiserror.workspace = true
 default = []
 # Enables the persistent RocksDB-backed backfill example.
 rocksdb = ["mem-store/rocksdb"]
+# Enables the transformer-embedder (`bge`) backfill path (mem-index/transformer).
+transformer = ["mem-index/transformer"]
 
 [[example]]
 name = "backfill"

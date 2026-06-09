@@ -6,8 +6,31 @@
 //!   cargo run -p mem-query --example query --features rocksdb -- <DB> <REPO> neighbors <ID_PREFIX> [N]
 
 use mem_core::MemoryNode;
-use mem_query::{Recall, RecallItem, RecallResult};
+use mem_query::{detect_embedding_model, Recall, RecallItem, RecallResult};
 use mem_store::MemoryDagStore;
+
+/// Build a `Recall` whose query embedder matches the model the tenant's nodes were
+/// embedded with (read off the stored vectors). The hashing baseline is the
+/// fallback; a bge-embedded tenant needs the transformer feature to be queried.
+fn recall_for<'a>(store: &'a MemoryDagStore<MemoryNode>, repo: &str) -> Recall<'a> {
+    match detect_embedding_model(store, repo).ok().flatten() {
+        #[cfg(feature = "transformer")]
+        Some(m) if m == mem_index::transformer::DEFAULT_MODEL_ID => {
+            eprintln!("tenant embedded with '{m}' — loading matching transformer embedder…");
+            let e = mem_index::TransformerEmbedder::bge_base().expect("load bge-base");
+            Recall::with_embedder(store, Box::new(e))
+        }
+        #[cfg(not(feature = "transformer"))]
+        Some(m) if m.starts_with("bge") => {
+            eprintln!(
+                "tenant embedded with '{m}', but this binary lacks the transformer feature — \
+                 search will mismatch. Rebuild with `--features rocksdb,transformer`."
+            );
+            Recall::new(store)
+        }
+        _ => Recall::new(store),
+    }
+}
 
 fn truncate(s: &str, n: usize) -> String {
     let one_line = s.replace('\n', " ");
@@ -58,7 +81,7 @@ fn main() {
     let (db, repo, cmd) = (&args[0], &args[1], args[2].as_str());
 
     let store = MemoryDagStore::<MemoryNode>::open_rocksdb(db).expect("open rocksdb store");
-    let recall = Recall::new(&store);
+    let recall = recall_for(&store, repo);
 
     match cmd {
         "storyline" => {

@@ -3,8 +3,14 @@
 //! node's `repo` field); per-tenant store isolation is a later refinement.
 //!
 //! Usage:
-//!   cargo run -p mem-ingest --example backfill --features rocksdb -- [WORKSPACE] [DB_PATH]
-//!   (defaults: WORKSPACE=.. , DB_PATH=./data/federation.memdag)
+//!   cargo run -p mem-ingest --example backfill --features rocksdb -- [WORKSPACE] [DB_PATH] [EMBEDDER]
+//!   (defaults: WORKSPACE=.. , DB_PATH=./data/federation.memdag , EMBEDDER=hashing)
+//!
+//! EMBEDDER is `hashing` (default, dependency-free) or `bge` (the bge-base-en-v1.5
+//! transformer, requires `--features rocksdb,transformer`). Use a DISTINCT DB path
+//! per embedder — vectors from different models must not share a store (the index's
+//! model-version guard would reject cross-space queries). One model is loaded once
+//! and shared across all tenants.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -17,10 +23,52 @@ fn is_git_repo(p: &Path) -> bool {
     p.join(".git").exists()
 }
 
+/// Build the per-tenant ingestor for the chosen embedder. With `bge`, every tenant
+/// shares one `Arc`-wrapped transformer model (loaded once by the caller).
+fn make_ingestor(name: String, embedder: &Embedder) -> Ingestor {
+    match embedder {
+        Embedder::Hashing => Ingestor::new(name),
+        #[cfg(feature = "transformer")]
+        Embedder::Bge(model) => Ingestor::with_embedder(name, Box::new(model.clone())),
+    }
+}
+
+/// The selected embedder, holding the shared model for `bge`.
+enum Embedder {
+    Hashing,
+    #[cfg(feature = "transformer")]
+    Bge(std::sync::Arc<mem_index::TransformerEmbedder>),
+}
+
+fn select_embedder(which: &str) -> Embedder {
+    match which {
+        "hashing" => Embedder::Hashing,
+        "bge" => {
+            #[cfg(feature = "transformer")]
+            {
+                eprintln!("loading bge-base-en-v1.5 (first run downloads ~440MB)…");
+                let model = mem_index::TransformerEmbedder::bge_base().expect("load bge-base");
+                Embedder::Bge(std::sync::Arc::new(model))
+            }
+            #[cfg(not(feature = "transformer"))]
+            {
+                eprintln!("embedder 'bge' requires --features transformer; rebuild with \
+                    `--features rocksdb,transformer`");
+                std::process::exit(2);
+            }
+        }
+        other => {
+            eprintln!("unknown embedder '{other}' (hashing|bge)");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let workspace = args.next().unwrap_or_else(|| "..".to_string());
     let db_path = args.next().unwrap_or_else(|| "./data/federation.memdag".to_string());
+    let which = args.next().unwrap_or_else(|| "hashing".to_string());
 
     if let Some(parent) = Path::new(&db_path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -36,8 +84,9 @@ fn main() {
     }
     repos.sort();
 
+    let embedder = select_embedder(&which);
     let store = MemoryDagStore::<MemoryNode>::open_rocksdb(&db_path).expect("open rocksdb store");
-    println!("backfilling {} repos -> {}\n", repos.len(), db_path);
+    println!("backfilling {} repos -> {} (embedder: {which})\n", repos.len(), db_path);
 
     let started = Instant::now();
     let mut ok = 0usize;
@@ -46,7 +95,7 @@ fn main() {
 
     for repo in &repos {
         let name = repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let ingestor = Ingestor::new(name.clone());
+        let ingestor = make_ingestor(name.clone(), &embedder);
         match ingestor.ingest(repo, &store) {
             Ok(r) => {
                 println!("  {name:<34} {:>6} commits  {:>4} docs", r.commits, r.docs);

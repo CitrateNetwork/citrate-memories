@@ -16,6 +16,8 @@ mem-ingest = { path = "../mem-ingest" }
 [features]
 default = []
 rocksdb = ["mem-store/rocksdb"]
+# Enables querying a bge-embedded graph (auto-detected by the query example).
+transformer = ["mem-index/transformer"]
 
 [[example]]
 name = "query"

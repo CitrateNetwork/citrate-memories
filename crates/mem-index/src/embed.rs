@@ -51,6 +51,21 @@ pub trait Embedder {
     fn embed(&self, text: &str) -> Result<VersionedVector, EmbedError>;
 }
 
+/// Share one embedder (e.g. a loaded transformer model) across many owners without
+/// reloading it — `Arc<dyn Embedder>` is itself an `Embedder`. Lets a batch job
+/// hand each per-tenant ingestor a cheap clone of the same model.
+impl<E: Embedder + ?Sized> Embedder for std::sync::Arc<E> {
+    fn model_id(&self) -> &str {
+        (**self).model_id()
+    }
+    fn dim(&self) -> usize {
+        (**self).dim()
+    }
+    fn embed(&self, text: &str) -> Result<VersionedVector, EmbedError> {
+        (**self).embed(text)
+    }
+}
+
 /// Deterministic feature-hashing embedder. Tokens are hashed into a fixed-width
 /// vector with signed accumulation, then L2-normalised so dot product equals
 /// cosine similarity.

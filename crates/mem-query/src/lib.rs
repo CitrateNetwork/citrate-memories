@@ -79,17 +79,41 @@ fn is_reference(n: &MemoryNode) -> bool {
     matches!(&n.source_ref, SourceRef::DagNative { key } if key.starts_with("ref:"))
 }
 
+/// The embedding model id a tenant's nodes were built with (the first embedded
+/// node wins). Lets a caller pick a matching query embedder so the index's
+/// model-version guard lines up instead of silently rejecting every query.
+pub fn detect_embedding_model(
+    store: &MemoryDagStore<MemoryNode>,
+    repo: &str,
+) -> Result<Option<String>, StoreError> {
+    Ok(store
+        .all_nodes()?
+        .into_iter()
+        .find(|n| n.repo == repo && n.embedding.is_some())
+        .and_then(|n| n.embedding.map(|v| v.model)))
+}
+
 pub struct Recall<'a> {
     store: &'a MemoryDagStore<MemoryNode>,
-    embedder: HashingEmbedder,
+    embedder: Box<dyn Embedder>,
 }
 
 impl<'a> Recall<'a> {
+    /// Default recall: the dependency-free hashing embedder. `search` only works if
+    /// the tenant's nodes were embedded with the same model (the index guard
+    /// rejects a mismatch), so use [`with_embedder`](Recall::with_embedder) to match
+    /// a transformer-embedded graph.
     pub fn new(store: &'a MemoryDagStore<MemoryNode>) -> Self {
         Self {
             store,
-            embedder: HashingEmbedder::new(EMBED_DIM),
+            embedder: Box::new(HashingEmbedder::new(EMBED_DIM)),
         }
+    }
+
+    /// Recall whose query embedder is explicit — must match the model the tenant's
+    /// nodes were embedded with, or `search`'s vector-space guard rejects the query.
+    pub fn with_embedder(store: &'a MemoryDagStore<MemoryNode>, embedder: Box<dyn Embedder>) -> Self {
+        Self { store, embedder }
     }
 
     /// All non-reference nodes for a tenant repo.
