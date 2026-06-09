@@ -8,6 +8,8 @@ members = [
     "crates/mem-index",
     "crates/mem-ingest",
     "crates/mem-query",
+    "crates/mem-authz",
+    "crates/mem-mcp",
 ]
 
 [workspace.package]
