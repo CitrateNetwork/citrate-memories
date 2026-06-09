@@ -223,6 +223,10 @@ fn doc_node(
 ) -> MemoryNode {
     let preview: String = body.chars().take(512).collect();
     let embed_text = format!("{title}\n{preview}");
+    // Bitemporal `valid_from` = the doc's authored date (frontmatter `created:`),
+    // so it lands in the storyline at its real time rather than clustering at
+    // ingest time (finding F-3). Falls back to ingest time when no date is present.
+    let valid_from = frontmatter::created_ms(fm).unwrap_or(now_ms);
     MemoryNode {
         schema_version: SCHEMA_VERSION,
         plane: Plane::Derived,
@@ -239,7 +243,7 @@ fn doc_node(
             byte_end: file_len as u64,
         },
         content: title.as_bytes().to_vec(),
-        valid_from: now_ms,
+        valid_from,
         valid_to: None,
         observed_at: now_ms,
         trust_tier: TrustTier::DerivedDeterministic,
