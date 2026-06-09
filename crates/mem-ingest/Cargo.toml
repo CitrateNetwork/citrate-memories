@@ -14,3 +14,12 @@ mem-index = { path = "../mem-index" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[features]
+default = []
+# Enables the persistent RocksDB-backed backfill example.
+rocksdb = ["mem-store/rocksdb"]
+
+[[example]]
+name = "backfill"
+required-features = ["rocksdb"]

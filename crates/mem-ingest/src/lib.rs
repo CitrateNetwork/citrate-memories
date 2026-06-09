@@ -30,8 +30,12 @@ use mem_store::{MemoryDagStore, StoreError};
 
 use git::CommitRecord;
 
-const WATERMARK_KEY: &[u8] = b"derived_watermark";
 const EMBED_DIM: usize = 256;
+
+/// Freshness watermark is keyed per-repo: one store holds many tenant repos.
+fn watermark_key(repo: &str) -> Vec<u8> {
+    format!("derived_watermark:{repo}").into_bytes()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
@@ -328,7 +332,7 @@ impl Ingestor {
             ingested_at_ms: now,
         };
         let bytes = serde_json::to_vec(&watermark).map_err(|e| IngestError::Serde(e.to_string()))?;
-        store.put_meta(WATERMARK_KEY, &bytes)?;
+        store.put_meta(&watermark_key(&self.repo_name), &bytes)?;
 
         Ok(IngestReport {
             commits: recs.len(),
@@ -344,7 +348,7 @@ impl Ingestor {
         &self,
         store: &MemoryDagStore<MemoryNode>,
     ) -> Result<Option<Watermark>, IngestError> {
-        match store.get_meta(WATERMARK_KEY)? {
+        match store.get_meta(&watermark_key(&self.repo_name))? {
             None => Ok(None),
             Some(bytes) => {
                 let wm = serde_json::from_slice(&bytes).map_err(|e| IngestError::Serde(e.to_string()))?;
@@ -447,7 +451,7 @@ mod tests {
         assert!(ing.read_watermark(&store).unwrap().is_none());
         // simulate an ingest's watermark write via the store directly
         let wm = Watermark { repo: "r".into(), head: Some("aaa".into()), head_count: 1, ingested_at_ms: 7 };
-        store.put_meta(WATERMARK_KEY, &serde_json::to_vec(&wm).unwrap()).unwrap();
+        store.put_meta(&watermark_key("r"), &serde_json::to_vec(&wm).unwrap()).unwrap();
         assert_eq!(ing.read_watermark(&store).unwrap(), Some(wm));
     }
 }
