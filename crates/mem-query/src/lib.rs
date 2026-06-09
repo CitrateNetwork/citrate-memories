@@ -93,6 +93,19 @@ pub fn detect_embedding_model(
         .and_then(|n| n.embedding.map(|v| v.model)))
 }
 
+/// Store-wide variant of [`detect_embedding_model`]: the embedding model of the
+/// first embedded node in any tenant. A federation backfill embeds every tenant
+/// with one model, so this is enough for a server to pick its query embedder once
+/// at startup.
+pub fn detect_store_embedding_model(
+    store: &MemoryDagStore<MemoryNode>,
+) -> Result<Option<String>, StoreError> {
+    Ok(store
+        .all_nodes()?
+        .into_iter()
+        .find_map(|n| n.embedding.map(|v| v.model)))
+}
+
 pub struct Recall<'a> {
     store: &'a MemoryDagStore<MemoryNode>,
     embedder: Box<dyn Embedder>,

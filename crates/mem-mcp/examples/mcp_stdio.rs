@@ -4,6 +4,10 @@
 //! Usage (in an MCP client config): run this binary with the DB path as arg.
 //!   cargo run -p mem-mcp --example mcp_stdio --features rocksdb -- ./data/federation.memdag
 //!
+//! For a bge-embedded graph, build with `--features rocksdb,transformer`: the
+//! server detects the store's embedding model at startup and loads the matching
+//! transformer embedder so `memory.search` ranks in the right vector space.
+//!
 //! The grant here is a demo wildcard read grant. In production the server loads a
 //! real signed CapabilityGrant (issued via citrate-identity SIWE) per session.
 
@@ -36,6 +40,24 @@ fn main() {
     // Session signing identity for assertions.
     let asserter = Asserter::new(SigningKey::from_bytes(&[2u8; 32]));
     let mut server = MemoryMcpServer::new_with_asserter(&store, grant, asserter);
+
+    // If the store was embedded with a transformer model, load the matching query
+    // embedder so memory.search ranks in the same vector space (else the index
+    // guard would reject every query). The hashing baseline needs no setup.
+    #[cfg(feature = "transformer")]
+    if let Ok(Some(model)) = mem_query::detect_store_embedding_model(&store) {
+        if model == mem_index::transformer::DEFAULT_MODEL_ID {
+            eprintln!("mcp_stdio: store embedded with '{model}', loading transformer embedder…");
+            match mem_index::TransformerEmbedder::bge_base() {
+                Ok(e) => server = server.with_query_embedder(std::sync::Arc::new(e)),
+                Err(e) => {
+                    eprintln!("mcp_stdio: failed to load embedder: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     if let Err(e) = serve_stdio(&mut server) {
         eprintln!("mcp_stdio: {e}");
         std::process::exit(1);

@@ -1578,6 +1578,7 @@ dependencies = [
  "mem-assert",
  "mem-authz",
  "mem-core",
+ "mem-index",
  "mem-query",
  "mem-store",
  "serde_json",

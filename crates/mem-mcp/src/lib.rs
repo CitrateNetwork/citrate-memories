@@ -13,9 +13,12 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use std::sync::Arc;
+
 use mem_assert::{apply_diff, Asserter, MemoryDiff};
 use mem_authz::{AuditChain, CapabilityGrant, MemoryEvent, Op};
 use mem_core::{ClaimStatus, MemoryNode, NodeKind};
+use mem_index::Embedder;
 use mem_query::{Direction, Recall, RecallResult};
 use mem_store::MemoryDagStore;
 
@@ -36,6 +39,11 @@ pub struct MemoryMcpServer<'a> {
     grant: CapabilityGrant,
     /// The session agent's signing identity. `None` → read-only (assert tools error).
     asserter: Option<Asserter>,
+    /// Query embedder for `memory.search`, loaded once and shared. `None` → the
+    /// hashing baseline; set to the model the store was embedded with (via
+    /// [`with_query_embedder`](MemoryMcpServer::with_query_embedder)) so the index's
+    /// model-version guard lines up instead of rejecting every search.
+    query_embedder: Option<Arc<dyn Embedder>>,
     audit: AuditChain,
 }
 
@@ -46,6 +54,7 @@ impl<'a> MemoryMcpServer<'a> {
             store,
             grant,
             asserter: None,
+            query_embedder: None,
             audit: AuditChain::new(),
         }
     }
@@ -60,8 +69,16 @@ impl<'a> MemoryMcpServer<'a> {
             store,
             grant,
             asserter: Some(asserter),
+            query_embedder: None,
             audit: AuditChain::new(),
         }
+    }
+
+    /// Use `embedder` for `memory.search` (must match the model the store was
+    /// embedded with). Load it once and share it for the whole session.
+    pub fn with_query_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.query_embedder = Some(embedder);
+        self
     }
 
     pub fn audit(&self) -> &AuditChain {
@@ -165,7 +182,11 @@ impl<'a> MemoryMcpServer<'a> {
         if let Err(deny) = self.authorize_read(&repo, &format!("memory.search {query:?}")) {
             return Ok(deny);
         }
-        let result = Recall::new(self.store).search(&repo, &query, budget).map_err(store_err)?;
+        let recall = match &self.query_embedder {
+            Some(e) => Recall::with_embedder(self.store, Box::new(Arc::clone(e))),
+            None => Recall::new(self.store),
+        };
+        let result = recall.search(&repo, &query, budget).map_err(store_err)?;
         Ok(tool_text(render_result(&result)))
     }
 

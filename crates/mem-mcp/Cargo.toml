@@ -10,6 +10,7 @@ description = "citrate-memories MCP server: JSON-RPC tools over the read path, a
 [dependencies]
 mem-core = { path = "../mem-core" }
 mem-store = { path = "../mem-store" }
+mem-index = { path = "../mem-index" }
 mem-query = { path = "../mem-query" }
 mem-authz = { path = "../mem-authz" }
 mem-assert = { path = "../mem-assert" }
@@ -19,6 +20,8 @@ ed25519-dalek = "2"
 [features]
 default = []
 rocksdb = ["mem-store/rocksdb"]
+# Lets the stdio server query a bge-embedded graph (auto-detected at startup).
+transformer = ["mem-query/transformer"]
 
 [[example]]
 name = "mcp_demo"
