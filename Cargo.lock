@@ -259,6 +259,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mem-ingest"
+version = "0.0.1"
+dependencies = [
+ "mem-core",
+ "mem-index",
+ "mem-store",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "mem-store"
 version = "0.0.1"
 dependencies = [

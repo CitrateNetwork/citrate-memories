@@ -26,10 +26,11 @@ pub mod cf {
     pub const NODES: &str = "mem_nodes";
     pub const EDGES_OUT: &str = "mem_edges_out"; // key: from ‖ to ‖ kind
     pub const EDGES_IN: &str = "mem_edges_in"; // key: to ‖ from ‖ kind
+    pub const META: &str = "mem_meta"; // small operational state: cursor, freshness watermark
 }
 
 /// Every column family a [`MemoryDagStore`] uses. Pass to `RocksKv::open`.
-pub const ALL_CFS: &[&str] = &[cf::NODES, cf::EDGES_OUT, cf::EDGES_IN];
+pub const ALL_CFS: &[&str] = &[cf::NODES, cf::EDGES_OUT, cf::EDGES_IN, cf::META];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -105,6 +106,31 @@ where
 
     pub fn node_count(&self) -> Result<usize, StoreError> {
         Ok(self.kv.kv_iter_cf(cf::NODES).map_err(StoreError::Backend)?.len())
+    }
+
+    pub fn edge_count(&self) -> Result<usize, StoreError> {
+        Ok(self.kv.kv_iter_cf(cf::EDGES_OUT).map_err(StoreError::Backend)?.len())
+    }
+
+    /// Deserialize every node. Linear scan — fine for CLI/report use; recall uses
+    /// targeted queries instead.
+    pub fn all_nodes(&self) -> Result<Vec<N>, StoreError> {
+        let mut out = Vec::new();
+        for (_k, v) in self.kv.kv_iter_cf(cf::NODES).map_err(StoreError::Backend)? {
+            out.push(serde_json::from_slice(&v).map_err(|e| StoreError::Serde(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    // ---- operational meta (cursor, freshness watermark) ----
+
+    /// Store a small operational value (not part of the graph).
+    pub fn put_meta(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.kv.kv_put(cf::META, key, value).map_err(StoreError::Backend)
+    }
+
+    pub fn get_meta(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.kv.kv_get(cf::META, key).map_err(StoreError::Backend)
     }
 
     // ---- edges ----

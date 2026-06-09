@@ -6,6 +6,7 @@ members = [
     "crates/mem-core",
     "crates/mem-store",
     "crates/mem-index",
+    "crates/mem-ingest",
 ]
 
 [workspace.package]

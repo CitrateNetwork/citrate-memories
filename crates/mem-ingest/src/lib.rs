@@ -1,0 +1,357 @@
+//! `mem-ingest` — Derived-plane ingestion (MEM-S1 / WP-1.2).
+//!
+//! Turns a repo's git history into memory nodes and edges, deterministically:
+//! commits become `Commit` nodes (identity = repo + sha + subject), parent links
+//! become `TemporalNext`/`MergeParent` edges, and `Agentile-*` commit trailers
+//! become load-bearing relationship edges. A freshness watermark is stored so
+//! every later recall can report how far behind HEAD the index is.
+//!
+//! Everything here is the Derived plane: a pure function of git state, so two
+//! machines ingest to byte-identical node ids (the core invariant). Nothing here
+//! ever calls a model or writes a non-deterministic edge.
+
+pub mod git;
+pub mod trailers;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use mem_core::{
+    BelnapValue, ContentHash, Edge, EdgeKind, EdgeMethod, EdgeProvenance, MemoryNode, NodeKind,
+    Plane, SourceRef, Status, TrustTier, SCHEMA_VERSION,
+};
+use mem_index::{Embedder, HashingEmbedder};
+use mem_store::{MemoryDagStore, StoreError};
+
+use git::CommitRecord;
+
+const WATERMARK_KEY: &[u8] = b"derived_watermark";
+const EMBED_DIM: usize = 256;
+
+#[derive(Debug, thiserror::Error)]
+pub enum IngestError {
+    #[error("git error: {0}")]
+    Git(String),
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+    #[error("serialization error: {0}")]
+    Serde(String),
+}
+
+/// Records how current the Derived index is for a repo. Stamped on every ingest;
+/// read back to compute "N commits behind HEAD" on recall.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watermark {
+    pub repo: String,
+    pub head: Option<String>,
+    pub head_count: usize,
+    pub ingested_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IngestReport {
+    pub commits: usize,
+    pub nodes_in_store: usize,
+    pub edges_in_store: usize,
+    pub watermark: Watermark,
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn commit_node(repo: &str, rec: &CommitRecord, now_ms: u64, embedder: &dyn Embedder) -> MemoryNode {
+    let embed_text = format!("{}\n{}", rec.subject, rec.body);
+    MemoryNode {
+        schema_version: SCHEMA_VERSION,
+        plane: Plane::Derived,
+        kind: NodeKind::Commit,
+        repo: repo.to_string(),
+        author: rec.author.clone(),
+        // sha lives in source_ref → identity is stable; subject is the canonical content.
+        source_ref: SourceRef::GitCommit {
+            repo: repo.to_string(),
+            sha: rec.sha.clone(),
+        },
+        content: rec.subject.as_bytes().to_vec(),
+        valid_from: (rec.time_secs.max(0) as u64).saturating_mul(1000),
+        valid_to: None,
+        observed_at: now_ms,
+        trust_tier: TrustTier::DerivedDeterministic,
+        signature: None,
+        embedding: Some(embedder.embed(&embed_text)),
+        confidence: vec![BelnapValue::True], // a commit's existence is a known-true fact
+        anchors: vec![],
+        status: Status::Active,
+    }
+}
+
+/// Best-effort kind for an unresolved trailer target (resolution/unification with
+/// the real node happens in a later WP).
+fn ref_kind(slug: &str) -> NodeKind {
+    if slug.to_ascii_lowercase().starts_with("adr") {
+        NodeKind::Adr
+    } else {
+        NodeKind::WorkPackage
+    }
+}
+
+fn ref_node(repo: &str, slug: &str, now_ms: u64) -> MemoryNode {
+    MemoryNode {
+        schema_version: SCHEMA_VERSION,
+        plane: Plane::Derived,
+        kind: ref_kind(slug),
+        repo: repo.to_string(),
+        author: "ingest".to_string(),
+        source_ref: SourceRef::DagNative {
+            key: format!("ref:{slug}"),
+        },
+        content: slug.as_bytes().to_vec(),
+        valid_from: now_ms,
+        valid_to: None,
+        observed_at: now_ms,
+        trust_tier: TrustTier::DerivedDeterministic,
+        signature: None,
+        embedding: None,
+        confidence: vec![],
+        anchors: vec![],
+        status: Status::Active,
+    }
+}
+
+fn make_edge(
+    from: ContentHash,
+    to: ContentHash,
+    kind: EdgeKind,
+    method: EdgeMethod,
+    now_ms: u64,
+    evidence: Option<String>,
+) -> Edge {
+    Edge {
+        from,
+        to,
+        kind,
+        plane: Plane::Derived,
+        trust_tier: TrustTier::DerivedDeterministic,
+        provenance: EdgeProvenance {
+            method,
+            asserter: "ingest".to_string(),
+            at: now_ms,
+            evidence,
+        },
+        confidence: vec![BelnapValue::True],
+        quarantined: false, // deterministic, load-bearing
+        signature: None,
+    }
+}
+
+/// Pure core: commits -> (nodes, edges). Deterministic given the same inputs
+/// (modulo `now_ms`, which only lands on non-identity fields). Exposed so it can
+/// be tested without a git repo.
+pub fn build_graph(
+    repo: &str,
+    recs: &[CommitRecord],
+    now_ms: u64,
+    embedder: &dyn Embedder,
+) -> (Vec<MemoryNode>, Vec<Edge>) {
+    let mut sha_to_id: HashMap<String, ContentHash> = HashMap::new();
+    let mut ref_ids: HashMap<String, ContentHash> = HashMap::new();
+    let mut nodes: Vec<MemoryNode> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::new();
+
+    for rec in recs {
+        let node = commit_node(repo, rec, now_ms, embedder);
+        let id = node.compute_id();
+        sha_to_id.insert(rec.sha.clone(), id);
+        nodes.push(node);
+
+        // Parent links: first parent is the spine (TemporalNext), the rest are merges.
+        for (i, parent) in rec.parents.iter().enumerate() {
+            if let Some(pid) = sha_to_id.get(parent).copied() {
+                let kind = if i == 0 {
+                    EdgeKind::TemporalNext
+                } else {
+                    EdgeKind::MergeParent
+                };
+                edges.push(make_edge(id, pid, kind, EdgeMethod::Ingest, now_ms, Some(parent.clone())));
+            }
+        }
+
+        // Load-bearing trailer edges.
+        for t in trailers::parse_trailers(&rec.body) {
+            if let Some(ek) = trailers::map_trailer(&t.key) {
+                let rid = *ref_ids.entry(t.value.clone()).or_insert_with(|| {
+                    let rn = ref_node(repo, &t.value, now_ms);
+                    let rid = rn.compute_id();
+                    nodes.push(rn);
+                    rid
+                });
+                edges.push(make_edge(id, rid, ek, EdgeMethod::Trailer, now_ms, Some(t.key.clone())));
+            }
+        }
+    }
+
+    (nodes, edges)
+}
+
+/// Drives Derived-plane ingestion for one repo.
+pub struct Ingestor {
+    repo_name: String,
+    embedder: HashingEmbedder,
+}
+
+impl Ingestor {
+    pub fn new(repo_name: impl Into<String>) -> Self {
+        Self {
+            repo_name: repo_name.into(),
+            embedder: HashingEmbedder::new(EMBED_DIM),
+        }
+    }
+
+    /// Ingest the full git history at `repo_path` into `store`. Idempotent:
+    /// content-addressed nodes/edges dedupe, so re-running is a no-op on counts.
+    pub fn ingest(
+        &self,
+        repo_path: &Path,
+        store: &MemoryDagStore<MemoryNode>,
+    ) -> Result<IngestReport, IngestError> {
+        let recs = git::read_commits(repo_path)?;
+        let now = now_millis();
+        let (nodes, edges) = build_graph(&self.repo_name, &recs, now, &self.embedder);
+        store.commit(&nodes, &edges)?;
+
+        let watermark = Watermark {
+            repo: self.repo_name.clone(),
+            head: recs.last().map(|r| r.sha.clone()),
+            head_count: recs.len(),
+            ingested_at_ms: now,
+        };
+        let bytes = serde_json::to_vec(&watermark).map_err(|e| IngestError::Serde(e.to_string()))?;
+        store.put_meta(WATERMARK_KEY, &bytes)?;
+
+        Ok(IngestReport {
+            commits: recs.len(),
+            nodes_in_store: store.node_count()?,
+            edges_in_store: store.edge_count()?,
+            watermark,
+        })
+    }
+
+    /// Read back the freshness watermark (None if never ingested).
+    pub fn read_watermark(
+        &self,
+        store: &MemoryDagStore<MemoryNode>,
+    ) -> Result<Option<Watermark>, IngestError> {
+        match store.get_meta(WATERMARK_KEY)? {
+            None => Ok(None),
+            Some(bytes) => {
+                let wm = serde_json::from_slice(&bytes).map_err(|e| IngestError::Serde(e.to_string()))?;
+                Ok(Some(wm))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mem_store::kv::InMemoryKv;
+
+    fn rec(sha: &str, parents: &[&str], subject: &str, body: &str) -> CommitRecord {
+        CommitRecord {
+            sha: sha.into(),
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+            author: "tester".into(),
+            time_secs: 1_000,
+            subject: subject.into(),
+            body: body.into(),
+        }
+    }
+
+    fn embedder() -> HashingEmbedder {
+        HashingEmbedder::new(EMBED_DIM)
+    }
+
+    #[test]
+    fn linear_history_builds_temporal_spine() {
+        let recs = vec![
+            rec("aaa", &[], "first", ""),
+            rec("bbb", &["aaa"], "second", ""),
+            rec("ccc", &["bbb"], "third", ""),
+        ];
+        let (nodes, edges) = build_graph("r", &recs, 1, &embedder());
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.kind == EdgeKind::TemporalNext));
+    }
+
+    #[test]
+    fn merge_commit_yields_one_spine_and_one_merge_edge() {
+        let recs = vec![
+            rec("aaa", &[], "root", ""),
+            rec("bbb", &["aaa"], "branch", ""),
+            rec("ccc", &["aaa", "bbb"], "merge", ""), // two parents
+        ];
+        let (_, edges) = build_graph("r", &recs, 1, &embedder());
+        let temporal = edges.iter().filter(|e| e.kind == EdgeKind::TemporalNext).count();
+        let merge = edges.iter().filter(|e| e.kind == EdgeKind::MergeParent).count();
+        // bbb->aaa and ccc->aaa (first parents); aaa is a root with no parent.
+        assert_eq!(temporal, 2, "each non-root child links to its first parent");
+        assert_eq!(merge, 1, "the second parent of the merge is a MergeParent edge");
+    }
+
+    #[test]
+    fn trailer_becomes_load_bearing_edge() {
+        let body = "details\n\nAgentile-Implements: SELL-S2#step-3";
+        let recs = vec![rec("aaa", &[], "do step 3", body)];
+        let (nodes, edges) = build_graph("r", &recs, 1, &embedder());
+        // commit node + one ref node
+        assert_eq!(nodes.len(), 2);
+        let impl_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Implements).collect();
+        assert_eq!(impl_edges.len(), 1);
+        assert!(!impl_edges[0].quarantined, "trailer edges are load-bearing");
+        assert_eq!(impl_edges[0].trust_tier, TrustTier::DerivedDeterministic);
+    }
+
+    #[test]
+    fn build_graph_is_deterministic() {
+        let recs = vec![rec("aaa", &[], "first", "body"), rec("bbb", &["aaa"], "second", "")];
+        let (n1, _) = build_graph("r", &recs, 1, &embedder());
+        let (n2, _) = build_graph("r", &recs, 999, &embedder()); // different now_ms
+        let ids1: Vec<_> = n1.iter().map(|n| n.compute_id()).collect();
+        let ids2: Vec<_> = n2.iter().map(|n| n.compute_id()).collect();
+        assert_eq!(ids1, ids2, "node ids do not depend on observed_at");
+    }
+
+    #[test]
+    fn ingest_is_idempotent_on_counts() {
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        let recs = vec![rec("aaa", &[], "first", ""), rec("bbb", &["aaa"], "second", "")];
+        let now = 42;
+        let (nodes, edges) = build_graph("r", &recs, now, &embedder());
+        store.commit(&nodes, &edges).unwrap();
+        let n1 = store.node_count().unwrap();
+        let e1 = store.edge_count().unwrap();
+        // commit again
+        store.commit(&nodes, &edges).unwrap();
+        assert_eq!(store.node_count().unwrap(), n1, "re-commit must not grow node count");
+        assert_eq!(store.edge_count().unwrap(), e1, "re-commit must not grow edge count");
+    }
+
+    #[test]
+    fn watermark_roundtrips() {
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        let ing = Ingestor::new("r");
+        assert!(ing.read_watermark(&store).unwrap().is_none());
+        // simulate an ingest's watermark write via the store directly
+        let wm = Watermark { repo: "r".into(), head: Some("aaa".into()), head_count: 1, ingested_at_ms: 7 };
+        store.put_meta(WATERMARK_KEY, &serde_json::to_vec(&wm).unwrap()).unwrap();
+        assert_eq!(ing.read_watermark(&store).unwrap(), Some(wm));
+    }
+}

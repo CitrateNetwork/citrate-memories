@@ -131,6 +131,9 @@ pub enum SourceRef {
         byte_start: u64,
         byte_end: u64,
     },
+    /// A git commit object itself (not a file span). The sha uniquely identifies
+    /// the commit, so a commit node's identity is stable across rebuilds.
+    GitCommit { repo: String, sha: String },
     /// Born in the graph (Asserted plane); lives nowhere else. `key` makes
     /// distinct dag-native records distinguishable in the identity hash.
     DagNative { key: String },
@@ -146,6 +149,7 @@ impl SourceRef {
                 byte_start,
                 byte_end,
             } => format!("artifact|{repo}|{path}|{git_sha}|{byte_start}|{byte_end}").into_bytes(),
+            SourceRef::GitCommit { repo, sha } => format!("git_commit|{repo}|{sha}").into_bytes(),
             SourceRef::DagNative { key } => format!("dag_native|{key}").into_bytes(),
         }
     }
