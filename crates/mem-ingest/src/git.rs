@@ -3,10 +3,27 @@
 //! Output is parsed from a separator-delimited `git log` so commit subjects and
 //! bodies that contain newlines are handled safely.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::IngestError;
+
+/// Resolve the repository top-level directory, so commit and doc ingestion both
+/// operate from the same root (git `ls-files` is otherwise subdir-scoped).
+pub fn repo_root(path: &Path) -> Result<PathBuf, IngestError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| IngestError::Git(format!("failed to run git: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(IngestError::Git(format!("not a git repo: {}", stderr.trim())));
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(PathBuf::from(root))
+}
 
 /// One commit as read from `git log`.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -90,6 +90,9 @@ pub enum NodeKind {
     WorkPackage,
     Rationale,
     AnalogyHypothesis,
+    /// Generic markdown document that doesn't match a more specific kind
+    /// (e.g. a planset/design doc).
+    Doc,
 }
 
 impl NodeKind {
@@ -116,6 +119,7 @@ impl NodeKind {
             NodeKind::WorkPackage => "work_package".into(),
             NodeKind::Rationale => "rationale".into(),
             NodeKind::AnalogyHypothesis => "analogy_hypothesis".into(),
+            NodeKind::Doc => "doc".into(),
         }
     }
 }

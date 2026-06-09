@@ -10,10 +10,12 @@
 //! machines ingest to byte-identical node ids (the core invariant). Nothing here
 //! ever calls a model or writes a non-deterministic edge.
 
+pub mod docs;
+pub mod frontmatter;
 pub mod git;
 pub mod trailers;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -54,6 +56,7 @@ pub struct Watermark {
 #[derive(Debug, Clone)]
 pub struct IngestReport {
     pub commits: usize,
+    pub docs: usize,
     pub nodes_in_store: usize,
     pub edges_in_store: usize,
     pub watermark: Watermark,
@@ -200,6 +203,91 @@ pub fn build_graph(
     (nodes, edges)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn doc_node(
+    repo: &str,
+    rel_path: &str,
+    title: &str,
+    file_len: usize,
+    fm: &BTreeMap<String, String>,
+    kind: NodeKind,
+    body: &str,
+    now_ms: u64,
+    embedder: &dyn Embedder,
+) -> MemoryNode {
+    let preview: String = body.chars().take(512).collect();
+    let embed_text = format!("{title}\n{preview}");
+    MemoryNode {
+        schema_version: SCHEMA_VERSION,
+        plane: Plane::Derived,
+        kind,
+        repo: repo.to_string(),
+        author: fm.get("author").cloned().unwrap_or_else(|| "ingest".to_string()),
+        // path identifies the file; title is the canonical content. No HEAD sha
+        // here, so a doc's identity does not churn on unrelated commits.
+        source_ref: SourceRef::Artifact {
+            repo: repo.to_string(),
+            path: rel_path.to_string(),
+            git_sha: String::new(),
+            byte_start: 0,
+            byte_end: file_len as u64,
+        },
+        content: title.as_bytes().to_vec(),
+        valid_from: now_ms,
+        valid_to: None,
+        observed_at: now_ms,
+        trust_tier: TrustTier::DerivedDeterministic,
+        signature: None,
+        embedding: Some(embedder.embed(&embed_text)),
+        confidence: vec![BelnapValue::True],
+        anchors: vec![],
+        status: docs::status_from_fm(fm),
+    }
+}
+
+/// Ingest every tracked markdown doc under `repo_root` into nodes/edges. Returns
+/// `(nodes, edges, doc_count)` where `doc_count` excludes minted reference nodes.
+fn build_doc_graph(
+    repo: &str,
+    repo_root: &Path,
+    now_ms: u64,
+    embedder: &dyn Embedder,
+) -> Result<(Vec<MemoryNode>, Vec<Edge>, usize), IngestError> {
+    let paths = docs::list_md_files(repo_root)?;
+    let mut nodes: Vec<MemoryNode> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut ref_ids: HashMap<String, ContentHash> = HashMap::new();
+    let mut doc_count = 0usize;
+
+    for rel in &paths {
+        let bytes = match std::fs::read(repo_root.join(rel)) {
+            Ok(b) => b,
+            Err(_) => continue, // tracked but unreadable (e.g. deleted) — skip
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let (fm, body) = frontmatter::parse(&text);
+        let kind = docs::classify(rel, &fm, body);
+        let title = docs::doc_title(rel, &fm, body);
+        let node = doc_node(repo, rel, &title, bytes.len(), &fm, kind, body, now_ms, embedder);
+        let id = node.compute_id();
+        nodes.push(node);
+        doc_count += 1;
+
+        for t in trailers::parse_agentile_blocks(&text) {
+            if let Some(ek) = docs::map_block_directive(&t.key) {
+                let rid = *ref_ids.entry(t.value.clone()).or_insert_with(|| {
+                    let rn = ref_node(repo, &t.value, now_ms);
+                    let rid = rn.compute_id();
+                    nodes.push(rn);
+                    rid
+                });
+                edges.push(make_edge(id, rid, ek, EdgeMethod::Trailer, now_ms, Some(t.key.clone())));
+            }
+        }
+    }
+    Ok((nodes, edges, doc_count))
+}
+
 /// Drives Derived-plane ingestion for one repo.
 pub struct Ingestor {
     repo_name: String,
@@ -221,9 +309,16 @@ impl Ingestor {
         repo_path: &Path,
         store: &MemoryDagStore<MemoryNode>,
     ) -> Result<IngestReport, IngestError> {
-        let recs = git::read_commits(repo_path)?;
+        let root = git::repo_root(repo_path)?;
         let now = now_millis();
-        let (nodes, edges) = build_graph(&self.repo_name, &recs, now, &self.embedder);
+
+        // Derived plane = commits + markdown docs, committed atomically.
+        let recs = git::read_commits(&root)?;
+        let (mut nodes, mut edges) = build_graph(&self.repo_name, &recs, now, &self.embedder);
+        let (doc_nodes, doc_edges, doc_count) =
+            build_doc_graph(&self.repo_name, &root, now, &self.embedder)?;
+        nodes.extend(doc_nodes);
+        edges.extend(doc_edges);
         store.commit(&nodes, &edges)?;
 
         let watermark = Watermark {
@@ -237,6 +332,7 @@ impl Ingestor {
 
         Ok(IngestReport {
             commits: recs.len(),
+            docs: doc_count,
             nodes_in_store: store.node_count()?,
             edges_in_store: store.edge_count()?,
             watermark,
