@@ -379,6 +379,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mem-assert"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "hex",
+ "mem-core",
+ "mem-store",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "mem-authz"
 version = "0.0.1"
 dependencies = [
@@ -424,6 +438,7 @@ name = "mem-mcp"
 version = "0.0.1"
 dependencies = [
  "ed25519-dalek",
+ "mem-assert",
  "mem-authz",
  "mem-core",
  "mem-query",

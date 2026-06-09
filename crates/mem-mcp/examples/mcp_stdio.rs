@@ -9,6 +9,7 @@
 
 use ed25519_dalek::SigningKey;
 
+use mem_assert::Asserter;
 use mem_authz::{CapabilityGrant, PolicyProfile, ResourceScope};
 use mem_core::MemoryNode;
 use mem_mcp::{serve_stdio, MemoryMcpServer};
@@ -22,8 +23,8 @@ fn main() {
         id: "stdio-demo".into(),
         issuer: "did:saul".into(),
         recipient: "agent:mcp-client".into(),
-        allowed_resources: vec![ResourceScope { resource_id: "*".into(), can_read: true, can_write: false }],
-        policy: PolicyProfile::ReadOnly,
+        allowed_resources: vec![ResourceScope { resource_id: "*".into(), can_read: true, can_write: true }],
+        policy: PolicyProfile::Maintainer,
         expires_at_ms: u64::MAX,
         revoked: false,
         delegation_chain: vec![],
@@ -32,7 +33,9 @@ fn main() {
     };
     grant.sign_with(&SigningKey::from_bytes(&[1u8; 32]));
 
-    let mut server = MemoryMcpServer::new(&store, grant);
+    // Session signing identity for assertions.
+    let asserter = Asserter::new(SigningKey::from_bytes(&[2u8; 32]));
+    let mut server = MemoryMcpServer::new_with_asserter(&store, grant, asserter);
     if let Err(e) = serve_stdio(&mut server) {
         eprintln!("mcp_stdio: {e}");
         std::process::exit(1);

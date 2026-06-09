@@ -9,10 +9,13 @@
 use std::io::{BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 
+use mem_assert::{apply_diff, Asserter, MemoryDiff};
 use mem_authz::{AuditChain, CapabilityGrant, MemoryEvent, Op};
-use mem_core::MemoryNode;
+use mem_core::{ClaimStatus, MemoryNode, NodeKind};
 use mem_query::{Direction, Recall, RecallResult};
 use mem_store::MemoryDagStore;
 
@@ -29,16 +32,34 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// authorization). One grant per session models "this agent may touch these
 /// resources".
 pub struct MemoryMcpServer<'a> {
-    recall: Recall<'a>,
+    store: &'a MemoryDagStore<MemoryNode>,
     grant: CapabilityGrant,
+    /// The session agent's signing identity. `None` → read-only (assert tools error).
+    asserter: Option<Asserter>,
     audit: AuditChain,
 }
 
 impl<'a> MemoryMcpServer<'a> {
+    /// Read-only server (no signing identity; write tools are unavailable).
     pub fn new(store: &'a MemoryDagStore<MemoryNode>, grant: CapabilityGrant) -> Self {
         Self {
-            recall: Recall::new(store),
+            store,
             grant,
+            asserter: None,
+            audit: AuditChain::new(),
+        }
+    }
+
+    /// Read+write server: the `asserter` signs every assertion this session makes.
+    pub fn new_with_asserter(
+        store: &'a MemoryDagStore<MemoryNode>,
+        grant: CapabilityGrant,
+        asserter: Asserter,
+    ) -> Self {
+        Self {
+            store,
+            grant,
+            asserter: Some(asserter),
             audit: AuditChain::new(),
         }
     }
@@ -90,18 +111,24 @@ impl<'a> MemoryMcpServer<'a> {
             "memory.recall" => self.call_recall(&args),
             "memory.search" => self.call_search(&args),
             "memory.neighbors" => self.call_neighbors(&args),
+            "memory.assert" => self.call_assert(&args),
+            "memory.merge_diff" => self.call_merge_diff(&args),
             other => Err((-32602, format!("unknown tool: {other}"))),
         }
     }
 
-    /// Resource-scoped read check + audit. Returns `Ok(())` if allowed, or a
+    /// Resource-scoped op check + audit. Returns `Ok(())` if allowed, or a
     /// ready-to-return tool error if denied (and records the denial).
-    fn authorize_read(&mut self, repo: &str, detail: &str) -> Result<(), Value> {
+    fn authorize(&mut self, op: Op, repo: &str, detail: &str) -> Result<(), Value> {
         let resource = format!("repo:{repo}/memory");
         let now = now_ms();
-        match self.grant.check(&resource, Op::Read, now) {
+        match self.grant.check(&resource, op, now) {
             Ok(()) => {
-                self.audit.append(MemoryEvent::Read, self.grant.recipient.clone(), resource, detail.to_string(), now);
+                let event = match op {
+                    Op::Read => MemoryEvent::Read,
+                    Op::Write => MemoryEvent::Write,
+                };
+                self.audit.append(event, self.grant.recipient.clone(), resource, detail.to_string(), now);
                 Ok(())
             }
             Err(e) => {
@@ -117,13 +144,17 @@ impl<'a> MemoryMcpServer<'a> {
         }
     }
 
+    fn authorize_read(&mut self, repo: &str, detail: &str) -> Result<(), Value> {
+        self.authorize(Op::Read, repo, detail)
+    }
+
     fn call_recall(&mut self, args: &Value) -> Result<Value, (i64, String)> {
         let repo = arg_str(args, "repo")?;
         let budget = arg_usize(args, "budget", 15);
         if let Err(deny) = self.authorize_read(&repo, &format!("memory.recall budget={budget}")) {
             return Ok(deny);
         }
-        let result = self.recall.storyline(&repo, budget).map_err(store_err)?;
+        let result = Recall::new(self.store).storyline(&repo, budget).map_err(store_err)?;
         Ok(tool_text(render_result(&result)))
     }
 
@@ -134,7 +165,7 @@ impl<'a> MemoryMcpServer<'a> {
         if let Err(deny) = self.authorize_read(&repo, &format!("memory.search {query:?}")) {
             return Ok(deny);
         }
-        let result = self.recall.search(&repo, &query, budget).map_err(store_err)?;
+        let result = Recall::new(self.store).search(&repo, &query, budget).map_err(store_err)?;
         Ok(tool_text(render_result(&result)))
     }
 
@@ -145,11 +176,12 @@ impl<'a> MemoryMcpServer<'a> {
         if let Err(deny) = self.authorize_read(&repo, &format!("memory.neighbors {prefix}")) {
             return Ok(deny);
         }
-        let id = match self.recall.resolve_prefix(&prefix).map_err(store_err)? {
+        let recall = Recall::new(self.store);
+        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
             Some(id) => id,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
-        let neighbors = self.recall.neighbors(&id, budget).map_err(store_err)?;
+        let neighbors = recall.neighbors(&id, budget).map_err(store_err)?;
         let mut text = format!("neighbors of {}:\n", &id.to_hex()[..12]);
         for nb in &neighbors {
             let arrow = match nb.direction {
@@ -160,6 +192,62 @@ impl<'a> MemoryMcpServer<'a> {
             text.push_str(&format!("  {arrow} [{:?}] {}\n", nb.edge_kind, title));
         }
         Ok(tool_text(text))
+    }
+
+    /// Append a signed assertion to the Asserted plane (write-gated).
+    fn call_assert(&mut self, args: &Value) -> Result<Value, (i64, String)> {
+        let repo = arg_str(args, "repo")?;
+        let content = arg_str(args, "content")?;
+        let kind_str = arg_str(args, "kind").unwrap_or_else(|_| "rationale".to_string());
+
+        if self.asserter.is_none() {
+            return Ok(tool_error("server has no signing identity; assert unavailable".to_string()));
+        }
+        if let Err(deny) = self.authorize(Op::Write, &repo, &format!("memory.assert {kind_str}")) {
+            return Ok(deny);
+        }
+        let now = now_ms();
+        let node = match self.asserter.as_ref() {
+            Some(a) => a.assert_node(&repo, node_kind_from_str(&kind_str), &content, now),
+            None => return Ok(tool_error("server has no signing identity".to_string())),
+        };
+        let id = node.compute_id();
+        self.store.put_node(&node).map_err(store_err)?;
+        Ok(tool_text(format!(
+            "asserted {} [{}] in {repo} by {}",
+            &id.to_hex()[..12],
+            node.kind.discriminant(),
+            self.grant.recipient
+        )))
+    }
+
+    /// Merge a signed memory-diff (session subgraph). Write-gated on every repo the
+    /// diff touches; rejected wholesale if any signature fails.
+    fn call_merge_diff(&mut self, args: &Value) -> Result<Value, (i64, String)> {
+        let diff_json = arg_str(args, "diff")?;
+        let diff = match MemoryDiff::from_json(&diff_json) {
+            Ok(d) => d,
+            Err(e) => return Ok(tool_error(format!("malformed diff: {e}"))),
+        };
+        let repos: BTreeSet<String> = diff.nodes.iter().map(|n| n.repo.clone()).collect();
+        for repo in &repos {
+            if let Err(deny) = self.authorize(Op::Write, repo, &format!("memory.merge_diff ({} nodes)", diff.nodes.len())) {
+                return Ok(deny);
+            }
+        }
+        match apply_diff(self.store, &diff) {
+            Ok(report) => Ok(tool_text(format!("merged {} nodes, {} edges", report.nodes, report.edges))),
+            Err(e) => Ok(tool_error(format!("merge rejected: {e}"))),
+        }
+    }
+}
+
+fn node_kind_from_str(s: &str) -> NodeKind {
+    match s.to_ascii_lowercase().as_str() {
+        "claim" => NodeKind::Claim(ClaimStatus::Confirmed),
+        "analogy" | "analogy_hypothesis" => NodeKind::AnalogyHypothesis,
+        "doc" | "note" => NodeKind::Doc,
+        _ => NodeKind::Rationale,
     }
 }
 
@@ -238,6 +326,30 @@ fn tools_list() -> Value {
                 },
                 "required": ["repo", "id_prefix"]
             }
+        },
+        {
+            "name": "memory.assert",
+            "description": "Append a signed assertion (Asserted plane) — a rationale/claim/note that lives nowhere else. Requires write scope.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string" },
+                    "content": { "type": "string", "description": "the assertion text" },
+                    "kind": { "type": "string", "enum": ["rationale", "claim", "analogy", "note"], "default": "rationale" }
+                },
+                "required": ["repo", "content"]
+            }
+        },
+        {
+            "name": "memory.merge_diff",
+            "description": "Merge a signed memory-diff (a session subgraph) into the graph — the 'git for agents' handoff. Requires write scope on the diff's repos; rejected wholesale if any signature fails.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "diff": { "type": "string", "description": "JSON-encoded MemoryDiff" }
+                },
+                "required": ["diff"]
+            }
         }
     ]})
 }
@@ -295,6 +407,7 @@ mod tests {
     use mem_store::kv::InMemoryKv;
 
     use ed25519_dalek::SigningKey;
+    use mem_assert::Asserter;
 
     fn node(repo: &str, subject: &str) -> MemoryNode {
         MemoryNode {
@@ -357,7 +470,7 @@ mod tests {
 
         let list = srv.handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let v: Value = serde_json::from_str(&list).unwrap();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
     }
 
     #[test]
@@ -400,5 +513,51 @@ mod tests {
         let resp = srv.handle_line(r#"{"jsonrpc":"2.0","id":9,"method":"bogus"}"#).unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], -32601);
+    }
+
+    /// Grant with write on citrate-chain.
+    fn write_grant() -> CapabilityGrant {
+        let mut g = grant();
+        g.allowed_resources[0].can_write = true;
+        g.sign_with(&SigningKey::from_bytes(&[3u8; 32]));
+        g
+    }
+
+    fn asserter() -> Asserter {
+        Asserter::new(SigningKey::from_bytes(&[8u8; 32]))
+    }
+
+    const ASSERT_CALL: &str = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"memory.assert","arguments":{"repo":"citrate-chain","content":"we chose rocksdb for durable atomic batches","kind":"rationale"}}}"#;
+
+    #[test]
+    fn assert_with_write_grant_appends_and_audits() {
+        let s = store();
+        let before = s.node_count().unwrap();
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        let v: Value = serde_json::from_str(&srv.handle_line(ASSERT_CALL).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        assert_eq!(s.node_count().unwrap(), before + 1, "assertion appended to the store");
+        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Write);
+    }
+
+    #[test]
+    fn assert_denied_without_write_scope() {
+        let s = store();
+        // read-only grant + asserter present
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, grant(), asserter());
+        let v: Value = serde_json::from_str(&srv.handle_line(ASSERT_CALL).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], true, "assert without write scope must be denied");
+        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Denied);
+        assert_eq!(s.node_count().unwrap(), 2, "nothing written");
+    }
+
+    #[test]
+    fn assert_without_signing_identity_errors() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, write_grant()); // no asserter
+        let v: Value = serde_json::from_str(&srv.handle_line(ASSERT_CALL).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("signing identity"));
     }
 }
