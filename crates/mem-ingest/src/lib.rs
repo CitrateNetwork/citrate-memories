@@ -30,7 +30,9 @@ use mem_store::{MemoryDagStore, StoreError};
 
 use git::CommitRecord;
 
-const EMBED_DIM: usize = 256;
+/// Embedding dimension used for all Derived-plane nodes. Public so the query
+/// layer embeds queries in the same space (the index rejects model mismatches).
+pub const EMBED_DIM: usize = 256;
 
 /// Freshness watermark is keyed per-repo: one store holds many tenant repos.
 fn watermark_key(repo: &str) -> Vec<u8> {

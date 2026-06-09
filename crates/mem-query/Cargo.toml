@@ -1,0 +1,22 @@
+[package]
+name = "mem-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "citrate-memories read path: budget-shaped recall, semantic search, blast-radius."
+
+[dependencies]
+mem-core = { path = "../mem-core" }
+mem-store = { path = "../mem-store" }
+mem-index = { path = "../mem-index" }
+mem-ingest = { path = "../mem-ingest" }
+
+[features]
+default = []
+rocksdb = ["mem-store/rocksdb"]
+
+[[example]]
+name = "query"
+required-features = ["rocksdb"]
