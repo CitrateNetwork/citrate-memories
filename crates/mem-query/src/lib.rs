@@ -143,7 +143,7 @@ impl<'a> Recall<'a> {
             }
         }
 
-        let q = self.embedder.embed(query);
+        let q = self.embedder.embed(query).map_err(|e| StoreError::Backend(e.to_string()))?;
         let hits = index.search(&q, budget).unwrap_or_default();
         let items = hits
             .into_iter()
@@ -217,7 +217,7 @@ mod tests {
             observed_at: valid_from,
             trust_tier: TrustTier::DerivedDeterministic,
             signature: None,
-            embedding: Some(HashingEmbedder::new(EMBED_DIM).embed(subject)),
+            embedding: Some(HashingEmbedder::new(EMBED_DIM).embed(subject).unwrap()),
             confidence: vec![],
             anchors: vec![],
             status: Status::Active,

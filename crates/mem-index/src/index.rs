@@ -146,12 +146,12 @@ mod tests {
     fn finds_nearest_first() {
         let e = HashingEmbedder::new(512);
         let mut idx = BruteForceIndex::new();
-        idx.add(id("a"), &e.embed("lora adapter provenance chain")).unwrap();
-        idx.add(id("b"), &e.embed("gossip peer discovery quic")).unwrap();
-        idx.add(id("c"), &e.embed("lora adapter provenance hash")).unwrap();
+        idx.add(id("a"), &e.embed("lora adapter provenance chain").unwrap()).unwrap();
+        idx.add(id("b"), &e.embed("gossip peer discovery quic").unwrap()).unwrap();
+        idx.add(id("c"), &e.embed("lora adapter provenance hash").unwrap()).unwrap();
         assert_eq!(idx.len(), 3);
 
-        let q = e.embed("lora adapter provenance");
+        let q = e.embed("lora adapter provenance").unwrap();
         let hits = idx.search(&q, 2).unwrap();
         assert_eq!(hits.len(), 2);
         // a and c (lora/provenance) should outrank b (networking).
@@ -164,9 +164,9 @@ mod tests {
         let small = HashingEmbedder::new(64);
         let big = HashingEmbedder::new(128);
         let mut idx = BruteForceIndex::new();
-        idx.add(id("a"), &small.embed("hello world")).unwrap();
+        idx.add(id("a"), &small.embed("hello world").unwrap()).unwrap();
         // Different model id (and dim) -> rejected, not silently compared.
-        let err = idx.search(&big.embed("hello world"), 1).unwrap_err();
+        let err = idx.search(&big.embed("hello world").unwrap(), 1).unwrap_err();
         assert!(matches!(err, IndexError::ModelMismatch { .. }));
     }
 
@@ -175,8 +175,8 @@ mod tests {
         let small = HashingEmbedder::new(64);
         let big = HashingEmbedder::new(128);
         let mut idx = BruteForceIndex::new();
-        idx.add(id("a"), &small.embed("x")).unwrap();
-        assert!(idx.add(id("b"), &big.embed("y")).is_err());
+        idx.add(id("a"), &small.embed("x").unwrap()).unwrap();
+        assert!(idx.add(id("b"), &big.embed("y").unwrap()).is_err());
     }
 
     #[test]
@@ -185,6 +185,6 @@ mod tests {
         let idx = BruteForceIndex::new();
         assert!(idx.is_empty());
         // Querying an empty (unbound) index is fine — no model bound yet.
-        assert_eq!(idx.search(&e.embed("anything"), 5).unwrap(), vec![]);
+        assert_eq!(idx.search(&e.embed("anything").unwrap(), 5).unwrap(), vec![]);
     }
 }

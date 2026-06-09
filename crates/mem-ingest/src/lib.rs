@@ -25,7 +25,7 @@ use mem_core::{
     BelnapValue, ContentHash, Edge, EdgeKind, EdgeMethod, EdgeProvenance, MemoryNode, NodeKind,
     Plane, SourceRef, Status, TrustTier, SCHEMA_VERSION,
 };
-use mem_index::{Embedder, HashingEmbedder};
+use mem_index::{EmbedError, Embedder, HashingEmbedder};
 use mem_store::{MemoryDagStore, StoreError};
 
 use git::CommitRecord;
@@ -47,6 +47,14 @@ pub enum IngestError {
     Store(#[from] StoreError),
     #[error("serialization error: {0}")]
     Serde(String),
+    #[error("embedding error: {0}")]
+    Embed(String),
+}
+
+impl From<EmbedError> for IngestError {
+    fn from(e: EmbedError) -> Self {
+        IngestError::Embed(e.to_string())
+    }
 }
 
 /// Records how current the Derived index is for a repo. Stamped on every ingest;
@@ -75,9 +83,14 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn commit_node(repo: &str, rec: &CommitRecord, now_ms: u64, embedder: &dyn Embedder) -> MemoryNode {
+fn commit_node(
+    repo: &str,
+    rec: &CommitRecord,
+    now_ms: u64,
+    embedder: &dyn Embedder,
+) -> Result<MemoryNode, IngestError> {
     let embed_text = format!("{}\n{}", rec.subject, rec.body);
-    MemoryNode {
+    Ok(MemoryNode {
         schema_version: SCHEMA_VERSION,
         plane: Plane::Derived,
         kind: NodeKind::Commit,
@@ -94,11 +107,11 @@ fn commit_node(repo: &str, rec: &CommitRecord, now_ms: u64, embedder: &dyn Embed
         observed_at: now_ms,
         trust_tier: TrustTier::DerivedDeterministic,
         signature: None,
-        embedding: Some(embedder.embed(&embed_text)),
+        embedding: Some(embedder.embed(&embed_text)?),
         confidence: vec![BelnapValue::True], // a commit's existence is a known-true fact
         anchors: vec![],
         status: Status::Active,
-    }
+    })
 }
 
 /// Best-effort kind for an unresolved trailer target (resolution/unification with
@@ -168,14 +181,14 @@ pub fn build_graph(
     recs: &[CommitRecord],
     now_ms: u64,
     embedder: &dyn Embedder,
-) -> (Vec<MemoryNode>, Vec<Edge>) {
+) -> Result<(Vec<MemoryNode>, Vec<Edge>), IngestError> {
     let mut sha_to_id: HashMap<String, ContentHash> = HashMap::new();
     let mut ref_ids: HashMap<String, ContentHash> = HashMap::new();
     let mut nodes: Vec<MemoryNode> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
     for rec in recs {
-        let node = commit_node(repo, rec, now_ms, embedder);
+        let node = commit_node(repo, rec, now_ms, embedder)?;
         let id = node.compute_id();
         sha_to_id.insert(rec.sha.clone(), id);
         nodes.push(node);
@@ -206,7 +219,7 @@ pub fn build_graph(
         }
     }
 
-    (nodes, edges)
+    Ok((nodes, edges))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -220,14 +233,14 @@ fn doc_node(
     body: &str,
     now_ms: u64,
     embedder: &dyn Embedder,
-) -> MemoryNode {
+) -> Result<MemoryNode, IngestError> {
     let preview: String = body.chars().take(512).collect();
     let embed_text = format!("{title}\n{preview}");
     // Bitemporal `valid_from` = the doc's authored date (frontmatter `created:`),
     // so it lands in the storyline at its real time rather than clustering at
     // ingest time (finding F-3). Falls back to ingest time when no date is present.
     let valid_from = frontmatter::created_ms(fm).unwrap_or(now_ms);
-    MemoryNode {
+    Ok(MemoryNode {
         schema_version: SCHEMA_VERSION,
         plane: Plane::Derived,
         kind,
@@ -248,11 +261,11 @@ fn doc_node(
         observed_at: now_ms,
         trust_tier: TrustTier::DerivedDeterministic,
         signature: None,
-        embedding: Some(embedder.embed(&embed_text)),
+        embedding: Some(embedder.embed(&embed_text)?),
         confidence: vec![BelnapValue::True],
         anchors: vec![],
         status: docs::status_from_fm(fm),
-    }
+    })
 }
 
 /// Ingest every tracked markdown doc under `repo_root` into nodes/edges. Returns
@@ -278,7 +291,7 @@ fn build_doc_graph(
         let (fm, body) = frontmatter::parse(&text);
         let kind = docs::classify(rel, &fm, body);
         let title = docs::doc_title(rel, &fm, body);
-        let node = doc_node(repo, rel, &title, bytes.len(), &fm, kind, body, now_ms, embedder);
+        let node = doc_node(repo, rel, &title, bytes.len(), &fm, kind, body, now_ms, embedder)?;
         let id = node.compute_id();
         nodes.push(node);
         doc_count += 1;
@@ -299,16 +312,30 @@ fn build_doc_graph(
 }
 
 /// Drives Derived-plane ingestion for one repo.
+///
+/// The embedder is pluggable: [`new`](Ingestor::new) uses the dependency-free
+/// [`HashingEmbedder`] baseline, while [`with_embedder`](Ingestor::with_embedder)
+/// accepts any [`Embedder`] — e.g. `mem-index`'s transformer embedder (WP-0.4b).
+/// Because every vector is model-tagged, the index never mixes spaces, so the
+/// choice of embedder is safe to vary per backfill.
 pub struct Ingestor {
     repo_name: String,
-    embedder: HashingEmbedder,
+    embedder: Box<dyn Embedder>,
 }
 
 impl Ingestor {
     pub fn new(repo_name: impl Into<String>) -> Self {
         Self {
             repo_name: repo_name.into(),
-            embedder: HashingEmbedder::new(EMBED_DIM),
+            embedder: Box::new(HashingEmbedder::new(EMBED_DIM)),
+        }
+    }
+
+    /// Build an ingestor backed by a specific embedder (e.g. a transformer model).
+    pub fn with_embedder(repo_name: impl Into<String>, embedder: Box<dyn Embedder>) -> Self {
+        Self {
+            repo_name: repo_name.into(),
+            embedder,
         }
     }
 
@@ -324,9 +351,9 @@ impl Ingestor {
 
         // Derived plane = commits + markdown docs, committed atomically.
         let recs = git::read_commits(&root)?;
-        let (mut nodes, mut edges) = build_graph(&self.repo_name, &recs, now, &self.embedder);
+        let (mut nodes, mut edges) = build_graph(&self.repo_name, &recs, now, self.embedder.as_ref())?;
         let (doc_nodes, doc_edges, doc_count) =
-            build_doc_graph(&self.repo_name, &root, now, &self.embedder)?;
+            build_doc_graph(&self.repo_name, &root, now, self.embedder.as_ref())?;
         nodes.extend(doc_nodes);
         edges.extend(doc_edges);
         store.commit(&nodes, &edges)?;
@@ -391,7 +418,7 @@ mod tests {
             rec("bbb", &["aaa"], "second", ""),
             rec("ccc", &["bbb"], "third", ""),
         ];
-        let (nodes, edges) = build_graph("r", &recs, 1, &embedder());
+        let (nodes, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
         assert_eq!(nodes.len(), 3);
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().all(|e| e.kind == EdgeKind::TemporalNext));
@@ -404,7 +431,7 @@ mod tests {
             rec("bbb", &["aaa"], "branch", ""),
             rec("ccc", &["aaa", "bbb"], "merge", ""), // two parents
         ];
-        let (_, edges) = build_graph("r", &recs, 1, &embedder());
+        let (_, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
         let temporal = edges.iter().filter(|e| e.kind == EdgeKind::TemporalNext).count();
         let merge = edges.iter().filter(|e| e.kind == EdgeKind::MergeParent).count();
         // bbb->aaa and ccc->aaa (first parents); aaa is a root with no parent.
@@ -416,7 +443,7 @@ mod tests {
     fn trailer_becomes_load_bearing_edge() {
         let body = "details\n\nAgentile-Implements: SELL-S2#step-3";
         let recs = vec![rec("aaa", &[], "do step 3", body)];
-        let (nodes, edges) = build_graph("r", &recs, 1, &embedder());
+        let (nodes, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
         // commit node + one ref node
         assert_eq!(nodes.len(), 2);
         let impl_edges: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Implements).collect();
@@ -428,8 +455,8 @@ mod tests {
     #[test]
     fn build_graph_is_deterministic() {
         let recs = vec![rec("aaa", &[], "first", "body"), rec("bbb", &["aaa"], "second", "")];
-        let (n1, _) = build_graph("r", &recs, 1, &embedder());
-        let (n2, _) = build_graph("r", &recs, 999, &embedder()); // different now_ms
+        let (n1, _) = build_graph("r", &recs, 1, &embedder()).unwrap();
+        let (n2, _) = build_graph("r", &recs, 999, &embedder()).unwrap(); // different now_ms
         let ids1: Vec<_> = n1.iter().map(|n| n.compute_id()).collect();
         let ids2: Vec<_> = n2.iter().map(|n| n.compute_id()).collect();
         assert_eq!(ids1, ids2, "node ids do not depend on observed_at");
@@ -440,7 +467,7 @@ mod tests {
         let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
         let recs = vec![rec("aaa", &[], "first", ""), rec("bbb", &["aaa"], "second", "")];
         let now = 42;
-        let (nodes, edges) = build_graph("r", &recs, now, &embedder());
+        let (nodes, edges) = build_graph("r", &recs, now, &embedder()).unwrap();
         store.commit(&nodes, &edges).unwrap();
         let n1 = store.node_count().unwrap();
         let e1 = store.edge_count().unwrap();

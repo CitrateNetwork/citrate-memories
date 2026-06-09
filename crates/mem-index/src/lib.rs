@@ -8,5 +8,10 @@
 pub mod embed;
 pub mod index;
 
-pub use embed::{Embedder, HashingEmbedder};
+pub use embed::{EmbedError, Embedder, HashingEmbedder};
 pub use index::{BruteForceIndex, IndexError, Neighbor, VectorIndex};
+
+#[cfg(feature = "transformer")]
+pub mod transformer;
+#[cfg(feature = "transformer")]
+pub use transformer::TransformerEmbedder;

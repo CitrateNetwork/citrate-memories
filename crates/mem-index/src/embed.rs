@@ -12,6 +12,31 @@
 
 use mem_core::VersionedVector;
 
+/// An embedding failure. The feature-hashing baseline never errors; model-backed
+/// embedders (WP-0.4b) surface load/tokenize/inference failures here rather than
+/// panicking (Rule 8) or silently returning a corrupt vector.
+#[derive(Debug)]
+pub enum EmbedError {
+    /// Model weights/tokenizer could not be loaded (missing asset, bad config).
+    Load(String),
+    /// Tokenization of the input failed.
+    Tokenize(String),
+    /// Forward-pass / tensor inference failed.
+    Inference(String),
+}
+
+impl std::fmt::Display for EmbedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmbedError::Load(m) => write!(f, "embedder load failed: {m}"),
+            EmbedError::Tokenize(m) => write!(f, "tokenization failed: {m}"),
+            EmbedError::Inference(m) => write!(f, "embedding inference failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for EmbedError {}
+
 /// Produces embeddings for text. Implementations must be deterministic: the same
 /// input yields the same vector (so the Asserted plane stays reproducible enough
 /// for advisory similarity).
@@ -21,7 +46,9 @@ pub trait Embedder {
     /// index to reject cross-space queries.
     fn model_id(&self) -> &str;
     fn dim(&self) -> usize;
-    fn embed(&self, text: &str) -> VersionedVector;
+    /// Embed `text`. Fallible: model-backed embedders can fail at inference time
+    /// (the hashing baseline always returns `Ok`).
+    fn embed(&self, text: &str) -> Result<VersionedVector, EmbedError>;
 }
 
 /// Deterministic feature-hashing embedder. Tokens are hashed into a fixed-width
@@ -57,7 +84,7 @@ impl Embedder for HashingEmbedder {
         self.dim
     }
 
-    fn embed(&self, text: &str) -> VersionedVector {
+    fn embed(&self, text: &str) -> Result<VersionedVector, EmbedError> {
         let mut data = vec![0f32; self.dim];
         for tok in Self::tokens(text) {
             let h = blake3::hash(tok.as_bytes());
@@ -75,10 +102,10 @@ impl Embedder for HashingEmbedder {
                 *x /= norm;
             }
         }
-        VersionedVector {
+        Ok(VersionedVector {
             model: self.model_id.clone(),
             data,
-        }
+        })
     }
 }
 
@@ -89,7 +116,10 @@ mod tests {
     #[test]
     fn deterministic() {
         let e = HashingEmbedder::new(256);
-        assert_eq!(e.embed("compose two lora adapters"), e.embed("compose two lora adapters"));
+        assert_eq!(
+            e.embed("compose two lora adapters").unwrap(),
+            e.embed("compose two lora adapters").unwrap()
+        );
     }
 
     #[test]
@@ -100,7 +130,7 @@ mod tests {
     #[test]
     fn normalised_unit_length() {
         let e = HashingEmbedder::new(64);
-        let v = e.embed("blue score finality reorg");
+        let v = e.embed("blue score finality reorg").unwrap();
         let norm: f32 = v.data.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "expected unit vector, got norm {norm}");
     }
@@ -108,7 +138,7 @@ mod tests {
     #[test]
     fn empty_input_is_zero_vector() {
         let e = HashingEmbedder::new(32);
-        let v = e.embed("!!! --- ");
+        let v = e.embed("!!! --- ").unwrap();
         assert!(v.data.iter().all(|x| *x == 0.0));
     }
 
@@ -116,7 +146,7 @@ mod tests {
     fn shared_vocabulary_is_more_similar() {
         let e = HashingEmbedder::new(512);
         let cos = |a: &str, b: &str| {
-            let (x, y) = (e.embed(a), e.embed(b));
+            let (x, y) = (e.embed(a).unwrap(), e.embed(b).unwrap());
             x.data.iter().zip(&y.data).map(|(p, q)| p * q).sum::<f32>()
         };
         let near = cos("lora adapter provenance chain", "lora adapter provenance hash");

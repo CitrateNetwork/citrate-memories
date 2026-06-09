@@ -10,3 +10,25 @@ description = "citrate-memories vector layer: embedders and model-version-guarde
 [dependencies]
 mem-core = { path = "../mem-core" }
 blake3.workspace = true
+
+# WP-0.4b transformer embedder (feature `transformer`): candle BERT + HF tokenizer.
+# Off by default so the baseline build stays pure-Rust and dependency-light; the
+# HashingEmbedder remains the no-deps fallback.
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+# `fancy-regex` is the pure-Rust regex backend (avoids the oniguruma C build).
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"], optional = true }
+hf-hub = { version = "0.4", optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = []
+transformer = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+    "dep:serde_json",
+]
