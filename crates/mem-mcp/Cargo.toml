@@ -30,3 +30,12 @@ required-features = ["rocksdb"]
 [[example]]
 name = "mcp_stdio"
 required-features = ["rocksdb"]
+
+# Multi-session: one daemon owns the DB lock, any number of shims connect.
+[[example]]
+name = "mcp_serve"
+required-features = ["rocksdb"]
+
+[[example]]
+name = "mcp_connect"
+

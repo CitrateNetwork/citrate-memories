@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mem_assert::{apply_diff, Asserter, MemoryDiff};
 use mem_authz::{AuditChain, CapabilityGrant, MemoryEvent, Op};
@@ -44,6 +44,11 @@ pub struct MemoryMcpServer<'a> {
     /// [`with_query_embedder`](MemoryMcpServer::with_query_embedder)) so the index's
     /// model-version guard lines up instead of rejecting every search.
     query_embedder: Option<Arc<dyn Embedder>>,
+    /// Serializes store mutations across concurrent sessions. The store's reads
+    /// are snapshot-consistent and every write lands as one atomic batch, but
+    /// `merge_diff` does check-then-write (cycle guard), so two sessions writing
+    /// at once must take turns. `None` → single-session (stdio), no gate needed.
+    write_gate: Option<Arc<Mutex<()>>>,
     audit: AuditChain,
 }
 
@@ -55,6 +60,7 @@ impl<'a> MemoryMcpServer<'a> {
             grant,
             asserter: None,
             query_embedder: None,
+            write_gate: None,
             audit: AuditChain::new(),
         }
     }
@@ -70,6 +76,7 @@ impl<'a> MemoryMcpServer<'a> {
             grant,
             asserter: Some(asserter),
             query_embedder: None,
+            write_gate: None,
             audit: AuditChain::new(),
         }
     }
@@ -79,6 +86,26 @@ impl<'a> MemoryMcpServer<'a> {
     pub fn with_query_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.query_embedder = Some(embedder);
         self
+    }
+
+    /// Share `gate` with every server bound to the same store: each write tool
+    /// holds it for the whole mutation, so concurrent sessions cannot interleave
+    /// check-then-write sequences. Reads run lock-free.
+    pub fn with_write_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.write_gate = Some(gate);
+        self
+    }
+
+    /// Acquire the cross-session write gate (no-op when ungated). A poisoned gate
+    /// means another session panicked mid-write; refuse to write past it.
+    fn lock_writes(&self) -> Result<Option<std::sync::MutexGuard<'_, ()>>, Value> {
+        match &self.write_gate {
+            None => Ok(None),
+            Some(g) => match g.lock() {
+                Ok(guard) => Ok(Some(guard)),
+                Err(_) => Err(tool_error("write gate poisoned; daemon needs a restart".to_string())),
+            },
+        }
     }
 
     pub fn audit(&self) -> &AuditChain {
@@ -233,6 +260,10 @@ impl<'a> MemoryMcpServer<'a> {
             None => return Ok(tool_error("server has no signing identity".to_string())),
         };
         let id = node.compute_id();
+        let _writes = match self.lock_writes() {
+            Ok(guard) => guard,
+            Err(deny) => return Ok(deny),
+        };
         self.store.put_node(&node).map_err(store_err)?;
         Ok(tool_text(format!(
             "asserted {} [{}] in {repo} by {}",
@@ -256,6 +287,10 @@ impl<'a> MemoryMcpServer<'a> {
                 return Ok(deny);
             }
         }
+        let _writes = match self.lock_writes() {
+            Ok(guard) => guard,
+            Err(deny) => return Ok(deny),
+        };
         match apply_diff(self.store, &diff) {
             Ok(report) => Ok(tool_text(format!("merged {} nodes, {} edges", report.nodes, report.edges))),
             Err(e) => Ok(tool_error(format!("merge rejected: {e}"))),
@@ -272,23 +307,35 @@ fn node_kind_from_str(s: &str) -> NodeKind {
     }
 }
 
-/// Drive an [`MemoryMcpServer`] over stdio (the MCP stdio transport): one JSON-RPC
-/// message per line in, one per line out.
-pub fn serve_stdio(server: &mut MemoryMcpServer) -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    for line in stdin.lock().lines() {
+/// Drive an [`MemoryMcpServer`] over any line-oriented transport: one JSON-RPC
+/// message per line in, one per line out. Returns when the reader reaches EOF
+/// (the client closed its end). This is the unit a multi-session daemon runs
+/// once per accepted connection — each connection gets its own server (its own
+/// grant + audit chain) over the shared store.
+pub fn serve_connection<R: BufRead, W: Write>(
+    reader: R,
+    mut writer: W,
+    server: &mut MemoryMcpServer,
+) -> std::io::Result<()> {
+    for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         if let Some(resp) = server.handle_line(&line) {
-            writeln!(out, "{resp}")?;
-            out.flush()?;
+            writeln!(writer, "{resp}")?;
+            writer.flush()?;
         }
     }
     Ok(())
+}
+
+/// Drive an [`MemoryMcpServer`] over stdio (the MCP stdio transport): one JSON-RPC
+/// message per line in, one per line out.
+pub fn serve_stdio(server: &mut MemoryMcpServer) -> std::io::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    serve_connection(stdin.lock(), stdout.lock(), server)
 }
 
 // ---- helpers ----
@@ -580,5 +627,84 @@ mod tests {
         assert_eq!(v["result"]["isError"], true);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("signing identity"));
+    }
+
+    /// Drive one full client session over a real socket: write requests on one end
+    /// of a `UnixStream` pair, run `serve_connection` on the other. Returns the
+    /// parsed responses in order.
+    #[cfg(unix)]
+    fn run_session(srv: &mut MemoryMcpServer, requests: &[&str]) -> Vec<Value> {
+        use std::io::BufReader;
+        use std::os::unix::net::UnixStream;
+        let (client, server_end) = UnixStream::pair().expect("socketpair");
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let reader = BufReader::new(server_end.try_clone().expect("clone stream"));
+                serve_connection(reader, server_end, srv).expect("serve_connection");
+            });
+            let mut w = client.try_clone().expect("clone client");
+            for req in requests {
+                use std::io::Write as _;
+                writeln!(w, "{req}").expect("write request");
+            }
+            client.shutdown(std::net::Shutdown::Write).expect("shutdown write");
+            use std::io::BufRead as _;
+            let responses: Vec<Value> = BufReader::new(client)
+                .lines()
+                .map(|l| serde_json::from_str(&l.expect("read response")).expect("parse response"))
+                .collect();
+            handle.join().expect("server thread");
+            responses
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_session_over_unix_socket() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let responses = run_session(
+            &mut srv,
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-chain","budget":5}}}"#,
+            ],
+        );
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["result"]["serverInfo"]["name"], "citrate-memories");
+        assert_eq!(responses[1]["result"]["isError"], false);
+        let text = responses[1]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ghostdag"));
+    }
+
+    /// Two sessions on the same store at the same time — the multi-session daemon
+    /// shape. Both write through one shared gate; both writes must land, and each
+    /// session keeps its own audit chain.
+    #[cfg(unix)]
+    #[test]
+    fn two_concurrent_sessions_share_one_store() {
+        let s = store();
+        let before = s.node_count().unwrap();
+        let gate = Arc::new(Mutex::new(()));
+
+        let mut srv_a = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter())
+            .with_write_gate(Arc::clone(&gate));
+        let mut srv_b = MemoryMcpServer::new_with_asserter(
+            &s,
+            write_grant(),
+            Asserter::new(SigningKey::from_bytes(&[9u8; 32])),
+        )
+        .with_write_gate(Arc::clone(&gate));
+
+        let call_b = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"memory.assert","arguments":{"repo":"citrate-chain","content":"session B: the daemon serializes writes through one gate","kind":"note"}}}"#;
+        std::thread::scope(|scope| {
+            let a = scope.spawn(move || run_session(&mut srv_a, &[ASSERT_CALL]));
+            let b = scope.spawn(move || run_session(&mut srv_b, &[call_b]));
+            for handle in [a, b] {
+                let responses = handle.join().expect("session thread");
+                assert_eq!(responses[0]["result"]["isError"], false, "both sessions' writes must succeed");
+            }
+        });
+        assert_eq!(s.node_count().unwrap(), before + 2, "both sessions' assertions landed");
     }
 }

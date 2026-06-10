@@ -39,8 +39,9 @@ impl std::error::Error for EmbedError {}
 
 /// Produces embeddings for text. Implementations must be deterministic: the same
 /// input yields the same vector (so the Asserted plane stays reproducible enough
-/// for advisory similarity).
-pub trait Embedder {
+/// for advisory similarity). `Send + Sync` so one loaded model can serve many
+/// concurrent sessions (the multi-session MCP daemon shares it across threads).
+pub trait Embedder: Send + Sync {
     /// Stable identifier of the model+version producing the vectors, e.g.
     /// `"hashing-v1-d256"`. Stored on every `VersionedVector` and used by the
     /// index to reject cross-space queries.
