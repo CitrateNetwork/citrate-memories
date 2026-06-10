@@ -85,7 +85,12 @@ fn main() {
     repos.sort();
 
     let embedder = select_embedder(&which);
-    let store = MemoryDagStore::<MemoryNode>::open_rocksdb(&db_path).expect("open rocksdb store");
+    // Auto mode: a crypto-shredded DB (keyring present) keeps getting sealed
+    // writes; a plaintext DB stays plaintext. See `reencrypt` for migrating.
+    let store = MemoryDagStore::<MemoryNode>::open_rocksdb_auto(&db_path).expect("open rocksdb store");
+    if store.is_encrypted_at_rest() {
+        println!("(store is encrypted at rest — new nodes will be sealed)");
+    }
     println!("backfilling {} repos -> {} (embedder: {which})\n", repos.len(), db_path);
 
     let started = Instant::now();

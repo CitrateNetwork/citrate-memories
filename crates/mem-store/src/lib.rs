@@ -129,6 +129,24 @@ where
         }
     }
 
+    /// Open in whatever mode the data already is: encrypted iff the keyring CF
+    /// has entries. Keeps operators (daemon, backfill refresh) from accidentally
+    /// writing plaintext into an encrypted store — reads work either way, but
+    /// the write mode must match.
+    pub fn new_auto(kv: Box<dyn KvStore>) -> Result<Self, StoreError> {
+        let encrypted = !kv.kv_iter_cf(cf::KEYS).map_err(StoreError::Backend)?.is_empty();
+        Ok(Self {
+            kv,
+            encrypt_at_rest: encrypted,
+            _node: std::marker::PhantomData,
+        })
+    }
+
+    /// Whether this store seals node payloads on write.
+    pub fn is_encrypted_at_rest(&self) -> bool {
+        self.encrypt_at_rest
+    }
+
     /// Open a durable RocksDB-backed store at `path`, wiring all required column
     /// families. Requires the `rocksdb` feature.
     #[cfg(feature = "rocksdb")]
@@ -142,6 +160,14 @@ where
     pub fn open_rocksdb_encrypted<P: AsRef<std::path::Path>>(path: P) -> Result<Self, StoreError> {
         let kv = crate::rocks::RocksKv::open(path, ALL_CFS).map_err(StoreError::Backend)?;
         Ok(Self::new_encrypted(Box::new(kv)))
+    }
+
+    /// [`open_rocksdb`](Self::open_rocksdb), matching the DB's existing mode:
+    /// encrypted iff its keyring has entries (see [`new_auto`](Self::new_auto)).
+    #[cfg(feature = "rocksdb")]
+    pub fn open_rocksdb_auto<P: AsRef<std::path::Path>>(path: P) -> Result<Self, StoreError> {
+        let kv = crate::rocks::RocksKv::open(path, ALL_CFS).map_err(StoreError::Backend)?;
+        Self::new_auto(Box::new(kv))
     }
 
     // ---- crypto-shred keyring (WP-1.6) ----
@@ -724,6 +750,18 @@ mod tests {
         let plain = serde_json::to_vec(&n).unwrap();
         s.kv.kv_put(cf::NODES, n.compute_id().as_bytes(), &plain).unwrap();
         assert_eq!(s.get_node(&n.compute_id()).unwrap(), Some(n));
+    }
+
+    #[test]
+    fn auto_mode_follows_keyring() {
+        let s = MemoryDagStore::<MemoryNode>::new_auto(Box::new(InMemoryKv::new())).unwrap();
+        assert!(!s.is_encrypted_at_rest(), "no keyring → plaintext mode");
+
+        // A kv that an encrypted store has written to carries keyring rows.
+        let kv = InMemoryKv::new();
+        kv.kv_put(cf::KEYS, b"r1", br#"{"gen":1,"key":null}"#).unwrap();
+        let s = MemoryDagStore::<MemoryNode>::new_auto(Box::new(kv)).unwrap();
+        assert!(s.is_encrypted_at_rest(), "keyring entries → encrypted writes");
     }
 
     #[test]

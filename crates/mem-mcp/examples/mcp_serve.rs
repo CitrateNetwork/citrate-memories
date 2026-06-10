@@ -77,7 +77,7 @@ fn main() {
 
     // DB first: this is the singleton lock. If another daemon is live, we exit
     // here and never touch its socket.
-    let store = match MemoryDagStore::<MemoryNode>::open_rocksdb(&db) {
+    let store = match MemoryDagStore::<MemoryNode>::open_rocksdb_auto(&db) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("mcp_serve: cannot open {db} (another daemon live?): {e}");
