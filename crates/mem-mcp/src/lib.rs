@@ -298,9 +298,38 @@ impl<'a> MemoryMcpServer<'a> {
             Ok(d) => d,
             Err(e) => return Ok(tool_error(format!("malformed diff: {e}"))),
         };
-        let repos: BTreeSet<String> = diff.nodes.iter().map(|n| n.repo.clone()).collect();
+        // FUA-MEMORIES-03: a zero-node diff carrying only edges previously ran
+        // the authz loop zero times and committed every edge unchecked. Reject a
+        // no-op diff, and authorize the repo of EVERY edge endpoint (resolved
+        // from the diff's own nodes, else from the store) — not just node repos.
+        if diff.nodes.is_empty() && diff.edges.is_empty() {
+            return Ok(tool_error("empty diff (no nodes, no edges)".to_string()));
+        }
+        let in_diff: std::collections::BTreeMap<_, String> = diff
+            .nodes
+            .iter()
+            .map(|n| (n.compute_id(), n.repo.clone()))
+            .collect();
+        let mut repos: BTreeSet<String> = diff.nodes.iter().map(|n| n.repo.clone()).collect();
+        for e in &diff.edges {
+            for endpoint in [&e.from, &e.to] {
+                let repo = match in_diff.get(endpoint) {
+                    Some(r) => r.clone(),
+                    None => match self.store.get_node(endpoint).map_err(store_err)? {
+                        Some(n) => n.repo.clone(),
+                        None => {
+                            return Ok(tool_error(format!(
+                                "edge references unknown node {}; cannot authorize",
+                                &endpoint.to_hex()[..12]
+                            )))
+                        }
+                    },
+                };
+                repos.insert(repo);
+            }
+        }
         for repo in &repos {
-            if let Err(deny) = self.authorize(Op::Write, repo, &format!("memory.merge_diff ({} nodes)", diff.nodes.len())) {
+            if let Err(deny) = self.authorize(Op::Write, repo, &format!("memory.merge_diff ({} nodes, {} edges)", diff.nodes.len(), diff.edges.len())) {
                 return Ok(deny);
             }
         }

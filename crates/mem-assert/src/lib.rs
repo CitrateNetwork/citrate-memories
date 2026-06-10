@@ -32,6 +32,11 @@ pub enum AssertError {
     Supersession(#[from] SupersessionError),
     #[error("serialization error: {0}")]
     Serde(String),
+    /// FUA-MEMORIES-02: the signed-assert path tried to write a plane/trust-tier
+    /// it is not allowed to mint (e.g. Derived plane, or the high-trust
+    /// DerivedDeterministic / HumanConfirmed tiers).
+    #[error("not assertable: {0}")]
+    NotAssertable(String),
 }
 
 /// A signing identity for assertions. The author is the hex of the ed25519
@@ -116,13 +121,36 @@ fn verify_sig(pubkey_hex: &str, msg: &[u8], sig: &Option<Vec<u8>>) -> Result<(),
     vk.verify_strict(msg, &signature).map_err(|_| AssertError::BadSignature)
 }
 
-/// Verify a signed Asserted node (author + signature over its id).
+/// FUA-MEMORIES-02: the write boundary for the signed-assert path. An agent's
+/// self-signed assertion may only land on the **Asserted** plane at an
+/// **AgentAsserted** or **InferredAdvisory** tier. The high-trust
+/// `DerivedDeterministic` / `HumanConfirmed` tiers and the `Derived` plane must
+/// come from deterministic ingest or an explicit human-confirmation path — never
+/// an agent's claim. `trust_tier` is excluded from `compute_id` (so it is not
+/// covered by the signature), which is exactly why it must be policed here.
+fn assertable_plane_and_tier(plane: Plane, tier: TrustTier) -> Result<(), AssertError> {
+    if plane != Plane::Asserted {
+        return Err(AssertError::NotAssertable(format!(
+            "plane must be Asserted on the assert path, got {plane:?}"
+        )));
+    }
+    if !matches!(tier, TrustTier::AgentAsserted | TrustTier::InferredAdvisory) {
+        return Err(AssertError::NotAssertable(format!(
+            "trust_tier must be AgentAsserted or InferredAdvisory, got {tier:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify a signed Asserted node (plane/tier policy + author + signature over id).
 pub fn verify_node(node: &MemoryNode) -> Result<(), AssertError> {
+    assertable_plane_and_tier(node.plane, node.trust_tier)?;
     verify_sig(&node.author, node.compute_id().as_bytes(), &node.signature)
 }
 
-/// Verify a signed Asserted edge (asserter + signature over its key).
+/// Verify a signed Asserted edge (plane/tier policy + asserter + signature).
 pub fn verify_edge(edge: &Edge) -> Result<(), AssertError> {
+    assertable_plane_and_tier(edge.plane, edge.trust_tier)?;
     verify_sig(&edge.provenance.asserter, &edge.key(), &edge.signature)
 }
 
@@ -249,6 +277,28 @@ mod tests {
         assert_eq!(n.trust_tier, TrustTier::AgentAsserted);
         assert!(verify_node(&n).is_ok());
         assert_eq!(blame(&n).author, a.pubkey_hex());
+    }
+
+    #[test]
+    fn rejects_forged_trust_tier_and_plane() {
+        // FUA-MEMORIES-02: `trust_tier` is EXCLUDED from compute_id, so a signer
+        // can flip it to the high-trust DerivedDeterministic / HumanConfirmed
+        // AFTER signing and the signature still verifies. And a self-signed node
+        // can claim the Derived plane. The write boundary must refuse both.
+        let a = asserter(7);
+        let mut n = a.assert_node("r", NodeKind::Rationale, "an agent's claim", 1);
+        assert!(verify_node(&n).is_ok());
+
+        // Forge the highest trust tier (signature still valid — tier isn't signed).
+        n.trust_tier = TrustTier::DerivedDeterministic;
+        assert!(matches!(verify_node(&n), Err(AssertError::NotAssertable(_))));
+        n.trust_tier = TrustTier::HumanConfirmed;
+        assert!(matches!(verify_node(&n), Err(AssertError::NotAssertable(_))));
+
+        // Claim the Derived plane (refused before the signature is even checked).
+        let mut d = a.assert_node("r", NodeKind::Rationale, "x", 1);
+        d.plane = Plane::Derived;
+        assert!(matches!(verify_node(&d), Err(AssertError::NotAssertable(_))));
     }
 
     #[test]
