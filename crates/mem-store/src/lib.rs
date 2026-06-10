@@ -40,6 +40,34 @@ pub enum StoreError {
     Serde(String),
 }
 
+/// Why a supersession could not be applied. Mirrors the guards of the TLA+
+/// `SupersededDag.Supersede` action — every rejected case here is a state the
+/// spec never reaches.
+#[derive(Debug, thiserror::Error)]
+pub enum SupersessionError {
+    #[error("edge kind is {0:?}, not Supersedes")]
+    NotSupersedes(EdgeKind),
+    #[error("a node cannot supersede itself")]
+    SelfSupersede,
+    #[error("node {0} not in store")]
+    MissingNode(String),
+    #[error("edge would close a supersession cycle")]
+    Cycle,
+    #[error("edge is quarantined (a proposal, not a load-bearing supersession)")]
+    Quarantined,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// What [`MemoryDagStore::apply_supersession`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupersessionReport {
+    /// `true` if the target transitioned Active → Superseded now; `false` if it
+    /// was already superseded/archived (idempotent re-apply — the edge is still
+    /// written, but `status`/`valid_to` are left untouched).
+    pub transitioned: bool,
+}
+
 /// Anything the DAG can store must know its own content-addressed id.
 pub trait Identified {
     fn id(&self) -> ContentHash;
@@ -241,6 +269,58 @@ where
     }
 }
 
+impl MemoryDagStore<MemoryNode> {
+    /// Apply a supersession (WP-1.4): write `from -Supersedes-> to` and
+    /// transition the target Active → Superseded (stamping `valid_to` from the
+    /// edge's provenance time) in ONE atomic batch — a reader can never observe
+    /// the edge without the status, or vice versa.
+    ///
+    /// This is the runtime image of the TLA+ `SupersededDag.Supersede` action:
+    /// both endpoints must exist, self-supersession is rejected, the
+    /// `would_cycle_supersedes` guard preserves `Acyclic`, and the transition
+    /// preserves `LatestWellDefined` (an Active node has no incoming
+    /// supersedes edge). Re-applying the same edge is idempotent: the edge
+    /// rewrites in place and an already-superseded target keeps its original
+    /// `status`/`valid_to`. Quarantined edges are rejected — a proposal must be
+    /// confirmed (de-quarantined) before it can change anyone's status.
+    pub fn apply_supersession(&self, edge: &Edge) -> Result<SupersessionReport, SupersessionError> {
+        if edge.kind != EdgeKind::Supersedes {
+            return Err(SupersessionError::NotSupersedes(edge.kind));
+        }
+        if edge.quarantined {
+            return Err(SupersessionError::Quarantined);
+        }
+        if edge.from == edge.to {
+            return Err(SupersessionError::SelfSupersede);
+        }
+        if !self.has_node(&edge.from)? {
+            return Err(SupersessionError::MissingNode(edge.from.to_hex()));
+        }
+        let mut target = self
+            .get_node(&edge.to)?
+            .ok_or_else(|| SupersessionError::MissingNode(edge.to.to_hex()))?;
+        if self.would_cycle_supersedes(&edge.from, &edge.to)? {
+            return Err(SupersessionError::Cycle);
+        }
+
+        let transitioned = target.status == mem_core::Status::Active;
+        let edge_bytes = serde_json::to_vec(edge).map_err(|e| StoreError::Serde(e.to_string()))?;
+        let mut ops = vec![
+            KvOp::Put { cf: cf::EDGES_OUT.into(), key: edge.key(), value: edge_bytes.clone() },
+            KvOp::Put { cf: cf::EDGES_IN.into(), key: Self::in_key(edge), value: edge_bytes },
+        ];
+        if transitioned {
+            target.status = mem_core::Status::Superseded;
+            target.valid_to = Some(edge.provenance.at);
+            let node_bytes = serde_json::to_vec(&target).map_err(|e| StoreError::Serde(e.to_string()))?;
+            // status/valid_to are excluded from compute_id, so this overwrites in place.
+            ops.push(KvOp::Put { cf: cf::NODES.into(), key: edge.to.as_bytes().to_vec(), value: node_bytes });
+        }
+        self.kv.kv_write_batch(&ops).map_err(StoreError::Backend)?;
+        Ok(SupersessionReport { transitioned })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +449,88 @@ mod tests {
         assert!(!s
             .would_cycle_supersedes(&d.compute_id(), &a.compute_id())
             .unwrap());
+    }
+
+    fn supersedes_at(from: &MemoryNode, to: &MemoryNode, at: u64) -> Edge {
+        let mut e = edge(from, to, EdgeKind::Supersedes);
+        e.provenance.at = at;
+        e
+    }
+
+    #[test]
+    fn apply_supersession_transitions_target_atomically() {
+        let s = store();
+        let (new, old) = (node("new understanding"), node("old understanding"));
+        s.put_node(&new).unwrap();
+        s.put_node(&old).unwrap();
+
+        let report = s.apply_supersession(&supersedes_at(&new, &old, 42)).unwrap();
+        assert!(report.transitioned);
+
+        let old_now = s.get_node(&old.compute_id()).unwrap().unwrap();
+        assert_eq!(old_now.status, Status::Superseded);
+        assert_eq!(old_now.valid_to, Some(42), "valid_to stamped from edge provenance");
+        // Edge visible in both directions (LatestWellDefined: active ⇒ no in-edge).
+        assert_eq!(s.out_edges(&new.compute_id()).unwrap().len(), 1);
+        assert_eq!(s.in_edges(&old.compute_id()).unwrap().len(), 1);
+        // The superseder itself stays active.
+        assert_eq!(s.get_node(&new.compute_id()).unwrap().unwrap().status, Status::Active);
+    }
+
+    #[test]
+    fn apply_supersession_is_idempotent_and_preserves_first_valid_to() {
+        let s = store();
+        let (a, b, c) = (node("a"), node("b"), node("c"));
+        for n in [&a, &b, &c] {
+            s.put_node(n).unwrap();
+        }
+        assert!(s.apply_supersession(&supersedes_at(&a, &c, 10)).unwrap().transitioned);
+        // Re-apply: no transition, valid_to untouched.
+        assert!(!s.apply_supersession(&supersedes_at(&a, &c, 99)).unwrap().transitioned);
+        // A second superseder of the same (already superseded) target: edge lands,
+        // but status/valid_to stay as the first transition wrote them.
+        assert!(!s.apply_supersession(&supersedes_at(&b, &c, 99)).unwrap().transitioned);
+        let c_now = s.get_node(&c.compute_id()).unwrap().unwrap();
+        assert_eq!(c_now.status, Status::Superseded);
+        assert_eq!(c_now.valid_to, Some(10));
+        assert_eq!(s.in_edges(&c.compute_id()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn apply_supersession_rejects_cycle_without_partial_write() {
+        let s = store();
+        let (a, b) = (node("a"), node("b"));
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+        s.apply_supersession(&supersedes_at(&a, &b, 1)).unwrap();
+
+        let err = s.apply_supersession(&supersedes_at(&b, &a, 2)).unwrap_err();
+        assert!(matches!(err, SupersessionError::Cycle));
+        // Rejection is total: no edge written, superseder a still active.
+        assert!(s.in_edges(&a.compute_id()).unwrap().is_empty());
+        assert_eq!(s.get_node(&a.compute_id()).unwrap().unwrap().status, Status::Active);
+    }
+
+    #[test]
+    fn apply_supersession_rejects_bad_inputs() {
+        let s = store();
+        let (a, b) = (node("a"), node("b"));
+        s.put_node(&a).unwrap();
+
+        // wrong kind
+        let e = edge(&a, &b, EdgeKind::Implements);
+        assert!(matches!(s.apply_supersession(&e).unwrap_err(), SupersessionError::NotSupersedes(_)));
+        // self-supersession
+        let e = supersedes_at(&a, &a, 1);
+        assert!(matches!(s.apply_supersession(&e).unwrap_err(), SupersessionError::SelfSupersede));
+        // missing target (b never stored)
+        let e = supersedes_at(&a, &b, 1);
+        assert!(matches!(s.apply_supersession(&e).unwrap_err(), SupersessionError::MissingNode(_)));
+        // quarantined proposals don't change anyone's status
+        s.put_node(&b).unwrap();
+        let mut e = supersedes_at(&a, &b, 1);
+        e.quarantined = true;
+        assert!(matches!(s.apply_supersession(&e).unwrap_err(), SupersessionError::Quarantined));
+        assert_eq!(s.get_node(&b.compute_id()).unwrap().unwrap().status, Status::Active);
     }
 }

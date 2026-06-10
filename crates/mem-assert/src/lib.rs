@@ -16,7 +16,7 @@ use mem_core::{
     BelnapValue, ContentHash, Edge, EdgeKind, EdgeMethod, EdgeProvenance, MemoryNode, NodeKind,
     Plane, SourceRef, Status, TrustTier, SCHEMA_VERSION,
 };
-use mem_store::{MemoryDagStore, StoreError};
+use mem_store::{MemoryDagStore, StoreError, SupersessionError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssertError {
@@ -28,6 +28,8 @@ pub enum AssertError {
     BadAuthor,
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("supersession rejected: {0}")]
+    Supersession(#[from] SupersessionError),
     #[error("serialization error: {0}")]
     Serde(String),
 }
@@ -192,19 +194,41 @@ impl MemoryDiff {
 pub struct MergeReport {
     pub nodes: usize,
     pub edges: usize,
+    /// How many supersedes edges transitioned their target Active → Superseded
+    /// (WP-1.4; idempotent re-merges count 0 here).
+    pub superseded: usize,
 }
 
 /// Verify, then append a diff to a store. Rejected wholesale if any signature
 /// fails (no partial poison). Append-only + content-addressed → idempotent.
+///
+/// Non-quarantined `Supersedes` edges are *applied*, not just stored (WP-1.4):
+/// each one atomically writes the edge and transitions its target, guarded by
+/// the cycle check. A rejected supersession (cycle/missing node) errors after
+/// the diff's nodes and other edges have landed — safe, because everything is
+/// idempotent: re-merging the same diff re-applies cleanly and the bad edge
+/// stays rejected. Quarantined supersedes edges are stored as plain proposals.
 pub fn apply_diff(
     store: &MemoryDagStore<MemoryNode>,
     diff: &MemoryDiff,
 ) -> Result<MergeReport, AssertError> {
     diff.verify()?;
-    store.commit(&diff.nodes, &diff.edges)?;
+    let (supersessions, plain): (Vec<&Edge>, Vec<&Edge>) = diff
+        .edges
+        .iter()
+        .partition(|e| e.kind == EdgeKind::Supersedes && !e.quarantined);
+    let plain: Vec<Edge> = plain.into_iter().cloned().collect();
+    store.commit(&diff.nodes, &plain)?;
+    let mut superseded = 0;
+    for e in supersessions {
+        if store.apply_supersession(e)?.transitioned {
+            superseded += 1;
+        }
+    }
     Ok(MergeReport {
         nodes: diff.nodes.len(),
         edges: diff.edges.len(),
+        superseded,
     })
 }
 
@@ -272,6 +296,56 @@ mod tests {
         // idempotent re-merge
         apply_diff(&store, &restored).unwrap();
         assert_eq!(store.node_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn diff_supersession_transitions_target() {
+        let a = asserter(5);
+        let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+
+        // Session 1 asserts the original understanding.
+        let old = a.assert_node("r", NodeKind::Rationale, "we thought X because Y", 1);
+        let old_id = old.compute_id();
+        let mut d1 = MemoryDiff::new(a.pubkey_hex(), 1);
+        d1.add_node(old);
+        apply_diff(&store, &d1).unwrap();
+
+        // Session 2 supersedes it.
+        let new = a.assert_node("r", NodeKind::Rationale, "X was wrong; it is Z", 2);
+        let e = a.assert_edge(new.compute_id(), old_id, EdgeKind::Supersedes, 2);
+        let mut d2 = MemoryDiff::new(a.pubkey_hex(), 2);
+        d2.add_node(new);
+        d2.add_edge(e);
+        let report = apply_diff(&store, &d2).unwrap();
+        assert_eq!(report.superseded, 1);
+
+        let old_now = store.get_node(&old_id).unwrap().unwrap();
+        assert_eq!(old_now.status, Status::Superseded);
+        assert_eq!(old_now.valid_to, Some(2));
+
+        // Idempotent re-merge: no second transition.
+        assert_eq!(apply_diff(&store, &d2).unwrap().superseded, 0);
+    }
+
+    #[test]
+    fn diff_with_cyclic_supersession_is_rejected() {
+        let a = asserter(6);
+        let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let n1 = a.assert_node("r", NodeKind::Rationale, "first", 1);
+        let n2 = a.assert_node("r", NodeKind::Rationale, "second", 1);
+        let e12 = a.assert_edge(n1.compute_id(), n2.compute_id(), EdgeKind::Supersedes, 1);
+        let e21 = a.assert_edge(n2.compute_id(), n1.compute_id(), EdgeKind::Supersedes, 1);
+        let mut diff = MemoryDiff::new(a.pubkey_hex(), 1);
+        diff.add_node(n1.clone());
+        diff.add_node(n2);
+        diff.add_edge(e12);
+        diff.add_edge(e21);
+
+        let err = apply_diff(&store, &diff).unwrap_err();
+        assert!(matches!(err, AssertError::Supersession(SupersessionError::Cycle)));
+        // The first supersession applied; the cycle-closing one is rejected forever
+        // — Acyclic holds.
+        assert_eq!(store.get_node(&n1.compute_id()).unwrap().unwrap().status, Status::Active);
     }
 
     #[test]

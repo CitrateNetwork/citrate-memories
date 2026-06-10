@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use mem_core::{ContentHash, MemoryNode, NodeKind, Plane, SourceRef, Timestamp, TrustTier};
+use mem_core::{ContentHash, MemoryNode, NodeKind, Plane, SourceRef, Status, Timestamp, TrustTier};
 use mem_index::{BruteForceIndex, Embedder, HashingEmbedder, HnswIndex, VectorIndex};
 use mem_ingest::{Ingestor, Watermark, EMBED_DIM};
 use mem_store::{MemoryDagStore, StoreError};
@@ -34,6 +34,9 @@ pub struct RecallItem {
     pub plane: Plane,
     pub trust_tier: TrustTier,
     pub source: SourceRef,
+    /// Lifecycle status (WP-1.4): callers must be able to see that a node is
+    /// Superseded so they never act on a stale memory unknowingly.
+    pub status: Status,
     /// Similarity score for `search`; `None` for `storyline`/`neighbors`.
     pub score: Option<f32>,
 }
@@ -49,6 +52,7 @@ impl RecallItem {
             plane: n.plane,
             trust_tier: n.trust_tier,
             source: n.source_ref.clone(),
+            status: n.status,
             score,
         }
     }
@@ -481,6 +485,30 @@ mod tests {
         assert!(!r.items.is_empty());
         assert!(r.items[0].title.contains("rocksdb"), "best match should be the storage node");
         assert!(r.items[0].score.is_some());
+    }
+
+    #[test]
+    fn recall_surfaces_superseded_status() {
+        let old = node("a", "old decision", 1);
+        let new = node("a", "new decision", 2);
+        let s = store_with(&[old.clone(), new.clone()]);
+        let edge = Edge {
+            from: new.compute_id(),
+            to: old.compute_id(),
+            kind: EdgeKind::Supersedes,
+            plane: Plane::Derived,
+            trust_tier: TrustTier::DerivedDeterministic,
+            provenance: EdgeProvenance { method: EdgeMethod::Trailer, asserter: "t".into(), at: 7, evidence: None },
+            confidence: vec![],
+            quarantined: false,
+            signature: None,
+        };
+        s.apply_supersession(&edge).unwrap();
+
+        let r = Recall::new(&s).storyline("a", 10).unwrap();
+        let by_title = |t: &str| r.items.iter().find(|i| i.title == t).map(|i| i.status);
+        assert_eq!(by_title("old decision"), Some(Status::Superseded), "stale memory is visibly marked");
+        assert_eq!(by_title("new decision"), Some(Status::Active));
     }
 
     #[test]

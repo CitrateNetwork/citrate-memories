@@ -26,7 +26,7 @@ use mem_core::{
     Plane, SourceRef, Status, TrustTier, SCHEMA_VERSION,
 };
 use mem_index::{EmbedError, Embedder, HashingEmbedder};
-use mem_store::{MemoryDagStore, StoreError};
+use mem_store::{MemoryDagStore, StoreError, SupersessionError};
 
 use git::CommitRecord;
 
@@ -73,6 +73,11 @@ pub struct IngestReport {
     pub docs: usize,
     pub nodes_in_store: usize,
     pub edges_in_store: usize,
+    /// Supersessions applied this run (Active → Superseded transitions, WP-1.4).
+    pub superseded: usize,
+    /// Supersedes edges rejected by the guards (cycle/self/missing target) —
+    /// deterministic outcome of bad source directives, counted, never fatal.
+    pub supersessions_rejected: usize,
     pub watermark: Watermark,
 }
 
@@ -356,7 +361,13 @@ impl Ingestor {
             build_doc_graph(&self.repo_name, &root, now, self.embedder.as_ref())?;
         nodes.extend(doc_nodes);
         edges.extend(doc_edges);
-        store.commit(&nodes, &edges)?;
+
+        // Supersedes edges are *applied* (status transition, cycle-guarded), not
+        // just stored (WP-1.4). Commit everything else first so targets exist.
+        let (supersessions, plain): (Vec<Edge>, Vec<Edge>) =
+            edges.into_iter().partition(|e| e.kind == EdgeKind::Supersedes && !e.quarantined);
+        store.commit(&nodes, &plain)?;
+        let (superseded, supersessions_rejected) = apply_supersessions(store, &supersessions)?;
 
         let watermark = Watermark {
             repo: self.repo_name.clone(),
@@ -372,6 +383,8 @@ impl Ingestor {
             docs: doc_count,
             nodes_in_store: store.node_count()?,
             edges_in_store: store.edge_count()?,
+            superseded,
+            supersessions_rejected,
             watermark,
         })
     }
@@ -389,6 +402,26 @@ impl Ingestor {
             }
         }
     }
+}
+
+/// Apply a batch of ingest-derived supersedes edges (targets must already be
+/// committed). Returns `(applied, rejected)`: a backend failure is fatal, but a
+/// semantically bad directive (cycle/self-supersede/missing target) is a
+/// deterministic property of the source — counted, never fatal, so one bad
+/// trailer can't take down a repo's ingest.
+fn apply_supersessions(
+    store: &MemoryDagStore<MemoryNode>,
+    edges: &[Edge],
+) -> Result<(usize, usize), IngestError> {
+    let (mut applied, mut rejected) = (0, 0);
+    for e in edges {
+        match store.apply_supersession(e) {
+            Ok(r) => applied += usize::from(r.transitioned),
+            Err(SupersessionError::Store(e)) => return Err(IngestError::Store(e)),
+            Err(_) => rejected += 1,
+        }
+    }
+    Ok((applied, rejected))
 }
 
 #[cfg(test)]
@@ -450,6 +483,47 @@ mod tests {
         assert_eq!(impl_edges.len(), 1);
         assert!(!impl_edges[0].quarantined, "trailer edges are load-bearing");
         assert_eq!(impl_edges[0].trust_tier, TrustTier::DerivedDeterministic);
+    }
+
+    #[test]
+    fn supersedes_trailer_is_applied_with_status_transition() {
+        // The full ingest pipeline shape: build the graph, commit the plain
+        // edges, apply the supersessions (WP-1.4).
+        let body = "details\n\nAgentile-Supersedes: adr:001";
+        let recs = vec![rec("aaa", &[], "revisit storage decision", body)];
+        let (nodes, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
+
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        let (supersessions, plain): (Vec<Edge>, Vec<Edge>) =
+            edges.into_iter().partition(|e| e.kind == EdgeKind::Supersedes && !e.quarantined);
+        assert_eq!(supersessions.len(), 1, "trailer minted a supersedes edge");
+        store.commit(&nodes, &plain).unwrap();
+
+        let (applied, rejected) = apply_supersessions(&store, &supersessions).unwrap();
+        assert_eq!((applied, rejected), (1, 0));
+        let target = store.get_node(&supersessions[0].to).unwrap().unwrap();
+        assert_eq!(target.status, Status::Superseded, "ref-node target transitioned");
+        assert_eq!(target.valid_to, Some(supersessions[0].provenance.at));
+
+        // Re-ingest of the same history: idempotent, no second transition.
+        let (applied, rejected) = apply_supersessions(&store, &supersessions).unwrap();
+        assert_eq!((applied, rejected), (0, 0));
+    }
+
+    #[test]
+    fn bad_supersession_is_counted_not_fatal() {
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        // A supersedes edge whose target was never committed (dangling directive).
+        let body = "x\n\nAgentile-Supersedes: adr:404";
+        let recs = vec![rec("aaa", &[], "subject", body)];
+        let (nodes, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
+        let (supersessions, _): (Vec<Edge>, Vec<Edge>) =
+            edges.into_iter().partition(|e| e.kind == EdgeKind::Supersedes);
+        // Commit only the commit/ref nodes minus the target: simulate by NOT
+        // committing anything — both endpoints missing.
+        let (applied, rejected) = apply_supersessions(&store, &supersessions).unwrap();
+        assert_eq!((applied, rejected), (0, 1), "dangling directive counted, ingest survives");
+        let _ = nodes;
     }
 
     #[test]

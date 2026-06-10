@@ -462,7 +462,14 @@ fn render_result(r: &RecallResult) -> String {
         } else {
             title
         };
-        s.push_str(&format!("  {} {}[{}] {}\n", &i.id.to_hex()[..10], score, i.kind.discriminant(), title));
+        // Surface non-active lifecycle states (WP-1.4) so a caller never acts on
+        // a stale memory without seeing it.
+        let status = match i.status {
+            mem_core::Status::Active => "",
+            mem_core::Status::Superseded => " ⚠SUPERSEDED",
+            mem_core::Status::Archived => " (archived)",
+        };
+        s.push_str(&format!("  {} {}[{}{}] {}\n", &i.id.to_hex()[..10], score, i.kind.discriminant(), status, title));
     }
     s
 }
