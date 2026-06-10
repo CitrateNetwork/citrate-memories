@@ -20,6 +20,15 @@ baseline_test_count: 110
 | FUA-MEMORIES-02 | High | `mem-assert::tests::rejects_forged_trust_tier_and_plane` | Write boundary `assertable_plane_and_tier` in `verify_node`/`verify_edge`: assert path may only write the **Asserted** plane at **AgentAsserted/InferredAdvisory** tier. Rejects the post-signature `trust_tier` forgery (tier is excluded from `compute_id`) and a self-signed `Derived`-plane claim — `crates/mem-assert/src/lib.rs` | 111 ✓ | killed (drop the check → test FAIL) | **FIXED** |
 | FUA-MEMORIES-03 | High | (dedicated mem-mcp harness = follow-up) | `call_merge_diff` now authorizes the repo of **every edge endpoint** (resolved from the diff's nodes, else the store) and rejects a no-op/empty diff — closing the zero-node-diff bypass that committed edges with no authz — `crates/mem-mcp/src/lib.rs` | 111 ✓ (no regression) | — | **FIXED (build-verified; test follow-up)** |
 
+## Phase 3 — WP 3.2 (tenant read-scope) + 3.3 (index/DoS hardening)
+
+| Finding | Sev | Red test(s) | Fix (file) | Suite | Mutation | Disposition |
+|---|---|---|---|---|---|---|
+| FUA-MEMORIES-01 | High | (mem-mcp harness = follow-up) | `call_neighbors` requires the resolved node to belong to the authorized repo (cross-tenant prefix reads as not-found) and drops cross-tenant neighbours — `crates/mem-mcp/src/lib.rs` | 112 ✓ | — | **FIXED (build-verified; test follow-up)** |
+| FUA-MEMORIES-04 | Med | `mem-index::tests::rejects_non_finite_vector` | `check()` rejects NaN/Inf vectors before they poison cosine ranking (covers add + search) — `crates/mem-index/src/index.rs` | 112 ✓ | killed | **FIXED** |
+| FUA-MEMORIES-05 | Med | (caps; harness follow-up) | `call_merge_diff` caps raw bytes (4 MiB) + node/edge counts (10k/50k) — `crates/mem-mcp/src/lib.rs` | 112 ✓ | — | **FIXED (build-verified)** |
+| FUA-MEMORIES-06 | Med | — | Commit-trailer authorial gating (mem-ingest) — **OPEN** (larger trust-model change; follow-up) | — | — | OPEN |
+
 ## Notes
 - Baseline (Phase 0): **110**; mem-assert **7 → 8** (+1). Whole-repo **110 → 111**.
 - TrustTier `Ord` is DerivedDeterministic < HumanConfirmed < AgentAsserted <

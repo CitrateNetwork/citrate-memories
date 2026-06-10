@@ -18,6 +18,10 @@ pub enum IndexError {
     ModelMismatch { expected: String, got: String },
     /// The vector's dimensionality differs from existing entries.
     DimMismatch { expected: usize, got: usize },
+    /// FUA-MEMORIES-04: the vector contains a non-finite component (NaN/±Inf).
+    /// An `Inf` component makes `cosine` return `Inf`, ranking the offending
+    /// node #1 for every query — a search-eclipse / recall-control primitive.
+    NonFiniteVector,
 }
 
 impl std::fmt::Display for IndexError {
@@ -28,6 +32,9 @@ impl std::fmt::Display for IndexError {
             }
             IndexError::DimMismatch { expected, got } => {
                 write!(f, "vector dim {got} does not match index dim {expected}")
+            }
+            IndexError::NonFiniteVector => {
+                write!(f, "vector contains a non-finite (NaN/Inf) component")
             }
         }
     }
@@ -82,6 +89,12 @@ impl BruteForceIndex {
     }
 
     fn check(&self, v: &VersionedVector) -> Result<(), IndexError> {
+        // FUA-MEMORIES-04: reject non-finite vectors before they can poison
+        // ranking (an Inf component makes cosine() return Inf → ranks #1 for
+        // every query). Applies to both add() and search() (both call check()).
+        if !v.data.iter().all(|x| x.is_finite()) {
+            return Err(IndexError::NonFiniteVector);
+        }
         if let Some(m) = &self.model {
             if m != &v.model {
                 return Err(IndexError::ModelMismatch {
@@ -157,6 +170,20 @@ mod tests {
         // a and c (lora/provenance) should outrank b (networking).
         assert!(hits.iter().all(|n| n.id != id("b")), "networking node should not be top-2");
         assert!(hits[0].score >= hits[1].score, "results sorted descending");
+    }
+
+    #[test]
+    fn rejects_non_finite_vector() {
+        // FUA-MEMORIES-04: a non-finite component would make cosine() return Inf
+        // and rank the node #1 for every query (a search-eclipse primitive).
+        let mut idx = BruteForceIndex::new();
+        idx.add(id("a"), &VersionedVector { model: "m".into(), data: vec![1.0, 0.0, 0.0] }).unwrap();
+
+        let inf = VersionedVector { model: "m".into(), data: vec![f32::INFINITY, 0.0, 0.0] };
+        assert_eq!(idx.add(id("evil"), &inf), Err(IndexError::NonFiniteVector));
+
+        let nan = VersionedVector { model: "m".into(), data: vec![f32::NAN, 0.0, 0.0] };
+        assert_eq!(idx.search(&nan, 1), Err(IndexError::NonFiniteVector));
     }
 
     #[test]

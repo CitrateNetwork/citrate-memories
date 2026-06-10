@@ -246,9 +246,26 @@ impl<'a> MemoryMcpServer<'a> {
             Some(id) => id,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
+        // FUA-MEMORIES-01: `resolve_prefix` matches across ALL tenants, so a
+        // session authorized on `repo` could pass a prefix of a node in another
+        // tenant and read its connected content. Require the resolved node to
+        // belong to the authorized repo (a cross-tenant hit reads as "not found"
+        // so existence isn't leaked).
+        match self.store.get_node(&id).map_err(store_err)? {
+            Some(n) if n.repo == repo => {}
+            _ => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
+        }
         let neighbors = recall.neighbors(&id, budget).map_err(store_err)?;
         let mut text = format!("neighbors of {}:\n", &id.to_hex()[..12]);
         for nb in &neighbors {
+            // FUA-MEMORIES-01: never reveal a neighbour that lives in another
+            // tenant (e.g. a cross-DAG AnalogousTo edge); only same-repo
+            // neighbours (and dangling edges from our own node) are shown.
+            if let Some(n) = nb.node.as_ref() {
+                if n.repo != repo {
+                    continue;
+                }
+            }
             let arrow = match nb.direction {
                 Direction::Out => "->",
                 Direction::In => "<-",
@@ -294,10 +311,28 @@ impl<'a> MemoryMcpServer<'a> {
     /// diff touches; rejected wholesale if any signature fails.
     fn call_merge_diff(&mut self, args: &Value) -> Result<Value, (i64, String)> {
         let diff_json = arg_str(args, "diff")?;
+        // FUA-MEMORIES-05: bound the work an unauthenticated-shaped payload can
+        // force — cap the raw bytes before parsing and the node/edge counts after.
+        const MAX_DIFF_BYTES: usize = 4 * 1024 * 1024;
+        const MAX_DIFF_NODES: usize = 10_000;
+        const MAX_DIFF_EDGES: usize = 50_000;
+        if diff_json.len() > MAX_DIFF_BYTES {
+            return Ok(tool_error(format!(
+                "diff too large ({} bytes > {MAX_DIFF_BYTES} cap)",
+                diff_json.len()
+            )));
+        }
         let diff = match MemoryDiff::from_json(&diff_json) {
             Ok(d) => d,
             Err(e) => return Ok(tool_error(format!("malformed diff: {e}"))),
         };
+        if diff.nodes.len() > MAX_DIFF_NODES || diff.edges.len() > MAX_DIFF_EDGES {
+            return Ok(tool_error(format!(
+                "diff exceeds size cap ({} nodes, {} edges)",
+                diff.nodes.len(),
+                diff.edges.len()
+            )));
+        }
         // FUA-MEMORIES-03: a zero-node diff carrying only edges previously ran
         // the authz loop zero times and committed every edge unchecked. Reject a
         // no-op diff, and authorize the repo of EVERY edge endpoint (resolved
