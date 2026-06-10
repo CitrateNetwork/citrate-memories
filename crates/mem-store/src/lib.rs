@@ -12,6 +12,7 @@
 pub mod kv;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
+pub mod shred;
 
 use std::collections::{HashSet, VecDeque};
 
@@ -27,10 +28,11 @@ pub mod cf {
     pub const EDGES_OUT: &str = "mem_edges_out"; // key: from ‖ to ‖ kind
     pub const EDGES_IN: &str = "mem_edges_in"; // key: to ‖ from ‖ kind
     pub const META: &str = "mem_meta"; // small operational state: cursor, freshness watermark
+    pub const KEYS: &str = "mem_keys"; // per-tenant crypto-shred keyring (WP-1.6)
 }
 
 /// Every column family a [`MemoryDagStore`] uses. Pass to `RocksKv::open`.
-pub const ALL_CFS: &[&str] = &[cf::NODES, cf::EDGES_OUT, cf::EDGES_IN, cf::META];
+pub const ALL_CFS: &[&str] = &[cf::NODES, cf::EDGES_OUT, cf::EDGES_IN, cf::META, cf::KEYS];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -38,6 +40,10 @@ pub enum StoreError {
     Backend(String),
     #[error("serialization error: {0}")]
     Serde(String),
+    /// Sealing/opening an at-rest envelope failed (WP-1.6). Authentication
+    /// failures are hard errors — tampering never reads as "missing".
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }
 
 /// Why a supersession could not be applied. Mirrors the guards of the TLA+
@@ -79,19 +85,46 @@ impl Identified for MemoryNode {
     }
 }
 
+/// Anything the DAG can store belongs to exactly one tenant — the unit of
+/// crypto-shredding (WP-1.6: one key per tenant; forget = destroy the key).
+pub trait Tenanted {
+    fn tenant(&self) -> &str;
+}
+
+impl Tenanted for MemoryNode {
+    fn tenant(&self) -> &str {
+        &self.repo
+    }
+}
+
 /// A content-addressed DAG of nodes `N` and [`Edge`]s, backed by any [`KvStore`].
 pub struct MemoryDagStore<N> {
     kv: Box<dyn KvStore>,
+    /// WP-1.6: seal node payloads with the owning tenant's key before they
+    /// touch the backend. Edges/meta are structural and stay plaintext.
+    encrypt_at_rest: bool,
     _node: std::marker::PhantomData<N>,
 }
 
 impl<N> MemoryDagStore<N>
 where
-    N: Identified + Serialize + DeserializeOwned + Clone,
+    N: Identified + Tenanted + Serialize + DeserializeOwned + Clone,
 {
     pub fn new(kv: Box<dyn KvStore>) -> Self {
         Self {
             kv,
+            encrypt_at_rest: false,
+            _node: std::marker::PhantomData,
+        }
+    }
+
+    /// A store that seals every node payload under its tenant's key (WP-1.6).
+    /// Reading is backward-compatible: plaintext values written by an
+    /// unencrypted store still parse.
+    pub fn new_encrypted(kv: Box<dyn KvStore>) -> Self {
+        Self {
+            kv,
+            encrypt_at_rest: true,
             _node: std::marker::PhantomData,
         }
     }
@@ -104,6 +137,98 @@ where
         Ok(Self::new(Box::new(kv)))
     }
 
+    /// [`open_rocksdb`](Self::open_rocksdb), but encrypting at rest (WP-1.6).
+    #[cfg(feature = "rocksdb")]
+    pub fn open_rocksdb_encrypted<P: AsRef<std::path::Path>>(path: P) -> Result<Self, StoreError> {
+        let kv = crate::rocks::RocksKv::open(path, ALL_CFS).map_err(StoreError::Backend)?;
+        Ok(Self::new_encrypted(Box::new(kv)))
+    }
+
+    // ---- crypto-shred keyring (WP-1.6) ----
+
+    fn keyring_entry(&self, tenant: &str) -> Result<Option<shred::KeyringEntry>, StoreError> {
+        match self.kv.kv_get(cf::KEYS, tenant.as_bytes()).map_err(StoreError::Backend)? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| StoreError::Serde(e.to_string()))?,
+            )),
+        }
+    }
+
+    fn put_keyring_entry(&self, tenant: &str, entry: &shred::KeyringEntry) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(entry).map_err(|e| StoreError::Serde(e.to_string()))?;
+        self.kv.kv_put(cf::KEYS, tenant.as_bytes(), &bytes).map_err(StoreError::Backend)
+    }
+
+    /// The tenant's live (generation, master key), minting generation 1 — or
+    /// the next generation after a shred — on first use.
+    fn ensure_tenant_key(&self, tenant: &str) -> Result<(u32, [u8; shred::KEY_LEN]), StoreError> {
+        let (gen, existing) = match self.keyring_entry(tenant)? {
+            Some(e) => (e.gen, e.key_bytes()?),
+            None => (0, None),
+        };
+        if let Some(key) = existing {
+            return Ok((gen, key));
+        }
+        // Absent or shredded: mint the next generation with fresh key material.
+        let key = shred::generate_key()?;
+        let entry = shred::KeyringEntry { gen: gen + 1, key: Some(hex::encode(key)) };
+        self.put_keyring_entry(tenant, &entry)?;
+        Ok((gen + 1, key))
+    }
+
+    /// Crypto-shred a tenant: destroy its key material (WP-1.6, decision #10).
+    /// Every payload sealed under the destroyed generation becomes permanently
+    /// unreadable — reads return `None`/skip, as if forgotten — while the
+    /// ciphertext itself stays put (it can keep federating). The generation
+    /// counter survives, so a tenant that writes again gets a *fresh* key under
+    /// the next generation and its pre-shred history stays lost. Returns
+    /// whether live key material existed.
+    pub fn shred_tenant(&self, tenant: &str) -> Result<bool, StoreError> {
+        match self.keyring_entry(tenant)? {
+            None => Ok(false),
+            Some(e) => {
+                let existed = e.key.is_some();
+                self.put_keyring_entry(tenant, &shred::KeyringEntry { gen: e.gen, key: None })?;
+                Ok(existed)
+            }
+        }
+    }
+
+    /// Serialize a node for storage: plaintext JSON, or a sealed envelope when
+    /// encrypting at rest.
+    fn encode_node(&self, node: &N) -> Result<Vec<u8>, StoreError> {
+        let plain = serde_json::to_vec(node).map_err(|e| StoreError::Serde(e.to_string()))?;
+        if !self.encrypt_at_rest {
+            return Ok(plain);
+        }
+        let tenant = node.tenant();
+        let (gen, key) = self.ensure_tenant_key(tenant)?;
+        shred::seal(&key, tenant, gen, &node.id(), &plain)
+    }
+
+    /// Decode a stored node value. `Ok(None)` means the value is sealed under a
+    /// destroyed key (the tenant was crypto-shredded — its generation's key
+    /// material is gone, or the whole keyring row is). An authentication
+    /// failure under the *live* matching generation is a hard error: that is
+    /// tampering, not forgetting.
+    fn decode_node(&self, id: &ContentHash, bytes: &[u8]) -> Result<Option<N>, StoreError> {
+        let Some(env) = shred::parse_envelope(bytes) else {
+            return Ok(Some(serde_json::from_slice(bytes).map_err(|e| StoreError::Serde(e.to_string()))?));
+        };
+        let Some(entry) = self.keyring_entry(&env.tenant)? else {
+            return Ok(None);
+        };
+        let Some(key) = entry.key_bytes()? else {
+            return Ok(None);
+        };
+        if entry.gen != env.kgen {
+            return Ok(None);
+        }
+        let plain = shred::open(&key, &env, id)?;
+        Ok(Some(serde_json::from_slice(&plain).map_err(|e| StoreError::Serde(e.to_string()))?))
+    }
+
     // ---- nodes ----
 
     /// Insert (or overwrite-in-place) a node. Content-addressing means an
@@ -111,20 +236,19 @@ where
     /// only advisory fields (embedding, confidence, status) can differ.
     pub fn put_node(&self, node: &N) -> Result<ContentHash, StoreError> {
         let id = node.id();
-        let bytes = serde_json::to_vec(node).map_err(|e| StoreError::Serde(e.to_string()))?;
+        let bytes = self.encode_node(node)?;
         self.kv
             .kv_put(cf::NODES, id.as_bytes(), &bytes)
             .map_err(StoreError::Backend)?;
         Ok(id)
     }
 
+    /// `Ok(None)` for absent nodes — and for crypto-shredded ones (WP-1.6):
+    /// a tenant whose key was destroyed reads as forgotten.
     pub fn get_node(&self, id: &ContentHash) -> Result<Option<N>, StoreError> {
         match self.kv.kv_get(cf::NODES, id.as_bytes()).map_err(StoreError::Backend)? {
             None => Ok(None),
-            Some(bytes) => {
-                let node = serde_json::from_slice(&bytes).map_err(|e| StoreError::Serde(e.to_string()))?;
-                Ok(Some(node))
-            }
+            Some(bytes) => self.decode_node(id, &bytes),
         }
     }
 
@@ -141,11 +265,18 @@ where
     }
 
     /// Deserialize every node. Linear scan — fine for CLI/report use; recall uses
-    /// targeted queries instead.
+    /// targeted queries instead. Crypto-shredded nodes (sealed, key destroyed)
+    /// are skipped — forgotten, not an error.
     pub fn all_nodes(&self) -> Result<Vec<N>, StoreError> {
         let mut out = Vec::new();
-        for (_k, v) in self.kv.kv_iter_cf(cf::NODES).map_err(StoreError::Backend)? {
-            out.push(serde_json::from_slice(&v).map_err(|e| StoreError::Serde(e.to_string()))?);
+        for (k, v) in self.kv.kv_iter_cf(cf::NODES).map_err(StoreError::Backend)? {
+            let id_bytes: [u8; 32] = k
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Serde("node key is not a 32-byte content hash".into()))?;
+            if let Some(node) = self.decode_node(&ContentHash(id_bytes), &v)? {
+                out.push(node);
+            }
         }
         Ok(out)
     }
@@ -196,7 +327,7 @@ where
     pub fn commit(&self, nodes: &[N], edges: &[Edge]) -> Result<(), StoreError> {
         let mut ops = Vec::with_capacity(nodes.len() + edges.len() * 2);
         for n in nodes {
-            let bytes = serde_json::to_vec(n).map_err(|e| StoreError::Serde(e.to_string()))?;
+            let bytes = self.encode_node(n)?;
             ops.push(KvOp::Put {
                 cf: cf::NODES.into(),
                 key: n.id().as_bytes().to_vec(),
@@ -312,8 +443,9 @@ impl MemoryDagStore<MemoryNode> {
         if transitioned {
             target.status = mem_core::Status::Superseded;
             target.valid_to = Some(edge.provenance.at);
-            let node_bytes = serde_json::to_vec(&target).map_err(|e| StoreError::Serde(e.to_string()))?;
-            // status/valid_to are excluded from compute_id, so this overwrites in place.
+            // status/valid_to are excluded from compute_id, so this overwrites in
+            // place (sealed under the tenant's key when encrypting at rest).
+            let node_bytes = self.encode_node(&target)?;
             ops.push(KvOp::Put { cf: cf::NODES.into(), key: edge.to.as_bytes().to_vec(), value: node_bytes });
         }
         self.kv.kv_write_batch(&ops).map_err(StoreError::Backend)?;
@@ -509,6 +641,103 @@ mod tests {
         // Rejection is total: no edge written, superseder a still active.
         assert!(s.in_edges(&a.compute_id()).unwrap().is_empty());
         assert_eq!(s.get_node(&a.compute_id()).unwrap().unwrap().status, Status::Active);
+    }
+
+    fn tenant_node(repo: &str, content: &str) -> MemoryNode {
+        let mut n = node(content);
+        n.repo = repo.into();
+        n
+    }
+
+    fn enc_store() -> MemoryDagStore<MemoryNode> {
+        MemoryDagStore::new_encrypted(Box::new(InMemoryKv::new()))
+    }
+
+    #[test]
+    fn encrypted_store_roundtrips_and_hides_plaintext_at_rest() {
+        let s = enc_store();
+        let n = tenant_node("r1", "TOP-SECRET design rationale");
+        let id = s.put_node(&n).unwrap();
+        assert_eq!(s.get_node(&id).unwrap(), Some(n.clone()), "sealed roundtrip");
+        assert_eq!(s.all_nodes().unwrap(), vec![n]);
+
+        // The REAL at-rest check: raw backend bytes are an envelope and contain
+        // no plaintext.
+        let raw = s.kv.kv_get(cf::NODES, id.as_bytes()).unwrap().unwrap();
+        assert!(shred::parse_envelope(&raw).is_some(), "value stored as sealed envelope");
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(!raw_str.contains("TOP-SECRET"), "plaintext must not touch the backend");
+
+        // Determinism: re-putting the same node writes identical bytes.
+        s.put_node(&s.get_node(&id).unwrap().unwrap()).unwrap();
+        assert_eq!(s.kv.kv_get(cf::NODES, id.as_bytes()).unwrap().unwrap(), raw);
+    }
+
+    #[test]
+    fn shred_forgets_one_tenant_and_rekeys_cleanly() {
+        let s = enc_store();
+        let n1 = tenant_node("r1", "tenant one memory");
+        let n2 = tenant_node("r2", "tenant two memory");
+        let (id1, id2) = (s.put_node(&n1).unwrap(), s.put_node(&n2).unwrap());
+
+        assert!(s.shred_tenant("r1").unwrap(), "live key existed");
+        // r1 is forgotten: point reads and scans, no errors.
+        assert_eq!(s.get_node(&id1).unwrap(), None);
+        assert_eq!(s.all_nodes().unwrap(), vec![n2.clone()]);
+        // The ciphertext row itself remains (it may keep federating).
+        assert_eq!(s.node_count().unwrap(), 2);
+        // r2 unaffected.
+        assert_eq!(s.get_node(&id2).unwrap(), Some(n2));
+        // Idempotent: shredding again reports no live key.
+        assert!(!s.shred_tenant("r1").unwrap());
+        // Unknown tenant: no key to destroy.
+        assert!(!s.shred_tenant("never-written").unwrap());
+
+        // r1 writes again: fresh key, new data readable — old data still lost.
+        let n1b = tenant_node("r1", "post-shred memory");
+        let id1b = s.put_node(&n1b).unwrap();
+        assert_eq!(s.get_node(&id1b).unwrap(), Some(n1b), "new generation readable");
+        assert_eq!(s.get_node(&id1).unwrap(), None, "pre-shred generation stays forgotten");
+    }
+
+    #[test]
+    fn tampered_ciphertext_is_a_hard_error_not_a_skip() {
+        let s = enc_store();
+        let id = s.put_node(&tenant_node("r1", "integrity matters")).unwrap();
+        let mut raw = s.kv.kv_get(cf::NODES, id.as_bytes()).unwrap().unwrap();
+        // Flip one hex char of the ciphertext field.
+        let pos = String::from_utf8_lossy(&raw).find("\"ct\":\"").unwrap() + 7;
+        raw[pos] = if raw[pos] == b'0' { b'1' } else { b'0' };
+        s.kv.kv_put(cf::NODES, id.as_bytes(), &raw).unwrap();
+        assert!(
+            matches!(s.get_node(&id).unwrap_err(), StoreError::Crypto(_)),
+            "tampering must error, never read as absent"
+        );
+    }
+
+    #[test]
+    fn encrypted_store_reads_plaintext_values() {
+        // A pre-WP-1.6 (or unencrypted-mode) value must stay readable when the
+        // store is later opened in encrypted mode.
+        let s = enc_store();
+        let n = tenant_node("r1", "legacy plaintext node");
+        let plain = serde_json::to_vec(&n).unwrap();
+        s.kv.kv_put(cf::NODES, n.compute_id().as_bytes(), &plain).unwrap();
+        assert_eq!(s.get_node(&n.compute_id()).unwrap(), Some(n));
+    }
+
+    #[test]
+    fn supersession_on_encrypted_store_stays_sealed() {
+        let s = enc_store();
+        let (new, old) = (tenant_node("r1", "new"), tenant_node("r1", "old"));
+        s.put_node(&new).unwrap();
+        s.put_node(&old).unwrap();
+        s.apply_supersession(&supersedes_at(&new, &old, 9)).unwrap();
+
+        let old_now = s.get_node(&old.compute_id()).unwrap().unwrap();
+        assert_eq!(old_now.status, Status::Superseded);
+        let raw = s.kv.kv_get(cf::NODES, old.compute_id().as_bytes()).unwrap().unwrap();
+        assert!(shred::parse_envelope(&raw).is_some(), "transitioned node re-sealed, not leaked");
     }
 
     #[test]

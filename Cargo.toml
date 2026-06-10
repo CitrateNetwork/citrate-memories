@@ -26,3 +26,7 @@ serde_json = "1"
 blake3 = "1"
 hex = "0.4"
 thiserror = "1"
+# WP-1.6 crypto-shred: AEAD for per-tenant at-rest encryption; OS randomness
+# for tenant key generation (keys must NOT be derivable, or shredding fails).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+getrandom = "0.2"
