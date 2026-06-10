@@ -76,9 +76,32 @@ pub enum Direction {
 pub struct NeighborItem {
     pub edge_kind: mem_core::EdgeKind,
     pub direction: Direction,
+    /// `true` for a proposed (quarantined) edge — advisory, not load-bearing,
+    /// until confirmed (MEM-S4 WP-4.1). Callers must surface this.
+    pub quarantined: bool,
     /// The connected node, if it resolves (a dangling edge yields `None`).
     pub node: Option<RecallItem>,
 }
+
+/// One cross-tenant analogy candidate (MEM-S4 WP-4.3, decision #7).
+#[derive(Debug, Clone)]
+pub struct AnalogyCandidate {
+    pub item: RecallItem,
+    /// Coarse signal: embedding cosine vs the anchor.
+    pub cosine: f32,
+    /// Fine signal: structural edge-kind-signature overlap (multiset Jaccard
+    /// over (direction, edge-kind) of load-bearing edges).
+    pub structural: f32,
+    /// Combined ranking score.
+    pub score: f32,
+}
+
+/// v1 ranking weights for the coarse-to-fine combination. The embedding does
+/// the finding; the structure ("shape of prior actions") does the vetting.
+const ANALOGY_COSINE_WEIGHT: f32 = 0.7;
+const ANALOGY_STRUCTURAL_WEIGHT: f32 = 0.3;
+/// Shortlist factor: how many coarse candidates survive to the structural pass.
+const ANALOGY_SHORTLIST_FACTOR: usize = 4;
 
 /// A minted placeholder reference node (trailer/block target not yet resolved).
 fn is_reference(n: &MemoryNode) -> bool {
@@ -339,15 +362,114 @@ impl<'a> Recall<'a> {
                 return Ok(out);
             }
             let node = self.store.get_node(&e.to)?.map(|n| RecallItem::from_node(&n, None));
-            out.push(NeighborItem { edge_kind: e.kind, direction: Direction::Out, node });
+            out.push(NeighborItem { edge_kind: e.kind, direction: Direction::Out, quarantined: e.quarantined, node });
         }
         for e in self.store.in_edges(id)? {
             if out.len() >= budget {
                 break;
             }
             let node = self.store.get_node(&e.from)?.map(|n| RecallItem::from_node(&n, None));
-            out.push(NeighborItem { edge_kind: e.kind, direction: Direction::In, node });
+            out.push(NeighborItem { edge_kind: e.kind, direction: Direction::In, quarantined: e.quarantined, node });
         }
+        Ok(out)
+    }
+
+    /// Structural edge-kind signature of a node: a multiset of
+    /// (direction, edge-kind) over its **load-bearing** edges. Quarantined
+    /// proposals are excluded — an unconfirmed edge must not influence
+    /// analogy ranking (it could launder itself into confirmations).
+    fn edge_signature(&self, id: &ContentHash) -> Result<HashMap<(u8, u8), usize>, StoreError> {
+        let mut sig: HashMap<(u8, u8), usize> = HashMap::new();
+        for e in self.store.out_edges(id)? {
+            if !e.quarantined {
+                *sig.entry((0, e.kind.tag())).or_default() += 1;
+            }
+        }
+        for e in self.store.in_edges(id)? {
+            if !e.quarantined {
+                *sig.entry((1, e.kind.tag())).or_default() += 1;
+            }
+        }
+        Ok(sig)
+    }
+
+    /// Multiset Jaccard overlap of two signatures, in [0, 1]. Two edgeless
+    /// nodes score 0 (no structural evidence, not perfect agreement).
+    fn signature_overlap(a: &HashMap<(u8, u8), usize>, b: &HashMap<(u8, u8), usize>) -> f32 {
+        let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+        let (mut inter, mut union) = (0usize, 0usize);
+        for k in keys {
+            let (x, y) = (*a.get(k).unwrap_or(&0), *b.get(k).unwrap_or(&0));
+            inter += x.min(y);
+            union += x.max(y);
+        }
+        if union == 0 {
+            0.0
+        } else {
+            inter as f32 / union as f32
+        }
+    }
+
+    /// Cross-tenant analogy (MEM-S4 WP-4.3, decision #7 coarse-to-fine):
+    /// shortlist by embedding cosine against the anchor's stored vector across
+    /// `candidate_repos` (the caller passes only tenants the session may read —
+    /// the R3 grant intersection lives at the authz boundary), then verify by
+    /// structural edge-kind-signature overlap and rank by the combined score.
+    /// An anchor without an embedding has no coarse signal: empty result.
+    pub fn analogies(
+        &self,
+        anchor_id: &ContentHash,
+        candidate_repos: &[String],
+        budget: usize,
+    ) -> Result<Vec<AnalogyCandidate>, StoreError> {
+        let Some(anchor) = self.store.get_node(anchor_id)? else {
+            return Err(StoreError::Backend("analogy anchor not in store".into()));
+        };
+        let Some(anchor_vec) = &anchor.embedding else {
+            return Ok(Vec::new());
+        };
+        let anchor_norm: f32 = anchor_vec.data.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if anchor_norm == 0.0 {
+            return Ok(Vec::new());
+        }
+
+        // Coarse: cosine shortlist across the readable candidate tenants.
+        let mut shortlist: Vec<(f32, MemoryNode)> = Vec::new();
+        for n in self.store.all_nodes()? {
+            if n.repo == anchor.repo || !candidate_repos.contains(&n.repo) || is_reference(&n) {
+                continue;
+            }
+            let Some(v) = &n.embedding else { continue };
+            // Never compare across vector spaces (the index guard's rule).
+            if v.model != anchor_vec.model {
+                continue;
+            }
+            let dot: f32 = v.data.iter().zip(&anchor_vec.data).map(|(x, y)| x * y).sum();
+            let norm: f32 = v.data.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm == 0.0 {
+                continue;
+            }
+            shortlist.push((dot / (norm * anchor_norm), n));
+        }
+        shortlist.sort_by(|a, b| {
+            b.0.total_cmp(&a.0).then_with(|| a.1.compute_id().cmp(&b.1.compute_id()))
+        });
+        shortlist.truncate((budget * ANALOGY_SHORTLIST_FACTOR).max(budget));
+
+        // Fine: structural verify + combined rank.
+        let anchor_sig = self.edge_signature(anchor_id)?;
+        let mut out: Vec<AnalogyCandidate> = Vec::with_capacity(shortlist.len());
+        for (cosine, n) in shortlist {
+            let structural = Self::signature_overlap(&anchor_sig, &self.edge_signature(&n.compute_id())?);
+            out.push(AnalogyCandidate {
+                item: RecallItem::from_node(&n, None),
+                cosine,
+                structural,
+                score: ANALOGY_COSINE_WEIGHT * cosine + ANALOGY_STRUCTURAL_WEIGHT * structural,
+            });
+        }
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.item.id.cmp(&b.item.id)));
+        out.truncate(budget);
         Ok(out)
     }
 
@@ -509,6 +631,83 @@ mod tests {
         let by_title = |t: &str| r.items.iter().find(|i| i.title == t).map(|i| i.status);
         assert_eq!(by_title("old decision"), Some(Status::Superseded), "stale memory is visibly marked");
         assert_eq!(by_title("new decision"), Some(Status::Active));
+    }
+
+    fn plain_edge(from: &MemoryNode, to: &MemoryNode, kind: EdgeKind, quarantined: bool) -> Edge {
+        Edge {
+            from: from.compute_id(),
+            to: to.compute_id(),
+            kind,
+            plane: Plane::Derived,
+            trust_tier: TrustTier::DerivedDeterministic,
+            provenance: EdgeProvenance { method: EdgeMethod::Trailer, asserter: "t".into(), at: 0, evidence: None },
+            confidence: vec![],
+            quarantined,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn analogies_rank_structural_matches_above_bare_cosine_twins() {
+        // Anchor in tenant a, with one load-bearing Implements out-edge.
+        let anchor = node("a", "rocksdb storage engine compaction", 1);
+        let impl_target = node("a", "storage work package", 2);
+        // Two candidates in tenant b with IDENTICAL text (same cosine):
+        // one mirrors the anchor's edge shape, one only has a QUARANTINED edge
+        // (which must not count as structure).
+        // Same token multiset → identical hashing vector (same cosine), but
+        // different byte order → distinct content-addressed ids.
+        let twin_structured = node("b", "rocksdb storage engine compaction notes", 3);
+        let twin_bare = node("b", "compaction notes rocksdb storage engine", 4);
+        let b_target = node("b", "storage work package b", 5);
+        // A tenant outside the candidate list must never appear.
+        let outsider = node("c", "rocksdb storage engine compaction notes", 6);
+
+        let s = store_with(&[
+            anchor.clone(),
+            impl_target.clone(),
+            twin_structured.clone(),
+            twin_bare.clone(),
+            b_target.clone(),
+            outsider,
+        ]);
+        s.add_edge(&plain_edge(&anchor, &impl_target, EdgeKind::Implements, false)).unwrap();
+        s.add_edge(&plain_edge(&twin_structured, &b_target, EdgeKind::Implements, false)).unwrap();
+        s.add_edge(&plain_edge(&twin_bare, &b_target, EdgeKind::Implements, true)).unwrap(); // proposal only
+
+        let r = Recall::new(&s);
+        let hits = r.analogies(&anchor.compute_id(), &["b".to_string()], 5).unwrap();
+        assert_eq!(hits.len(), 3, "only tenant b candidates (c not in the readable list)");
+        assert_eq!(hits[0].item.id, twin_structured.compute_id(), "matching edge shape wins the tie");
+        assert!(hits[0].structural > 0.0);
+        let bare = hits.iter().find(|h| h.item.id == twin_bare.compute_id()).unwrap();
+        assert_eq!(bare.structural, 0.0, "quarantined edges contribute no structure");
+        assert!(hits[0].score > bare.score);
+    }
+
+    #[test]
+    fn analogies_never_cross_vector_spaces_or_leave_candidate_repos() {
+        let anchor = node("a", "gossip networking peers", 1);
+        let mut alien = node("b", "gossip networking peers", 2);
+        // Same text but a different embedding model: must be skipped, not compared.
+        alien.embedding = Some(mem_index::HashingEmbedder::new(64).embed("gossip networking peers").unwrap());
+        let s = store_with(&[anchor.clone(), alien]);
+        let hits = Recall::new(&s).analogies(&anchor.compute_id(), &["b".to_string()], 5).unwrap();
+        assert!(hits.is_empty(), "cross-model vectors are never cosine-compared");
+        // And with no candidate repos at all, nothing comes back.
+        let hits = Recall::new(&s).analogies(&anchor.compute_id(), &[], 5).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn neighbors_marks_proposed_edges() {
+        let a = node("a", "anchor node", 1);
+        let b = node("a", "proposed peer", 2);
+        let s = store_with(&[a.clone(), b.clone()]);
+        s.add_edge(&plain_edge(&a, &b, EdgeKind::References, true)).unwrap();
+        let out = Recall::new(&s).neighbors(&a.compute_id(), 10).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].quarantined, "proposal visibly marked in the read path");
     }
 
     #[test]

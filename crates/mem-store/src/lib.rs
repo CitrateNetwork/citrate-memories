@@ -426,7 +426,53 @@ where
     }
 }
 
+/// What [`MemoryDagStore::confirm_edge`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// The edge was quarantined and is now load-bearing. For a `Supersedes`
+    /// edge this includes the status transition (routed through
+    /// `apply_supersession`).
+    Confirmed,
+    /// The edge was already load-bearing — idempotent no-op.
+    AlreadyConfirmed,
+    /// No such edge.
+    NotFound,
+}
+
 impl MemoryDagStore<MemoryNode> {
+    /// Promote a quarantined (proposed) edge to load-bearing (MEM-S4 WP-4.1,
+    /// the confirm half of the propose→quarantine→confirm lifecycle, R1).
+    /// Identified by (from, to, kind) — the edge's identity key. The
+    /// `quarantined` flag is outside the signed message (`Edge::key`), so
+    /// flipping it preserves the proposer's signature. Confirming a
+    /// `Supersedes` edge routes through [`apply_supersession`]
+    /// (cycle-guarded, atomic edge+status), so a proposal can never transition
+    /// anyone's status before confirmation.
+    pub fn confirm_edge(
+        &self,
+        from: &ContentHash,
+        to: &ContentHash,
+        kind: EdgeKind,
+    ) -> Result<ConfirmOutcome, SupersessionError> {
+        let Some(mut edge) = self
+            .out_edges(from)?
+            .into_iter()
+            .find(|e| e.to == *to && e.kind == kind)
+        else {
+            return Ok(ConfirmOutcome::NotFound);
+        };
+        if !edge.quarantined {
+            return Ok(ConfirmOutcome::AlreadyConfirmed);
+        }
+        edge.quarantined = false;
+        if edge.kind == EdgeKind::Supersedes {
+            self.apply_supersession(&edge)?;
+        } else {
+            self.add_edge(&edge)?;
+        }
+        Ok(ConfirmOutcome::Confirmed)
+    }
+
     /// Apply a supersession (WP-1.4): write `from -Supersedes-> to` and
     /// transition the target Active → Superseded (stamping `valid_to` from the
     /// edge's provenance time) in ONE atomic batch — a reader can never observe
@@ -776,6 +822,59 @@ mod tests {
         assert_eq!(old_now.status, Status::Superseded);
         let raw = s.kv.kv_get(cf::NODES, old.compute_id().as_bytes()).unwrap().unwrap();
         assert!(shred::parse_envelope(&raw).is_some(), "transitioned node re-sealed, not leaked");
+    }
+
+    #[test]
+    fn proposed_supersession_is_inert_until_confirmed() {
+        let s = store();
+        let (new, old) = (node("new view"), node("old view"));
+        s.put_node(&new).unwrap();
+        s.put_node(&old).unwrap();
+
+        // A quarantined proposal can be STORED as a plain edge but must not
+        // transition anyone (apply_supersession rejects it; WP-1.4 guard).
+        let mut proposal = supersedes_at(&new, &old, 5);
+        proposal.quarantined = true;
+        s.add_edge(&proposal).unwrap();
+        assert_eq!(s.get_node(&old.compute_id()).unwrap().unwrap().status, Status::Active);
+
+        // Confirming flips it load-bearing AND applies the supersession.
+        let outcome = s.confirm_edge(&new.compute_id(), &old.compute_id(), EdgeKind::Supersedes).unwrap();
+        assert_eq!(outcome, ConfirmOutcome::Confirmed);
+        let old_now = s.get_node(&old.compute_id()).unwrap().unwrap();
+        assert_eq!(old_now.status, Status::Superseded);
+        assert_eq!(old_now.valid_to, Some(5));
+        let stored = &s.out_edges(&new.compute_id()).unwrap()[0];
+        assert!(!stored.quarantined, "edge is load-bearing after confirm");
+
+        // Idempotent re-confirm; unknown edge reads NotFound.
+        assert_eq!(
+            s.confirm_edge(&new.compute_id(), &old.compute_id(), EdgeKind::Supersedes).unwrap(),
+            ConfirmOutcome::AlreadyConfirmed
+        );
+        assert_eq!(
+            s.confirm_edge(&old.compute_id(), &new.compute_id(), EdgeKind::References).unwrap(),
+            ConfirmOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn confirming_a_cyclic_supersession_proposal_is_rejected() {
+        let s = store();
+        let (a, b) = (node("a"), node("b"));
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+        s.apply_supersession(&supersedes_at(&a, &b, 1)).unwrap();
+
+        // Propose the cycle-closing edge; storage is fine (quarantined), but
+        // confirmation hits the Acyclic guard and the proposal stays inert.
+        let mut proposal = supersedes_at(&b, &a, 2);
+        proposal.quarantined = true;
+        s.add_edge(&proposal).unwrap();
+        let err = s.confirm_edge(&b.compute_id(), &a.compute_id(), EdgeKind::Supersedes).unwrap_err();
+        assert!(matches!(err, SupersessionError::Cycle));
+        assert!(s.out_edges(&b.compute_id()).unwrap()[0].quarantined, "proposal stays quarantined");
+        assert_eq!(s.get_node(&a.compute_id()).unwrap().unwrap().status, Status::Active);
     }
 
     #[test]

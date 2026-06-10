@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use mem_assert::{apply_diff, Asserter, MemoryDiff};
 use mem_authz::{AuditChain, CapabilityGrant, MemoryEvent, Op};
-use mem_core::{ClaimStatus, MemoryNode, NodeKind};
+use mem_core::{ClaimStatus, EdgeKind, EdgeMethod, MemoryNode, NodeKind};
 use mem_index::Embedder;
 use mem_query::{Direction, Recall, RecallResult, TenantIndexCache};
 use mem_store::MemoryDagStore;
@@ -169,8 +169,11 @@ impl<'a> MemoryMcpServer<'a> {
             "memory.recall" => self.call_recall(&args),
             "memory.search" => self.call_search(&args),
             "memory.neighbors" => self.call_neighbors(&args),
+            "memory.analogy" => self.call_analogy(&args),
             "memory.assert" => self.call_assert(&args),
             "memory.merge_diff" => self.call_merge_diff(&args),
+            "memory.propose_edge" => self.call_propose_edge(&args),
+            "memory.confirm_edge" => self.call_confirm_edge(&args),
             other => Err((-32602, format!("unknown tool: {other}"))),
         }
     }
@@ -258,11 +261,13 @@ impl<'a> MemoryMcpServer<'a> {
         let neighbors = recall.neighbors(&id, budget).map_err(store_err)?;
         let mut text = format!("neighbors of {}:\n", &id.to_hex()[..12]);
         for nb in &neighbors {
-            // FUA-MEMORIES-01: never reveal a neighbour that lives in another
-            // tenant (e.g. a cross-DAG AnalogousTo edge); only same-repo
-            // neighbours (and dangling edges from our own node) are shown.
+            // FUA-MEMORIES-01, refined to grant intersection (MEM-S4 WP-4.2, R3):
+            // a neighbour in another tenant (e.g. via a cross-DAG AnalogousTo
+            // edge) is shown iff this session's grant can READ that tenant.
+            // Unauthorized tenants are silently dropped — neither content nor
+            // existence leaks.
             if let Some(n) = nb.node.as_ref() {
-                if n.repo != repo {
+                if n.repo != repo && !self.can_read(&n.repo) {
                     continue;
                 }
             }
@@ -270,10 +275,181 @@ impl<'a> MemoryMcpServer<'a> {
                 Direction::Out => "->",
                 Direction::In => "<-",
             };
+            // A quarantined edge is a proposal — advisory until confirmed (WP-4.1).
+            let proposed = if nb.quarantined { " (proposed)" } else { "" };
+            let cross = nb
+                .node
+                .as_ref()
+                .filter(|n| n.repo != repo)
+                .map(|n| format!(" @{}", n.repo))
+                .unwrap_or_default();
             let title = nb.node.as_ref().map(|n| n.title.replace('\n', " ")).unwrap_or_else(|| "(dangling)".into());
-            text.push_str(&format!("  {arrow} [{:?}] {}\n", nb.edge_kind, title));
+            text.push_str(&format!("  {arrow} [{:?}{proposed}]{cross} {}\n", nb.edge_kind, title));
         }
         Ok(tool_text(text))
+    }
+
+    /// Grant-intersection read check (R3): no audit record, used for filtering
+    /// individual cross-tenant items inside an already-audited call.
+    fn can_read(&self, repo: &str) -> bool {
+        self.grant.check(&format!("repo:{repo}/memory"), Op::Read, now_ms()).is_ok()
+    }
+
+    /// Resolve an id prefix to a node, requiring the session to be able to read
+    /// the node's tenant. Unauthorized or missing both read as "not found"
+    /// (FUA-MEMORIES-01: existence must not leak).
+    fn resolve_readable(&self, prefix: &str) -> Result<Option<(mem_core::ContentHash, MemoryNode)>, (i64, String)> {
+        let recall = Recall::new(self.store);
+        let Some(id) = recall.resolve_prefix(prefix).map_err(store_err)? else {
+            return Ok(None);
+        };
+        match self.store.get_node(&id).map_err(store_err)? {
+            Some(n) if self.can_read(&n.repo) => Ok(Some((id, n))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Cross-tenant analogy (MEM-S4 WP-4.3): coarse embedding shortlist +
+    /// structural verify, over exactly the tenants this grant can read (R3).
+    fn call_analogy(&mut self, args: &Value) -> Result<Value, (i64, String)> {
+        let repo = arg_str(args, "repo")?;
+        let prefix = arg_str(args, "id_prefix")?;
+        let budget = arg_usize(args, "budget", 5).min(50);
+        if let Err(deny) = self.authorize_read(&repo, &format!("memory.analogy {prefix}")) {
+            return Ok(deny);
+        }
+        let recall = Recall::new(self.store);
+        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
+            Some(id) => id,
+            None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
+        };
+        // Anchor must live in the authorized repo (FUA-MEMORIES-01).
+        match self.store.get_node(&id).map_err(store_err)? {
+            Some(n) if n.repo == repo => {}
+            _ => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
+        }
+        // R3 grant intersection: candidates come only from readable tenants.
+        let mut candidate_repos: BTreeSet<String> = BTreeSet::new();
+        for n in self.store.all_nodes().map_err(store_err)? {
+            if n.repo != repo && !candidate_repos.contains(&n.repo) && self.can_read(&n.repo) {
+                candidate_repos.insert(n.repo);
+            }
+        }
+        let candidate_repos: Vec<String> = candidate_repos.into_iter().collect();
+        if candidate_repos.is_empty() {
+            return Ok(tool_text("no other readable tenants to search for analogues".into()));
+        }
+        let hits = recall.analogies(&id, &candidate_repos, budget).map_err(store_err)?;
+        let mut text = format!(
+            "analogues of {} across {} readable tenant(s):\n",
+            &id.to_hex()[..12],
+            candidate_repos.len()
+        );
+        if hits.is_empty() {
+            text.push_str("  (none — anchor may lack an embedding, or no candidates share its vector space)\n");
+        }
+        for h in &hits {
+            let title = h.item.title.replace('\n', " ");
+            let title = if title.chars().count() > 60 {
+                format!("{}…", title.chars().take(59).collect::<String>())
+            } else {
+                title
+            };
+            text.push_str(&format!(
+                "  {} {:.3} (cos {:.3}, struct {:.2}) [{}] @{} {}\n",
+                &h.item.id.to_hex()[..10],
+                h.score,
+                h.cosine,
+                h.structural,
+                h.item.kind.discriminant(),
+                h.item.repo,
+                title
+            ));
+        }
+        text.push_str("(use memory.propose_edge kind=analogous_to to record one as a quarantined proposal)\n");
+        Ok(tool_text(text))
+    }
+
+    /// Record a signed, QUARANTINED edge proposal (MEM-S4 WP-4.1). Write-gated
+    /// on BOTH endpoint tenants (the edge lands in both adjacency views). The
+    /// proposal is advisory until `memory.confirm_edge` promotes it.
+    fn call_propose_edge(&mut self, args: &Value) -> Result<Value, (i64, String)> {
+        let from_prefix = arg_str(args, "from_prefix")?;
+        let to_prefix = arg_str(args, "to_prefix")?;
+        let kind_str = arg_str(args, "kind").unwrap_or_else(|_| "analogous_to".to_string());
+        let evidence = arg_str(args, "evidence").ok();
+        let Some(kind) = edge_kind_from_str(&kind_str) else {
+            return Ok(tool_error(format!("unknown edge kind '{kind_str}'")));
+        };
+        if self.asserter.is_none() {
+            return Ok(tool_error("server has no signing identity; propose unavailable".to_string()));
+        }
+        let Some((from_id, from_node)) = self.resolve_readable(&from_prefix)? else {
+            return Ok(tool_error(format!("no unique node for prefix '{from_prefix}'")));
+        };
+        let Some((to_id, to_node)) = self.resolve_readable(&to_prefix)? else {
+            return Ok(tool_error(format!("no unique node for prefix '{to_prefix}'")));
+        };
+        let repos: BTreeSet<String> = [from_node.repo.clone(), to_node.repo.clone()].into();
+        for r in &repos {
+            if let Err(deny) = self.authorize(Op::Write, r, &format!("memory.propose_edge {kind_str}")) {
+                return Ok(deny);
+            }
+        }
+        let edge = match self.asserter.as_ref() {
+            Some(a) => a.propose_edge(from_id, to_id, kind, EdgeMethod::Nlp, evidence, now_ms()),
+            None => return Ok(tool_error("server has no signing identity".to_string())),
+        };
+        let _writes = match self.lock_writes() {
+            Ok(guard) => guard,
+            Err(deny) => return Ok(deny),
+        };
+        self.store.add_edge(&edge).map_err(store_err)?;
+        Ok(tool_text(format!(
+            "proposed (quarantined) {} -{kind_str}-> {} — promote with memory.confirm_edge",
+            &from_id.to_hex()[..10],
+            &to_id.to_hex()[..10]
+        )))
+    }
+
+    /// Promote a quarantined proposal to load-bearing (MEM-S4 WP-4.1).
+    /// Write-gated on both endpoint tenants; a confirmed Supersedes applies
+    /// the status transition (cycle-guarded) atomically.
+    fn call_confirm_edge(&mut self, args: &Value) -> Result<Value, (i64, String)> {
+        let from_prefix = arg_str(args, "from_prefix")?;
+        let to_prefix = arg_str(args, "to_prefix")?;
+        let kind_str = arg_str(args, "kind").unwrap_or_else(|_| "analogous_to".to_string());
+        let Some(kind) = edge_kind_from_str(&kind_str) else {
+            return Ok(tool_error(format!("unknown edge kind '{kind_str}'")));
+        };
+        let Some((from_id, from_node)) = self.resolve_readable(&from_prefix)? else {
+            return Ok(tool_error(format!("no unique node for prefix '{from_prefix}'")));
+        };
+        let Some((to_id, to_node)) = self.resolve_readable(&to_prefix)? else {
+            return Ok(tool_error(format!("no unique node for prefix '{to_prefix}'")));
+        };
+        let repos: BTreeSet<String> = [from_node.repo.clone(), to_node.repo.clone()].into();
+        for r in &repos {
+            if let Err(deny) = self.authorize(Op::Write, r, &format!("memory.confirm_edge {kind_str}")) {
+                return Ok(deny);
+            }
+        }
+        let _writes = match self.lock_writes() {
+            Ok(guard) => guard,
+            Err(deny) => return Ok(deny),
+        };
+        match self.store.confirm_edge(&from_id, &to_id, kind) {
+            Ok(mem_store::ConfirmOutcome::Confirmed) => Ok(tool_text(format!(
+                "confirmed {} -{kind_str}-> {} (now load-bearing)",
+                &from_id.to_hex()[..10],
+                &to_id.to_hex()[..10]
+            ))),
+            Ok(mem_store::ConfirmOutcome::AlreadyConfirmed) => {
+                Ok(tool_text("edge is already load-bearing".to_string()))
+            }
+            Ok(mem_store::ConfirmOutcome::NotFound) => Ok(tool_error("no such edge".to_string())),
+            Err(e) => Ok(tool_error(format!("confirm rejected: {e}"))),
+        }
     }
 
     /// Append a signed assertion to the Asserted plane (write-gated).
@@ -379,6 +555,27 @@ impl<'a> MemoryMcpServer<'a> {
     }
 }
 
+/// Edge kinds an MCP client may propose/confirm. Structural ingest kinds
+/// (TemporalNext/MergeParent) are deliberately absent — those only come from
+/// deterministic ingestion.
+fn edge_kind_from_str(s: &str) -> Option<EdgeKind> {
+    match s.to_ascii_lowercase().as_str() {
+        "analogous_to" | "analogousto" | "analogy" => Some(EdgeKind::AnalogousTo),
+        "supersedes" => Some(EdgeKind::Supersedes),
+        "references" => Some(EdgeKind::References),
+        "depends_on" | "dependson" => Some(EdgeKind::DependsOn),
+        "implements" => Some(EdgeKind::Implements),
+        "decides" => Some(EdgeKind::Decides),
+        "refutes" => Some(EdgeKind::Refutes),
+        "contradicts" => Some(EdgeKind::Contradicts),
+        "caused_by" | "causedby" => Some(EdgeKind::CausedBy),
+        "motivates" => Some(EdgeKind::Motivates),
+        "derived_from" | "derivedfrom" => Some(EdgeKind::DerivedFrom),
+        "anchored_to" | "anchoredto" => Some(EdgeKind::AnchoredTo),
+        _ => None,
+    }
+}
+
 fn node_kind_from_str(s: &str) -> NodeKind {
     match s.to_ascii_lowercase().as_str() {
         "claim" => NodeKind::Claim(ClaimStatus::Confirmed),
@@ -474,6 +671,46 @@ fn tools_list() -> Value {
                     "budget": { "type": "integer", "default": 20 }
                 },
                 "required": ["repo", "id_prefix"]
+            }
+        },
+        {
+            "name": "memory.analogy",
+            "description": "Cross-tenant analogues of a node (coarse embedding shortlist + structural edge-shape verify), searched only across tenants this session may read.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "the anchor node's tenant" },
+                    "id_prefix": { "type": "string" },
+                    "budget": { "type": "integer", "default": 5 }
+                },
+                "required": ["repo", "id_prefix"]
+            }
+        },
+        {
+            "name": "memory.propose_edge",
+            "description": "Record a signed QUARANTINED edge proposal (advisory until confirmed; never load-bearing on arrival). Requires write scope on both endpoint tenants.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_prefix": { "type": "string" },
+                    "to_prefix": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["analogous_to", "supersedes", "references", "depends_on", "implements", "decides", "refutes", "contradicts", "caused_by", "motivates", "derived_from", "anchored_to"], "default": "analogous_to" },
+                    "evidence": { "type": "string", "description": "why — human-auditable rationale" }
+                },
+                "required": ["from_prefix", "to_prefix"]
+            }
+        },
+        {
+            "name": "memory.confirm_edge",
+            "description": "Promote a quarantined edge proposal to load-bearing. A confirmed supersedes edge applies the status transition (cycle-guarded). Requires write scope on both endpoint tenants.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_prefix": { "type": "string" },
+                    "to_prefix": { "type": "string" },
+                    "kind": { "type": "string", "default": "analogous_to" }
+                },
+                "required": ["from_prefix", "to_prefix"]
             }
         },
         {
@@ -628,7 +865,7 @@ mod tests {
 
         let list = srv.handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let v: Value = serde_json::from_str(&list).unwrap();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 8);
     }
 
     #[test]
@@ -717,6 +954,128 @@ mod tests {
         assert_eq!(v["result"]["isError"], true);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("signing identity"));
+    }
+
+    /// Grant readable (+writable) on BOTH fixture tenants.
+    fn grant_both(write: bool) -> CapabilityGrant {
+        let mut g = grant();
+        g.allowed_resources = vec![
+            ResourceScope { resource_id: "repo:citrate-chain/memory".into(), can_read: true, can_write: write },
+            ResourceScope { resource_id: "repo:citrate-identity/memory".into(), can_read: true, can_write: write },
+        ];
+        g.sign_with(&SigningKey::from_bytes(&[3u8; 32]));
+        g
+    }
+
+    fn call_json(srv: &mut MemoryMcpServer, name: &str, args: Value) -> Value {
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}});
+        let resp = srv.handle_line(&req.to_string()).unwrap();
+        serde_json::from_str::<Value>(&resp).unwrap()["result"].clone()
+    }
+
+    fn text_of(result: &Value) -> String {
+        result["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    /// WP-4.2 (F-6/R3): a cross-tenant neighbour is shown iff the grant reads
+    /// that tenant — and silently hidden otherwise.
+    #[test]
+    fn cross_tenant_neighbors_follow_grant_intersection() {
+        let s = store();
+        let nodes = s.all_nodes().unwrap();
+        let chain = nodes.iter().find(|n| n.repo == "citrate-chain").unwrap().clone();
+        let ident = nodes.iter().find(|n| n.repo == "citrate-identity").unwrap().clone();
+        // A confirmed cross-DAG analogy edge chain -> identity.
+        let edge = mem_core::Edge {
+            from: chain.compute_id(),
+            to: ident.compute_id(),
+            kind: EdgeKind::AnalogousTo,
+            plane: mem_core::Plane::Asserted,
+            trust_tier: mem_core::TrustTier::InferredAdvisory,
+            provenance: mem_core::EdgeProvenance {
+                method: EdgeMethod::Analogy,
+                asserter: "t".into(),
+                at: 1,
+                evidence: None,
+            },
+            confidence: vec![],
+            quarantined: false,
+            signature: None,
+        };
+        s.add_edge(&edge).unwrap();
+        let prefix = &chain.compute_id().to_hex()[..12];
+        let args = json!({"repo": "citrate-chain", "id_prefix": prefix});
+
+        // Chain-only grant: the identity neighbour is silently hidden.
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let text = text_of(&call_json(&mut srv, "memory.neighbors", args.clone()));
+        assert!(!text.contains("siwe"), "unreadable tenant's neighbour must be hidden");
+
+        // Both-tenant grant: shown, labelled with its tenant.
+        let mut srv = MemoryMcpServer::new(&s, grant_both(false));
+        let text = text_of(&call_json(&mut srv, "memory.neighbors", args));
+        assert!(text.contains("siwe login"), "readable cross-tenant neighbour shown");
+        assert!(text.contains("@citrate-identity"), "cross-tenant neighbour labelled");
+    }
+
+    /// WP-4.1 over MCP: propose (quarantined, marked) → confirm (load-bearing).
+    #[test]
+    fn propose_then_confirm_edge_over_mcp() {
+        let s = store();
+        let nodes = s.all_nodes().unwrap();
+        let chain = nodes.iter().find(|n| n.repo == "citrate-chain").unwrap().clone();
+        let ident = nodes.iter().find(|n| n.repo == "citrate-identity").unwrap().clone();
+        let from_prefix = chain.compute_id().to_hex()[..12].to_string();
+        let to_prefix = ident.compute_id().to_hex()[..12].to_string();
+        let args = json!({"from_prefix": from_prefix, "to_prefix": to_prefix, "kind": "analogous_to", "evidence": "same shape"});
+
+        // Write on chain only: the cross-tenant proposal is denied.
+        let mut g = grant_both(false);
+        g.allowed_resources[0].can_write = true;
+        g.sign_with(&SigningKey::from_bytes(&[3u8; 32]));
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, g, asserter());
+        let r = call_json(&mut srv, "memory.propose_edge", args.clone());
+        assert_eq!(r["isError"], true, "needs write on BOTH endpoint tenants");
+        assert!(s.out_edges(&chain.compute_id()).unwrap().is_empty());
+
+        // Write on both: proposal lands quarantined, then confirm promotes it.
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, grant_both(true), asserter());
+        let r = call_json(&mut srv, "memory.propose_edge", args.clone());
+        assert_eq!(r["isError"], false, "{r}");
+        let stored = &s.out_edges(&chain.compute_id()).unwrap()[0];
+        assert!(stored.quarantined, "proposal starts quarantined");
+
+        let text = text_of(&call_json(
+            &mut srv,
+            "memory.neighbors",
+            json!({"repo": "citrate-chain", "id_prefix": chain.compute_id().to_hex()[..12]}),
+        ));
+        assert!(text.contains("(proposed)"), "quarantined edge visibly marked: {text}");
+
+        let r = call_json(&mut srv, "memory.confirm_edge", args);
+        assert_eq!(r["isError"], false, "{r}");
+        let stored = &s.out_edges(&chain.compute_id()).unwrap()[0];
+        assert!(!stored.quarantined, "confirmed edge is load-bearing");
+    }
+
+    /// WP-4.3 over MCP: analogues come only from readable tenants.
+    #[test]
+    fn analogy_respects_grant_intersection() {
+        let s = store();
+        let nodes = s.all_nodes().unwrap();
+        let chain = nodes.iter().find(|n| n.repo == "citrate-chain").unwrap().clone();
+        let args = json!({"repo": "citrate-chain", "id_prefix": chain.compute_id().to_hex()[..12]});
+
+        // Chain-only grant: identity is not a candidate tenant.
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let text = text_of(&call_json(&mut srv, "memory.analogy", args.clone()));
+        assert!(text.contains("no other readable tenants"), "{text}");
+
+        // Both readable: the identity node appears as a candidate.
+        let mut srv = MemoryMcpServer::new(&s, grant_both(false));
+        let text = text_of(&call_json(&mut srv, "memory.analogy", args));
+        assert!(text.contains("@citrate-identity"), "readable tenant searched: {text}");
+        assert!(text.contains("cos "), "scores rendered: {text}");
     }
 
     #[test]

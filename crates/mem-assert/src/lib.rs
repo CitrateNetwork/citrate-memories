@@ -109,6 +109,42 @@ impl Asserter {
         edge.signature = Some(sig.to_bytes().to_vec());
         edge
     }
+
+    /// Build a signed **proposal** edge (MEM-S4 WP-4.1): quarantined at the
+    /// `InferredAdvisory` tier — advisory until a `confirm` promotes it, so a
+    /// model's output can never be load-bearing on arrival (anti-poisoning,
+    /// R1). `method` records who inferred it (`Nlp` / `Analogy`); `evidence`
+    /// is the human-auditable why.
+    pub fn propose_edge(
+        &self,
+        from: ContentHash,
+        to: ContentHash,
+        kind: EdgeKind,
+        method: EdgeMethod,
+        evidence: Option<String>,
+        now_ms: u64,
+    ) -> Edge {
+        use ed25519_dalek::Signer;
+        let mut edge = Edge {
+            from,
+            to,
+            kind,
+            plane: Plane::Asserted,
+            trust_tier: TrustTier::InferredAdvisory,
+            provenance: EdgeProvenance {
+                method,
+                asserter: self.pubkey_hex.clone(),
+                at: now_ms,
+                evidence,
+            },
+            confidence: vec![BelnapValue::True],
+            quarantined: true,
+            signature: None,
+        };
+        let sig = self.sk.sign(&edge.key());
+        edge.signature = Some(sig.to_bytes().to_vec());
+        edge
+    }
 }
 
 fn verify_sig(pubkey_hex: &str, msg: &[u8], sig: &Option<Vec<u8>>) -> Result<(), AssertError> {
@@ -346,6 +382,25 @@ mod tests {
         // idempotent re-merge
         apply_diff(&store, &restored).unwrap();
         assert_eq!(store.node_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn proposed_edge_is_quarantined_signed_and_advisory() {
+        let a = asserter(7);
+        let n1 = a.assert_node("r", NodeKind::Rationale, "anchor", 1);
+        let n2 = a.assert_node("r", NodeKind::Rationale, "peer", 1);
+        let e = a.propose_edge(
+            n1.compute_id(),
+            n2.compute_id(),
+            EdgeKind::AnalogousTo,
+            EdgeMethod::Analogy,
+            Some("cosine 0.81, structure 3/4".into()),
+            2,
+        );
+        assert!(e.quarantined, "proposals start quarantined (R1)");
+        assert_eq!(e.trust_tier, TrustTier::InferredAdvisory);
+        assert_eq!(e.provenance.method, EdgeMethod::Analogy);
+        assert!(verify_edge(&e).is_ok(), "proposal passes the FUA-02 write boundary");
     }
 
     #[test]
