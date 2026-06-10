@@ -21,7 +21,7 @@ use mem_store::MemoryDagStore;
 
 fn main() {
     let db = std::env::args().nth(1).unwrap_or_else(|| "./data/federation.memdag".to_string());
-    let store = MemoryDagStore::<MemoryNode>::open_rocksdb(&db).expect("open rocksdb store");
+    let store = MemoryDagStore::<MemoryNode>::open_rocksdb_auto(&db).expect("open rocksdb store");
 
     let mut grant = CapabilityGrant {
         id: "stdio-demo".into(),

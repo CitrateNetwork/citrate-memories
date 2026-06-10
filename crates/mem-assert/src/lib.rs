@@ -32,6 +32,11 @@ pub enum AssertError {
     Supersession(#[from] SupersessionError),
     #[error("serialization error: {0}")]
     Serde(String),
+    /// FUA-MEMORIES-02: the signed-assert path tried to write a plane/trust-tier
+    /// it is not allowed to mint (e.g. Derived plane, or the high-trust
+    /// DerivedDeterministic / HumanConfirmed tiers).
+    #[error("not assertable: {0}")]
+    NotAssertable(String),
 }
 
 /// A signing identity for assertions. The author is the hex of the ed25519
@@ -104,6 +109,42 @@ impl Asserter {
         edge.signature = Some(sig.to_bytes().to_vec());
         edge
     }
+
+    /// Build a signed **proposal** edge (MEM-S4 WP-4.1): quarantined at the
+    /// `InferredAdvisory` tier — advisory until a `confirm` promotes it, so a
+    /// model's output can never be load-bearing on arrival (anti-poisoning,
+    /// R1). `method` records who inferred it (`Nlp` / `Analogy`); `evidence`
+    /// is the human-auditable why.
+    pub fn propose_edge(
+        &self,
+        from: ContentHash,
+        to: ContentHash,
+        kind: EdgeKind,
+        method: EdgeMethod,
+        evidence: Option<String>,
+        now_ms: u64,
+    ) -> Edge {
+        use ed25519_dalek::Signer;
+        let mut edge = Edge {
+            from,
+            to,
+            kind,
+            plane: Plane::Asserted,
+            trust_tier: TrustTier::InferredAdvisory,
+            provenance: EdgeProvenance {
+                method,
+                asserter: self.pubkey_hex.clone(),
+                at: now_ms,
+                evidence,
+            },
+            confidence: vec![BelnapValue::True],
+            quarantined: true,
+            signature: None,
+        };
+        let sig = self.sk.sign(&edge.key());
+        edge.signature = Some(sig.to_bytes().to_vec());
+        edge
+    }
 }
 
 fn verify_sig(pubkey_hex: &str, msg: &[u8], sig: &Option<Vec<u8>>) -> Result<(), AssertError> {
@@ -116,13 +157,36 @@ fn verify_sig(pubkey_hex: &str, msg: &[u8], sig: &Option<Vec<u8>>) -> Result<(),
     vk.verify_strict(msg, &signature).map_err(|_| AssertError::BadSignature)
 }
 
-/// Verify a signed Asserted node (author + signature over its id).
+/// FUA-MEMORIES-02: the write boundary for the signed-assert path. An agent's
+/// self-signed assertion may only land on the **Asserted** plane at an
+/// **AgentAsserted** or **InferredAdvisory** tier. The high-trust
+/// `DerivedDeterministic` / `HumanConfirmed` tiers and the `Derived` plane must
+/// come from deterministic ingest or an explicit human-confirmation path — never
+/// an agent's claim. `trust_tier` is excluded from `compute_id` (so it is not
+/// covered by the signature), which is exactly why it must be policed here.
+fn assertable_plane_and_tier(plane: Plane, tier: TrustTier) -> Result<(), AssertError> {
+    if plane != Plane::Asserted {
+        return Err(AssertError::NotAssertable(format!(
+            "plane must be Asserted on the assert path, got {plane:?}"
+        )));
+    }
+    if !matches!(tier, TrustTier::AgentAsserted | TrustTier::InferredAdvisory) {
+        return Err(AssertError::NotAssertable(format!(
+            "trust_tier must be AgentAsserted or InferredAdvisory, got {tier:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify a signed Asserted node (plane/tier policy + author + signature over id).
 pub fn verify_node(node: &MemoryNode) -> Result<(), AssertError> {
+    assertable_plane_and_tier(node.plane, node.trust_tier)?;
     verify_sig(&node.author, node.compute_id().as_bytes(), &node.signature)
 }
 
-/// Verify a signed Asserted edge (asserter + signature over its key).
+/// Verify a signed Asserted edge (plane/tier policy + asserter + signature).
 pub fn verify_edge(edge: &Edge) -> Result<(), AssertError> {
+    assertable_plane_and_tier(edge.plane, edge.trust_tier)?;
     verify_sig(&edge.provenance.asserter, &edge.key(), &edge.signature)
 }
 
@@ -252,6 +316,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_forged_trust_tier_and_plane() {
+        // FUA-MEMORIES-02: `trust_tier` is EXCLUDED from compute_id, so a signer
+        // can flip it to the high-trust DerivedDeterministic / HumanConfirmed
+        // AFTER signing and the signature still verifies. And a self-signed node
+        // can claim the Derived plane. The write boundary must refuse both.
+        let a = asserter(7);
+        let mut n = a.assert_node("r", NodeKind::Rationale, "an agent's claim", 1);
+        assert!(verify_node(&n).is_ok());
+
+        // Forge the highest trust tier (signature still valid — tier isn't signed).
+        n.trust_tier = TrustTier::DerivedDeterministic;
+        assert!(matches!(verify_node(&n), Err(AssertError::NotAssertable(_))));
+        n.trust_tier = TrustTier::HumanConfirmed;
+        assert!(matches!(verify_node(&n), Err(AssertError::NotAssertable(_))));
+
+        // Claim the Derived plane (refused before the signature is even checked).
+        let mut d = a.assert_node("r", NodeKind::Rationale, "x", 1);
+        d.plane = Plane::Derived;
+        assert!(matches!(verify_node(&d), Err(AssertError::NotAssertable(_))));
+    }
+
+    #[test]
     fn tampered_node_fails_verification() {
         let a = asserter(1);
         let mut n = a.assert_node("r", NodeKind::Rationale, "original", 5);
@@ -296,6 +382,25 @@ mod tests {
         // idempotent re-merge
         apply_diff(&store, &restored).unwrap();
         assert_eq!(store.node_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn proposed_edge_is_quarantined_signed_and_advisory() {
+        let a = asserter(7);
+        let n1 = a.assert_node("r", NodeKind::Rationale, "anchor", 1);
+        let n2 = a.assert_node("r", NodeKind::Rationale, "peer", 1);
+        let e = a.propose_edge(
+            n1.compute_id(),
+            n2.compute_id(),
+            EdgeKind::AnalogousTo,
+            EdgeMethod::Analogy,
+            Some("cosine 0.81, structure 3/4".into()),
+            2,
+        );
+        assert!(e.quarantined, "proposals start quarantined (R1)");
+        assert_eq!(e.trust_tier, TrustTier::InferredAdvisory);
+        assert_eq!(e.provenance.method, EdgeMethod::Analogy);
+        assert!(verify_edge(&e).is_ok(), "proposal passes the FUA-02 write boundary");
     }
 
     #[test]

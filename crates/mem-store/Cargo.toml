@@ -23,3 +23,7 @@ default = []
 # Durable RocksDB backend (same KvStore trait). Off by default so the standard
 # `cargo test` stays fast and the in-memory backend is the test default.
 rocksdb = ["dep:rocksdb"]
+
+[[example]]
+name = "reencrypt"
+required-features = ["rocksdb"]
