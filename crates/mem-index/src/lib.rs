@@ -6,9 +6,11 @@
 //! a transformer embedder and an HNSW index without touching callers.
 
 pub mod embed;
+pub mod hnsw;
 pub mod index;
 
 pub use embed::{EmbedError, Embedder, HashingEmbedder};
+pub use hnsw::HnswIndex;
 pub use index::{BruteForceIndex, IndexError, Neighbor, VectorIndex};
 
 #[cfg(feature = "transformer")]

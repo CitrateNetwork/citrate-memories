@@ -14,9 +14,11 @@
 //! current scale (~8k nodes); a per-tenant index/CF is a later refinement.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use mem_core::{ContentHash, MemoryNode, NodeKind, Plane, SourceRef, Timestamp, TrustTier};
-use mem_index::{BruteForceIndex, Embedder, HashingEmbedder, VectorIndex};
+use mem_index::{BruteForceIndex, Embedder, HashingEmbedder, HnswIndex, VectorIndex};
 use mem_ingest::{Ingestor, Watermark, EMBED_DIM};
 use mem_store::{MemoryDagStore, StoreError};
 
@@ -106,9 +108,88 @@ pub fn detect_store_embedding_model(
         .find_map(|n| n.embedding.map(|v| v.model)))
 }
 
+/// One cached per-tenant HNSW index plus the store state it was built from.
+struct CachedTenantIndex {
+    watermark: Option<Watermark>,
+    /// Global node count at build time — catches Asserted-plane writes, which
+    /// land without bumping the ingest watermark.
+    node_count: usize,
+    /// Tenant size at build (incl. nodes without embeddings), for `total_in_tenant`.
+    tenant_total: usize,
+    index: Arc<HnswIndex>,
+}
+
+/// Cross-query (and, in the daemon, cross-session) cache of per-tenant
+/// [`HnswIndex`]es — what makes search sub-linear in practice. Building any
+/// ANN index is itself a full scan, so it only pays off amortised: build once
+/// per (tenant, store-state), then every later query skips both the tenant
+/// scan and the brute-force pass. An entry is invalidated when the repo's
+/// ingest watermark or the global node count changes.
+#[derive(Default)]
+pub struct TenantIndexCache {
+    entries: Mutex<HashMap<String, CachedTenantIndex>>,
+    builds: AtomicUsize,
+    hits: AtomicUsize,
+}
+
+impl TenantIndexCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many indexes have been (re)built — observable for tests and ops.
+    pub fn builds(&self) -> usize {
+        self.builds.load(Ordering::Relaxed)
+    }
+
+    /// How many lookups were served from cache.
+    pub fn hits(&self) -> usize {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Return the cached index for `repo` if it still matches the store state,
+    /// else build, cache, and return a fresh one. The lock is held across the
+    /// build so concurrent first-queries do one build, not N.
+    fn get_or_build<F>(
+        &self,
+        repo: &str,
+        watermark: &Option<Watermark>,
+        node_count: usize,
+        build: F,
+    ) -> Result<(Arc<HnswIndex>, usize), StoreError>
+    where
+        F: FnOnce() -> Result<(HnswIndex, usize), StoreError>,
+    {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| StoreError::Backend("tenant index cache poisoned".into()))?;
+        if let Some(e) = entries.get(repo) {
+            if e.watermark == *watermark && e.node_count == node_count {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok((Arc::clone(&e.index), e.tenant_total));
+            }
+        }
+        let (index, tenant_total) = build()?;
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        let index = Arc::new(index);
+        entries.insert(
+            repo.to_string(),
+            CachedTenantIndex {
+                watermark: watermark.clone(),
+                node_count,
+                tenant_total,
+                index: Arc::clone(&index),
+            },
+        );
+        Ok((index, tenant_total))
+    }
+}
+
 pub struct Recall<'a> {
     store: &'a MemoryDagStore<MemoryNode>,
     embedder: Box<dyn Embedder>,
+    index_cache: Option<Arc<TenantIndexCache>>,
 }
 
 impl<'a> Recall<'a> {
@@ -120,13 +201,21 @@ impl<'a> Recall<'a> {
         Self {
             store,
             embedder: Box::new(HashingEmbedder::new(EMBED_DIM)),
+            index_cache: None,
         }
     }
 
     /// Recall whose query embedder is explicit — must match the model the tenant's
     /// nodes were embedded with, or `search`'s vector-space guard rejects the query.
     pub fn with_embedder(store: &'a MemoryDagStore<MemoryNode>, embedder: Box<dyn Embedder>) -> Self {
-        Self { store, embedder }
+        Self { store, embedder, index_cache: None }
+    }
+
+    /// Serve `search` from a shared [`TenantIndexCache`] (HNSW, built once per
+    /// tenant per store-state) instead of scanning + brute-forcing per query.
+    pub fn with_index_cache(mut self, cache: Arc<TenantIndexCache>) -> Self {
+        self.index_cache = Some(cache);
+        self
     }
 
     /// All non-reference nodes for a tenant repo.
@@ -166,6 +255,9 @@ impl<'a> Recall<'a> {
     /// embedded in the same space as ingest, so the index's model-version guard
     /// lines up.
     pub fn search(&self, repo: &str, query: &str, budget: usize) -> Result<RecallResult, StoreError> {
+        if let Some(cache) = &self.index_cache {
+            return self.search_cached(Arc::clone(cache), repo, query, budget);
+        }
         let nodes = self.tenant_nodes(repo)?;
         let total = nodes.len();
 
@@ -189,6 +281,47 @@ impl<'a> Recall<'a> {
         Ok(RecallResult {
             repo: repo.to_string(),
             watermark: self.watermark(repo),
+            total_in_tenant: total,
+            items,
+        })
+    }
+
+    /// `search` served from the shared HNSW cache: reuse the tenant's index when
+    /// the store hasn't changed, else rebuild it (one full scan, amortised over
+    /// every following query). Hits resolve to nodes by id — `budget` point reads,
+    /// not a tenant scan.
+    fn search_cached(
+        &self,
+        cache: Arc<TenantIndexCache>,
+        repo: &str,
+        query: &str,
+        budget: usize,
+    ) -> Result<RecallResult, StoreError> {
+        let watermark = self.watermark(repo);
+        let node_count = self.store.node_count()?;
+        let (index, total) = cache.get_or_build(repo, &watermark, node_count, || {
+            let nodes = self.tenant_nodes(repo)?;
+            let mut index = HnswIndex::new();
+            for n in &nodes {
+                if let Some(v) = &n.embedding {
+                    // Skip vectors from a mismatched model, like the uncached path.
+                    let _ = index.add(n.compute_id(), v);
+                }
+            }
+            Ok((index, nodes.len()))
+        })?;
+
+        let q = self.embedder.embed(query).map_err(|e| StoreError::Backend(e.to_string()))?;
+        let hits = index.search(&q, budget).unwrap_or_default();
+        let mut items = Vec::with_capacity(hits.len());
+        for nb in hits {
+            if let Some(n) = self.store.get_node(&nb.id)? {
+                items.push(RecallItem::from_node(&n, Some(nb.score)));
+            }
+        }
+        Ok(RecallResult {
+            repo: repo.to_string(),
+            watermark,
             total_in_tenant: total,
             items,
         })
@@ -286,6 +419,55 @@ mod tests {
         let s = store_with(&[node("a", "n1", 1), node("a", "n2", 2), node("a", "n3", 3)]);
         let r = Recall::new(&s).storyline("a", 2).unwrap();
         assert_eq!(r.items.len(), 2);
+    }
+
+    #[test]
+    fn cached_search_matches_uncached_and_reuses_index() {
+        // Graded relevance (2 / 1 / 0 query tokens shared) so every rank is
+        // determined — ties among zero-overlap items are float noise, not ranking.
+        let s = store_with(&[
+            node("a", "rocksdb storage durability backend", 1),
+            node("a", "storage compaction write amplification", 2),
+            node("a", "belnap four valued logic lattice", 3),
+            node("b", "other tenant noise", 4),
+        ]);
+        let cache = Arc::new(TenantIndexCache::new());
+        let plain = Recall::new(&s).search("a", "rocksdb storage", 2).unwrap();
+        let cached_recall = Recall::new(&s).with_index_cache(Arc::clone(&cache));
+
+        let first = cached_recall.search("a", "rocksdb storage", 2).unwrap();
+        let second = cached_recall.search("a", "rocksdb storage", 2).unwrap();
+
+        for r in [&first, &second] {
+            assert_eq!(r.total_in_tenant, plain.total_in_tenant);
+            let plain_titles: Vec<_> = plain.items.iter().map(|i| i.title.as_str()).collect();
+            let titles: Vec<_> = r.items.iter().map(|i| i.title.as_str()).collect();
+            assert_eq!(titles, plain_titles, "cached search must rank like the exact path");
+        }
+        assert_eq!(cache.builds(), 1, "one build serves both queries");
+        assert_eq!(cache.hits(), 1, "second query came from cache");
+    }
+
+    #[test]
+    fn cache_rebuilds_when_store_changes() {
+        let s = store_with(&[node("a", "rocksdb storage durability backend", 1)]);
+        let cache = Arc::new(TenantIndexCache::new());
+        let recall = Recall::new(&s).with_index_cache(Arc::clone(&cache));
+
+        let r = recall.search("a", "consensus tip selection ghostdag", 5).unwrap();
+        assert_eq!(r.total_in_tenant, 1);
+        assert_eq!(cache.builds(), 1);
+
+        // An Asserted-plane-style write lands without bumping the watermark; the
+        // node-count check must still invalidate the entry.
+        s.put_node(&node("a", "ghostdag tip selection consensus", 9)).unwrap();
+        let r = recall.search("a", "consensus tip selection ghostdag", 5).unwrap();
+        assert_eq!(cache.builds(), 2, "store change must rebuild the index");
+        assert_eq!(r.total_in_tenant, 2);
+        assert!(
+            r.items[0].title.contains("ghostdag"),
+            "the new node must be searchable immediately"
+        );
     }
 
     #[test]

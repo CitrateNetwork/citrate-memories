@@ -106,6 +106,7 @@ fn main() {
     eprintln!("mcp_serve: serving {db} on {sock}");
 
     let write_gate = Arc::new(Mutex::new(()));
+    let index_cache = Arc::new(mem_query::TenantIndexCache::new());
     let store = &store;
     std::thread::scope(|scope| {
         for conn in listener.incoming() {
@@ -118,11 +119,13 @@ fn main() {
             };
             let embedder = query_embedder.clone();
             let gate = Arc::clone(&write_gate);
+            let cache = Arc::clone(&index_cache);
             scope.spawn(move || {
                 // Fresh session: own grant, own signing identity, own audit chain.
                 let mut server =
                     MemoryMcpServer::new_with_asserter(store, demo_grant(), Asserter::new(SigningKey::from_bytes(&[2u8; 32])))
-                        .with_write_gate(gate);
+                        .with_write_gate(gate)
+                        .with_index_cache(cache);
                 if let Some(e) = embedder {
                     server = server.with_query_embedder(e);
                 }

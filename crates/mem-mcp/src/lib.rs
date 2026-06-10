@@ -19,7 +19,7 @@ use mem_assert::{apply_diff, Asserter, MemoryDiff};
 use mem_authz::{AuditChain, CapabilityGrant, MemoryEvent, Op};
 use mem_core::{ClaimStatus, MemoryNode, NodeKind};
 use mem_index::Embedder;
-use mem_query::{Direction, Recall, RecallResult};
+use mem_query::{Direction, Recall, RecallResult, TenantIndexCache};
 use mem_store::MemoryDagStore;
 
 fn now_ms() -> u64 {
@@ -44,6 +44,10 @@ pub struct MemoryMcpServer<'a> {
     /// [`with_query_embedder`](MemoryMcpServer::with_query_embedder)) so the index's
     /// model-version guard lines up instead of rejecting every search.
     query_embedder: Option<Arc<dyn Embedder>>,
+    /// Shared per-tenant HNSW cache: `memory.search` reuses one index across
+    /// queries (and, in the daemon, across sessions) instead of scanning +
+    /// brute-forcing the tenant per call. `None` → exact per-query search.
+    index_cache: Option<Arc<TenantIndexCache>>,
     /// Serializes store mutations across concurrent sessions. The store's reads
     /// are snapshot-consistent and every write lands as one atomic batch, but
     /// `merge_diff` does check-then-write (cycle guard), so two sessions writing
@@ -60,6 +64,7 @@ impl<'a> MemoryMcpServer<'a> {
             grant,
             asserter: None,
             query_embedder: None,
+            index_cache: None,
             write_gate: None,
             audit: AuditChain::new(),
         }
@@ -76,6 +81,7 @@ impl<'a> MemoryMcpServer<'a> {
             grant,
             asserter: Some(asserter),
             query_embedder: None,
+            index_cache: None,
             write_gate: None,
             audit: AuditChain::new(),
         }
@@ -85,6 +91,14 @@ impl<'a> MemoryMcpServer<'a> {
     /// embedded with). Load it once and share it for the whole session.
     pub fn with_query_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.query_embedder = Some(embedder);
+        self
+    }
+
+    /// Share `cache` with every server bound to the same store: `memory.search`
+    /// builds each tenant's HNSW index once and every session reuses it until
+    /// the store changes.
+    pub fn with_index_cache(mut self, cache: Arc<TenantIndexCache>) -> Self {
+        self.index_cache = Some(cache);
         self
     }
 
@@ -209,10 +223,13 @@ impl<'a> MemoryMcpServer<'a> {
         if let Err(deny) = self.authorize_read(&repo, &format!("memory.search {query:?}")) {
             return Ok(deny);
         }
-        let recall = match &self.query_embedder {
+        let mut recall = match &self.query_embedder {
             Some(e) => Recall::with_embedder(self.store, Box::new(Arc::clone(e))),
             None => Recall::new(self.store),
         };
+        if let Some(cache) = &self.index_cache {
+            recall = recall.with_index_cache(Arc::clone(cache));
+        }
         let result = recall.search(&repo, &query, budget).map_err(store_err)?;
         Ok(tool_text(render_result(&result)))
     }
@@ -478,6 +495,8 @@ mod tests {
     use mem_assert::Asserter;
 
     fn node(repo: &str, subject: &str) -> MemoryNode {
+        // Embedded with Recall::new's default space (hashing, d=256) so search works.
+        let embedding = Some(mem_index::HashingEmbedder::new(256).embed(subject).unwrap());
         MemoryNode {
             schema_version: SCHEMA_VERSION,
             plane: Plane::Derived,
@@ -491,7 +510,7 @@ mod tests {
             observed_at: 1,
             trust_tier: TrustTier::DerivedDeterministic,
             signature: None,
-            embedding: None,
+            embedding,
             confidence: vec![],
             anchors: vec![],
             status: Status::Active,
@@ -627,6 +646,24 @@ mod tests {
         assert_eq!(v["result"]["isError"], true);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("signing identity"));
+    }
+
+    #[test]
+    fn search_through_shared_index_cache() {
+        let s = store();
+        let cache = Arc::new(TenantIndexCache::new());
+        // Two sessions sharing one cache, like daemon connections.
+        let mut srv_a = MemoryMcpServer::new(&s, grant()).with_index_cache(Arc::clone(&cache));
+        let mut srv_b = MemoryMcpServer::new(&s, grant()).with_index_cache(Arc::clone(&cache));
+        let call = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"memory.search","arguments":{"repo":"citrate-chain","query":"ghostdag tip","budget":2}}}"#;
+        for srv in [&mut srv_a, &mut srv_b] {
+            let v: Value = serde_json::from_str(&srv.handle_line(call).unwrap()).unwrap();
+            assert_eq!(v["result"]["isError"], false);
+            let text = v["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("ghostdag"), "search should surface the chain node");
+        }
+        assert_eq!(cache.builds(), 1, "one HNSW build serves both sessions");
+        assert_eq!(cache.hits(), 1, "second session reused the index");
     }
 
     /// Drive one full client session over a real socket: write requests on one end
