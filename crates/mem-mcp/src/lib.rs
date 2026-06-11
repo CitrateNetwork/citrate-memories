@@ -53,7 +53,10 @@ pub struct MemoryMcpServer<'a> {
     /// `merge_diff` does check-then-write (cycle guard), so two sessions writing
     /// at once must take turns. `None` → single-session (stdio), no gate needed.
     write_gate: Option<Arc<Mutex<()>>>,
-    audit: AuditChain,
+    /// Hash-chained audit log. Shared (`Arc<Mutex<…>>`) so the daemon can bind
+    /// every session to ONE persistent chain (`AuditChain::open`) that survives
+    /// restart; defaults to a fresh in-memory chain per server.
+    audit: Arc<Mutex<AuditChain>>,
 }
 
 impl<'a> MemoryMcpServer<'a> {
@@ -66,7 +69,7 @@ impl<'a> MemoryMcpServer<'a> {
             query_embedder: None,
             index_cache: None,
             write_gate: None,
-            audit: AuditChain::new(),
+            audit: Arc::new(Mutex::new(AuditChain::new())),
         }
     }
 
@@ -83,7 +86,7 @@ impl<'a> MemoryMcpServer<'a> {
             query_embedder: None,
             index_cache: None,
             write_gate: None,
-            audit: AuditChain::new(),
+            audit: Arc::new(Mutex::new(AuditChain::new())),
         }
     }
 
@@ -122,8 +125,17 @@ impl<'a> MemoryMcpServer<'a> {
         }
     }
 
-    pub fn audit(&self) -> &AuditChain {
-        &self.audit
+    /// Bind this session to `audit` — share one persistent chain
+    /// ([`AuditChain::open`]) across every session so the log survives restart.
+    pub fn with_audit_chain(mut self, audit: Arc<Mutex<AuditChain>>) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// The session's audit chain (locked). Panics only if another thread
+    /// panicked while appending — at which point the log is suspect anyway.
+    pub fn audit(&self) -> std::sync::MutexGuard<'_, AuditChain> {
+        self.audit.lock().expect("audit chain lock poisoned")
     }
 
     /// Handle one JSON-RPC line. Returns `Some(response)` for requests and `None`
@@ -183,23 +195,34 @@ impl<'a> MemoryMcpServer<'a> {
     fn authorize(&mut self, op: Op, repo: &str, detail: &str) -> Result<(), Value> {
         let resource = format!("repo:{repo}/memory");
         let now = now_ms();
+        // Fail closed: an operation that cannot be audited does not run.
+        let mut audit = match self.audit.lock() {
+            Ok(g) => g,
+            Err(_) => return Err(tool_error("audit chain lock poisoned; refusing to proceed".to_string())),
+        };
         match self.grant.check(&resource, op, now) {
             Ok(()) => {
                 let event = match op {
                     Op::Read => MemoryEvent::Read,
                     Op::Write => MemoryEvent::Write,
                 };
-                self.audit.append(event, self.grant.recipient.clone(), resource, detail.to_string(), now);
+                audit
+                    .append(event, self.grant.recipient.clone(), resource, detail.to_string(), now)
+                    .map_err(|e| tool_error(format!("audit append failed; refusing to proceed: {e}")))?;
                 Ok(())
             }
             Err(e) => {
-                self.audit.append(
+                if let Err(ae) = audit.append(
                     MemoryEvent::Denied,
                     self.grant.recipient.clone(),
                     resource,
                     format!("{detail}: {e}"),
                     now,
-                );
+                ) {
+                    return Err(tool_error(format!(
+                        "authorization denied: {e} (and the denial could not be audited: {ae})"
+                    )));
+                }
                 Err(tool_error(format!("authorization denied: {e}")))
             }
         }
@@ -891,6 +914,46 @@ mod tests {
         assert_eq!(v["result"]["isError"], true, "recall on ungranted repo must be denied");
         assert_eq!(srv.audit().records()[0].event, MemoryEvent::Denied);
         assert_eq!(srv.audit().verify_integrity(), Ok(1));
+    }
+
+    /// SECREM-02 7.5: the audit chain bound via `with_audit_chain` survives a
+    /// server "restart" — reopened from disk, it verifies and continues.
+    #[test]
+    fn persistent_audit_chain_survives_server_restart() {
+        let log = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let mut p = std::env::temp_dir();
+            p.push(format!("memmcp-audit-{}-{nanos}.jsonl", std::process::id()));
+            p
+        };
+        let s = store();
+        {
+            let chain = AuditChain::open(&log).expect("open persistent chain");
+            let mut srv = MemoryMcpServer::new(&s, grant())
+                .with_audit_chain(Arc::new(Mutex::new(chain)));
+            let ok = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-chain"}}}"#;
+            let deny = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#;
+            srv.handle_line(ok).unwrap();
+            srv.handle_line(deny).unwrap();
+            assert_eq!(srv.audit().len(), 2);
+        } // daemon restart
+        {
+            let chain = AuditChain::open(&log).expect("reopen persistent chain");
+            assert_eq!(chain.verify_integrity(), Ok(2), "pre-restart records survive and verify");
+            assert_eq!(chain.records()[1].event, MemoryEvent::Denied);
+            let mut srv = MemoryMcpServer::new(&s, grant())
+                .with_audit_chain(Arc::new(Mutex::new(chain)));
+            let again = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-chain"}}}"#;
+            srv.handle_line(again).unwrap();
+            // The chain CONTINUES from the pre-restart head, not from genesis.
+            assert_eq!(srv.audit().records()[2].sequence, 2);
+            assert_eq!(srv.audit().verify_integrity(), Ok(3));
+        }
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(format!("{}.head", log.display()));
     }
 
     #[test]

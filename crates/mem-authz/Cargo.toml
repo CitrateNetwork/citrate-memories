@@ -9,6 +9,7 @@ description = "citrate-memories authorization: signed CapabilityGrants + hash-ch
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 blake3.workspace = true
 hex.workspace = true
 thiserror.workspace = true
