@@ -11,6 +11,7 @@
 //! ever calls a model or writes a non-deterministic edge.
 
 pub mod docs;
+pub mod federation;
 pub mod frontmatter;
 pub mod git;
 pub mod trailers;

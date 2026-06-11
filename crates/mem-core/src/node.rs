@@ -93,6 +93,9 @@ pub enum NodeKind {
     /// Generic markdown document that doesn't match a more specific kind
     /// (e.g. a planset/design doc).
     Doc,
+    /// Federation meta-graph: one node per tenant repo (role/tier summary),
+    /// living in the reserved `federation` tenant (MEM-S4 WP-4.4).
+    Tenant,
 }
 
 impl NodeKind {
@@ -120,6 +123,7 @@ impl NodeKind {
             NodeKind::Rationale => "rationale".into(),
             NodeKind::AnalogyHypothesis => "analogy_hypothesis".into(),
             NodeKind::Doc => "doc".into(),
+            NodeKind::Tenant => "tenant".into(),
         }
     }
 }

@@ -27,3 +27,7 @@ rocksdb = ["dep:rocksdb"]
 [[example]]
 name = "reencrypt"
 required-features = ["rocksdb"]
+
+[[example]]
+name = "shred"
+required-features = ["rocksdb"]

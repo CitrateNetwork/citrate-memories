@@ -13,6 +13,7 @@ mem-store = { path = "../mem-store" }
 mem-index = { path = "../mem-index" }
 serde.workspace = true
 serde_json.workspace = true
+blake3.workspace = true
 thiserror.workspace = true
 
 [features]
@@ -24,4 +25,8 @@ transformer = ["mem-index/transformer"]
 
 [[example]]
 name = "backfill"
+required-features = ["rocksdb"]
+
+[[example]]
+name = "meta_ingest"
 required-features = ["rocksdb"]
