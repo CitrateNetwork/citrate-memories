@@ -16,7 +16,7 @@ pub mod frontmatter;
 pub mod git;
 pub mod trailers;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -179,14 +179,73 @@ fn make_edge(
     }
 }
 
+/// FUA-MEMORIES-06: edge kinds that RETRACT or CONTRADICT existing memory. A git
+/// commit (or doc) trailer is not, by itself, sufficient authority to assert one
+/// — that's an authorial act that must be confirmed on the Asserted plane (cf.
+/// mem-assert). Structural kinds (Implements/Decides/DependsOn/References/…) are
+/// not gated.
+fn is_authority_bearing(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Supersedes | EdgeKind::Refutes)
+}
+
+/// Build a trailer-derived edge, attributed to the trailer's AUTHOR (not the
+/// generic "ingest" identity). Authority-bearing kinds are LOAD-BEARING only when
+/// `author` is in `authoritative`; otherwise the edge is quarantined — recorded
+/// and attributed, but never auto-applied (e.g. a quarantined `Supersedes` does
+/// not transition its target). This is the trailer authorial gate (FUA-MEMORIES-06).
+fn make_trailer_edge(
+    from: ContentHash,
+    to: ContentHash,
+    kind: EdgeKind,
+    now_ms: u64,
+    evidence: Option<String>,
+    author: &str,
+    authoritative: &HashSet<String>,
+) -> Edge {
+    let quarantined = is_authority_bearing(kind) && !authoritative.contains(author);
+    Edge {
+        from,
+        to,
+        kind,
+        plane: Plane::Derived,
+        trust_tier: TrustTier::DerivedDeterministic,
+        provenance: EdgeProvenance {
+            method: EdgeMethod::Trailer,
+            asserter: author.to_string(),
+            at: now_ms,
+            evidence,
+        },
+        confidence: vec![BelnapValue::True],
+        quarantined,
+        signature: None,
+    }
+}
+
 /// Pure core: commits -> (nodes, edges). Deterministic given the same inputs
 /// (modulo `now_ms`, which only lands on non-identity fields). Exposed so it can
 /// be tested without a git repo.
+///
+/// Fail-closed: no author is treated as authoritative, so authority-bearing
+/// trailers (Supersedes/Refutes) are quarantined. Use [`build_graph_gated`] to
+/// pass the authoritative-author allowlist (FUA-MEMORIES-06).
 pub fn build_graph(
     repo: &str,
     recs: &[CommitRecord],
     now_ms: u64,
     embedder: &dyn Embedder,
+) -> Result<(Vec<MemoryNode>, Vec<Edge>), IngestError> {
+    build_graph_gated(repo, recs, now_ms, embedder, &HashSet::new())
+}
+
+/// As [`build_graph`], but `authoritative` lists the authors whose
+/// authority-bearing trailers (Supersedes/Refutes) are load-bearing rather than
+/// quarantined (FUA-MEMORIES-06).
+pub fn build_graph_gated(
+    repo: &str,
+    recs: &[CommitRecord],
+    now_ms: u64,
+    embedder: &dyn Embedder,
+    authoritative: &HashSet<String>,
 ) -> Result<(Vec<MemoryNode>, Vec<Edge>), IngestError> {
     let mut sha_to_id: HashMap<String, ContentHash> = HashMap::new();
     let mut ref_ids: HashMap<String, ContentHash> = HashMap::new();
@@ -211,7 +270,7 @@ pub fn build_graph(
             }
         }
 
-        // Load-bearing trailer edges.
+        // Trailer edges, attributed to the commit author and authorially gated.
         for t in trailers::parse_trailers(&rec.body) {
             if let Some(ek) = trailers::map_trailer(&t.key) {
                 let rid = *ref_ids.entry(t.value.clone()).or_insert_with(|| {
@@ -220,7 +279,15 @@ pub fn build_graph(
                     nodes.push(rn);
                     rid
                 });
-                edges.push(make_edge(id, rid, ek, EdgeMethod::Trailer, now_ms, Some(t.key.clone())));
+                edges.push(make_trailer_edge(
+                    id,
+                    rid,
+                    ek,
+                    now_ms,
+                    Some(t.key.clone()),
+                    &rec.author,
+                    authoritative,
+                ));
             }
         }
     }
@@ -281,6 +348,7 @@ fn build_doc_graph(
     repo_root: &Path,
     now_ms: u64,
     embedder: &dyn Embedder,
+    authoritative: &HashSet<String>,
 ) -> Result<(Vec<MemoryNode>, Vec<Edge>, usize), IngestError> {
     let paths = docs::list_md_files(repo_root)?;
     let mut nodes: Vec<MemoryNode> = Vec::new();
@@ -297,6 +365,8 @@ fn build_doc_graph(
         let (fm, body) = frontmatter::parse(&text);
         let kind = docs::classify(rel, &fm, body);
         let title = docs::doc_title(rel, &fm, body);
+        // The doc's frontmatter author owns its agentile-block trailers.
+        let doc_author = fm.get("author").cloned().unwrap_or_else(|| "ingest".to_string());
         let node = doc_node(repo, rel, &title, bytes.len(), &fm, kind, body, now_ms, embedder)?;
         let id = node.compute_id();
         nodes.push(node);
@@ -310,7 +380,15 @@ fn build_doc_graph(
                     nodes.push(rn);
                     rid
                 });
-                edges.push(make_edge(id, rid, ek, EdgeMethod::Trailer, now_ms, Some(t.key.clone())));
+                edges.push(make_trailer_edge(
+                    id,
+                    rid,
+                    ek,
+                    now_ms,
+                    Some(t.key.clone()),
+                    &doc_author,
+                    authoritative,
+                ));
             }
         }
     }
@@ -327,6 +405,9 @@ fn build_doc_graph(
 pub struct Ingestor {
     repo_name: String,
     embedder: Box<dyn Embedder>,
+    /// Authors whose authority-bearing trailers (Supersedes/Refutes) are
+    /// load-bearing rather than quarantined (FUA-MEMORIES-06). Empty = fail-closed.
+    authoritative_authors: HashSet<String>,
 }
 
 impl Ingestor {
@@ -334,6 +415,7 @@ impl Ingestor {
         Self {
             repo_name: repo_name.into(),
             embedder: Box::new(HashingEmbedder::new(EMBED_DIM)),
+            authoritative_authors: HashSet::new(),
         }
     }
 
@@ -342,7 +424,18 @@ impl Ingestor {
         Self {
             repo_name: repo_name.into(),
             embedder,
+            authoritative_authors: HashSet::new(),
         }
+    }
+
+    /// Set the authors whose authority-bearing trailers (Supersedes/Refutes) are
+    /// honored as load-bearing. Anyone else's are quarantined (FUA-MEMORIES-06).
+    pub fn with_authoritative_authors(
+        mut self,
+        authors: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.authoritative_authors = authors.into_iter().collect();
+        self
     }
 
     /// Ingest the full git history at `repo_path` into `store`. Idempotent:
@@ -357,9 +450,20 @@ impl Ingestor {
 
         // Derived plane = commits + markdown docs, committed atomically.
         let recs = git::read_commits(&root)?;
-        let (mut nodes, mut edges) = build_graph(&self.repo_name, &recs, now, self.embedder.as_ref())?;
-        let (doc_nodes, doc_edges, doc_count) =
-            build_doc_graph(&self.repo_name, &root, now, self.embedder.as_ref())?;
+        let (mut nodes, mut edges) = build_graph_gated(
+            &self.repo_name,
+            &recs,
+            now,
+            self.embedder.as_ref(),
+            &self.authoritative_authors,
+        )?;
+        let (doc_nodes, doc_edges, doc_count) = build_doc_graph(
+            &self.repo_name,
+            &root,
+            now,
+            self.embedder.as_ref(),
+            &self.authoritative_authors,
+        )?;
         nodes.extend(doc_nodes);
         edges.extend(doc_edges);
 
@@ -486,13 +590,40 @@ mod tests {
         assert_eq!(impl_edges[0].trust_tier, TrustTier::DerivedDeterministic);
     }
 
+    fn authoritative() -> HashSet<String> {
+        // `rec` authors its commits as "tester".
+        HashSet::from(["tester".to_string()])
+    }
+
+    #[test]
+    fn supersedes_trailer_from_unauthoritative_author_is_quarantined() {
+        // FUA-MEMORIES-06: a Supersedes trailer from an author NOT on the
+        // authoritative list is recorded + attributed but quarantined, so it is
+        // never auto-applied (the ingest pipeline only applies !quarantined).
+        let body = "details\n\nAgentile-Supersedes: adr:001";
+        let recs = vec![rec("aaa", &[], "revisit storage decision", body)];
+        // build_graph = fail-closed (empty allowlist) → "tester" is not authoritative.
+        let (_, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
+        let sup: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Supersedes).collect();
+        assert_eq!(sup.len(), 1, "the edge is still recorded");
+        assert!(sup[0].quarantined, "an unauthoritative supersedes is quarantined");
+        assert_eq!(sup[0].provenance.asserter, "tester", "attributed to the real author");
+        // The pipeline's application filter excludes it.
+        assert_eq!(
+            edges.iter().filter(|e| e.kind == EdgeKind::Supersedes && !e.quarantined).count(),
+            0,
+        );
+    }
+
     #[test]
     fn supersedes_trailer_is_applied_with_status_transition() {
         // The full ingest pipeline shape: build the graph, commit the plain
-        // edges, apply the supersessions (WP-1.4).
+        // edges, apply the supersessions (WP-1.4). The author is authoritative,
+        // so the trailer is load-bearing (FUA-MEMORIES-06).
         let body = "details\n\nAgentile-Supersedes: adr:001";
         let recs = vec![rec("aaa", &[], "revisit storage decision", body)];
-        let (nodes, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
+        let (nodes, edges) =
+            build_graph_gated("r", &recs, 1, &embedder(), &authoritative()).unwrap();
 
         let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
         let (supersessions, plain): (Vec<Edge>, Vec<Edge>) =
@@ -515,11 +646,13 @@ mod tests {
     fn bad_supersession_is_counted_not_fatal() {
         let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
         // A supersedes edge whose target was never committed (dangling directive).
+        // Author is authoritative so the edge is load-bearing (FUA-MEMORIES-06).
         let body = "x\n\nAgentile-Supersedes: adr:404";
         let recs = vec![rec("aaa", &[], "subject", body)];
-        let (nodes, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
+        let (nodes, edges) =
+            build_graph_gated("r", &recs, 1, &embedder(), &authoritative()).unwrap();
         let (supersessions, _): (Vec<Edge>, Vec<Edge>) =
-            edges.into_iter().partition(|e| e.kind == EdgeKind::Supersedes);
+            edges.into_iter().partition(|e| e.kind == EdgeKind::Supersedes && !e.quarantined);
         // Commit only the commit/ref nodes minus the target: simulate by NOT
         // committing anything — both endpoints missing.
         let (applied, rejected) = apply_supersessions(&store, &supersessions).unwrap();
