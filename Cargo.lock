@@ -1616,6 +1616,7 @@ dependencies = [
 name = "mem-ingest"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "mem-core",
  "mem-index",
  "mem-store",
@@ -1658,6 +1659,20 @@ dependencies = [
  "hex",
  "mem-core",
  "rocksdb",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mem-sync"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "mem-assert",
+ "mem-core",
+ "mem-store",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
