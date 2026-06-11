@@ -39,7 +39,20 @@ fn main() {
 
     // Session signing identity for assertions.
     let asserter = Asserter::new(SigningKey::from_bytes(&[2u8; 32]));
-    let mut server = MemoryMcpServer::new_with_asserter(&store, grant, asserter);
+
+    // Persistent audit chain (SECREM-02 7.5): verified on load, survives restart.
+    let audit_log = format!("{db}.audit.jsonl");
+    let audit = match mem_authz::AuditChain::open(&audit_log) {
+        Ok(c) => std::sync::Arc::new(std::sync::Mutex::new(c)),
+        Err(e) => {
+            // Fail closed: a chain that cannot be trusted must not be extended.
+            eprintln!("mcp_stdio: audit chain {audit_log} REJECTED: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut server =
+        MemoryMcpServer::new_with_asserter(&store, grant, asserter).with_audit_chain(audit);
 
     // If the store was embedded with a transformer model, load the matching query
     // embedder so memory.search ranks in the same vector space (else the index

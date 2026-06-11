@@ -45,3 +45,15 @@ baseline_test_count: 110
   build-verified-only rows (01/03/05) — fold into Phase 8.2/8.3.
 - Branch: `audit/secrem02-memories-write-plane` (merged `e8d9408`); FUA-MEMORIES-06
   direct on main `840ef94`.
+
+## Phase 7.5 — WP 7.5 (hygiene batch — audit hash-chain persistence)
+
+| Finding | Sev | Red test(s) | Fix | Suite (≥131?) | Mutation | Disposition |
+|---|---|---|---|---|---|---|
+| planned-but-unbuilt: audit chain in-memory/per-session (`mem-authz/src/audit.rs`) | Hygiene→Defense-in-depth | `mem-authz`: `persists_resumes_and_continues_across_reopen`, `truncated_log_is_detected_on_open`, `tampered_log_record_is_detected_on_open`, `missing_head_sidecar_is_detected_on_open`, `crash_window_log_one_ahead_of_head_is_accepted_and_repaired`, `log_more_than_one_ahead_of_head_is_rejected`; `mem-mcp`: `persistent_audit_chain_survives_server_restart` | `AuditChain::open(path)` binds the chain to an append-only JSONL log + `.head` sidecar `(len, last_hash)`; every `append` is write-through (line fsync'd, head atomically replaced via tmp+rename) BEFORE the in-memory state mutates, so callers fail closed; whole chain re-walked on load — in-place edits → `AuditError::Corrupt`, log behind head → `AuditError::Truncated`; one-record crash window accepted + head repaired. `append` now returns `Result` and `mem-mcp::authorize` fails closed (op refused if the audit append fails; poisoned lock refused). Server audit chain is now `Arc<Mutex<…>>` with `with_audit_chain(…)` so the daemon (`mcp_serve`) binds ALL sessions to ONE persistent chain (`<db>.audit.jsonl`, verified at startup, exit 1 on rejection); `mcp_stdio` likewise. | 138 ✓ (was 131; +7) | M1 (truncation check dropped) killed ×1; M2 (write-through dropped) killed ×5; M3 (load linkage check dropped) killed ×1 | **FIXED** |
+
+Notes:
+- Documented limitation: an adversary rewriting BOTH log and head consistently is
+  out of local scope — that is the on-chain anchoring story (`chain_anchor`,
+  MEM-S5 WP-5.2). The head sidecar is the local anti-truncation commitment.
+- Clippy clean on mem-authz + mem-mcp; `cargo check --examples --features rocksdb` clean.

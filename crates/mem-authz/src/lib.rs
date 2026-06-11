@@ -7,5 +7,5 @@
 pub mod audit;
 pub mod grant;
 
-pub use audit::{AuditChain, AuditRecord, MemoryEvent};
+pub use audit::{AuditChain, AuditError, AuditRecord, MemoryEvent};
 pub use grant::{AuthzError, CapabilityGrant, DelegationStep, Op, PolicyProfile, ResourceScope};

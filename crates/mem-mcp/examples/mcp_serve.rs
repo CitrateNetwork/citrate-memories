@@ -12,8 +12,9 @@
 //! remove precisely because we already hold the DB lock no live daemon could
 //! have released.
 //!
-//! Each connection gets its own `MemoryMcpServer` — its own grant + audit chain —
-//! over the shared store; writes are serialized through one write gate. The
+//! Each connection gets its own `MemoryMcpServer` — its own grant — over the
+//! shared store; writes are serialized through one write gate. All sessions
+//! share ONE persistent audit chain (`<db>.audit.jsonl`, verified on load). The
 //! grant here is the same demo wildcard as `mcp_stdio`; per-user signed grants
 //! (citrate-identity SIWE) are the v2 integration (F-5).
 
@@ -96,6 +97,21 @@ fn main() {
     // Load the query embedder ONCE for all sessions, matching the store's model.
     let query_embedder = load_query_embedder(&store);
 
+    // ONE persistent audit chain for the whole daemon (SECREM-02 7.5): every
+    // session appends to it, it is verified on load, and it survives restart.
+    let audit_log = format!("{db}.audit.jsonl");
+    let audit = match mem_authz::AuditChain::open(&audit_log) {
+        Ok(c) => {
+            eprintln!("mcp_serve: audit chain {audit_log} verified ({} records)", c.len());
+            Arc::new(Mutex::new(c))
+        }
+        Err(e) => {
+            // Fail closed: a chain that cannot be trusted must not be extended.
+            eprintln!("mcp_serve: audit chain {audit_log} REJECTED: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
@@ -120,12 +136,15 @@ fn main() {
             let embedder = query_embedder.clone();
             let gate = Arc::clone(&write_gate);
             let cache = Arc::clone(&index_cache);
+            let audit = Arc::clone(&audit);
             scope.spawn(move || {
-                // Fresh session: own grant, own signing identity, own audit chain.
+                // Fresh session: own grant + signing identity; the persistent
+                // audit chain is SHARED so every session extends one log.
                 let mut server =
                     MemoryMcpServer::new_with_asserter(store, demo_grant(), Asserter::new(SigningKey::from_bytes(&[2u8; 32])))
                         .with_write_gate(gate)
-                        .with_index_cache(cache);
+                        .with_index_cache(cache)
+                        .with_audit_chain(audit);
                 if let Some(e) = embedder {
                     server = server.with_query_embedder(e);
                 }
