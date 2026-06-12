@@ -1644,6 +1644,8 @@ dependencies = [
 name = "mem-query"
 version = "0.0.1"
 dependencies = [
+ "ed25519-dalek",
+ "mem-assert",
  "mem-core",
  "mem-index",
  "mem-ingest",
