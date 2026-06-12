@@ -15,6 +15,25 @@ sprint: citrate-memories-program
 > `manifest.toml` `[[drift]]` first (Rules 11/12). This file is the program-level
 > index; it is **not** the per-sprint truth (Rule 4 — that lives in each sprint file).
 
+## Program status (2026-06-11, Lane D close-out)
+
+| Sprint | Status | Where |
+|---|---|---|
+| MEM-S0 Foundations | **CLOSED** (TLC-green + CI gate landed; spec bug caught + fixed) | `sprints/completed/2026-06/` |
+| MEM-S1 Derived plane | **CLOSED** | `sprints/completed/2026-06/` |
+| MEM-S2 MCP + authz | **CLOSED** (SIWE binding F-5 + revocation cascade F-7 deferred → v2, trigger Lane C IDP-S3) | `completed/2026-06/` |
+| MEM-S3 Differentiators | **CLOSED** (as_of/verify/self-critic landed; token-budget WP-3.1 + code-anchored WP-3.2 → backlog) | `completed/2026-06/` |
+| MEM-S4 Trust boundary + analogy | **CLOSED** (2026-06-10) | `completed/2026-06/` |
+| MEM-S5 Federation (CRDT/anchor/transport) | **CLOSED** on 5.1–5.4 (chain anchor read-side live; HTTP transport) | `completed/2026-06/` |
+| MEM-S5.5 ML track (LoRA + chatbot) | **BLOCKED** (split from S5; inference-gateway training infra) | `sprints/active/` |
+| MEM-S6 Hardening & OSS | **SCOPED** (Tier-1 audit → federation audit queue; execution post-lane) | `sprints/active/` |
+
+**Explicit deferrals (backlog, not dropped):** WP-3.1 token-budget recall
+shaping; WP-3.2 code-anchored blast-radius (needs anchor-ingestion); WP-2.3 SIWE
+principal binding (F-5) + delegation-revocation cascade (F-7), both v2 on the
+Lane-C IDP-S3 trigger; WP-5.3 durable on-chain anchor *write* (operator step,
+needs anchor contract); WP-5.4 gossip/peer-discovery; MEM-S5.5 LoRA/chatbot.
+
 ## Phasing & sequencing logic
 
 ```
