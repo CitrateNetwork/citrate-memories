@@ -26,10 +26,23 @@ ordering/cycle/expiry bugs without state-space blowup.
 ./check.sh
 ```
 
-> **Status:** the specs are authored and bound; local model-checking needs a Java
-> runtime (not installed on this machine yet). The CI gate (MEM-S0 exit criterion)
-> installs Temurin + tla2tools and runs `check.sh`; any invariant violation fails
-> the build. Until the CI job lands, treat these as reviewed-but-not-yet-TLC-green.
+> **Status (2026-06-11, Lane D): TLC-GREEN.** All three specs model-check clean
+> under TLC (`check.sh` exit 0). The CI gate is wired
+> (`.github/workflows/ci.yml` → job `tla-model-check`: Temurin 21 + tla2tools
+> 1.8.0 + `check.sh`); any invariant violation fails the build. This closes the
+> MEM-S0 WP-0.5 exit criterion.
+>
+> **What the gate caught (the reason it exists):** on first real TLC run,
+> `SupersededDag` **failed** `Acyclic`. Root cause was a bug in the spec's
+> `Reach` helper — it seeded `visited = {}` and only folded in `nxt`, so the
+> one-step successors (the initial frontier) were dropped from the reachable
+> set; the cycle-guard then admitted a 2-cycle. **The deployed Rust code was
+> correct** (`reachable_via` pushes each first-seen successor into its result),
+> so this was a spec-modeling bug, not a production vulnerability — but it is
+> exactly what "specs pass internally / TLC bypassed" had been hiding. Fixed by
+> seeding `visited` with the frontier; `SupersededDag` also gained
+> `CHECK_DEADLOCK FALSE` (the finite-node-set-exhausted terminal state is a
+> legitimate stop for a safety-only spec, not a deadlock).
 
 ## Notes on the models
 

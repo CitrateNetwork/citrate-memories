@@ -20,13 +20,25 @@ Init ==
 \* Cycle-safe transitive closure: terminates on ANY graph because `visited`
 \* grows monotonically inside the finite node set. So even a (hypothetical)
 \* cycle is reported as an invariant violation instead of hanging the checker.
+\*
+\* `visited` is SEEDED with the initial frontier (the direct successors), not
+\* `{}`. The recursion only ever folds `nxt` into `visited`, so seeding with the
+\* seed set is what puts the one-step successors into the result; seeding with
+\* `{}` would drop them and under-report reachability (a 1-step edge x->y would
+\* leave y out of Reach(x)). This mirrors the Rust BFS in
+\* `MemoryDagStore::reachable_via`, which pushes each first-seen successor into
+\* its result set. (WP-0.5: TLC found that the `{}` seed let the Acyclic guard
+\* admit a 2-cycle the deployed code already rejects — the code was right; the
+\* spec's reachability helper was the bug. Fixed 2026-06-11, Lane D.)
 RECURSIVE ReachFrom(_, _, _)
 ReachFrom(S, frontier, visited) ==
     IF frontier = {} THEN visited
     ELSE LET nxt == { y \in Nodes : \E x \in frontier : <<x, y>> \in S } \ visited
          IN ReachFrom(S, nxt, visited \cup nxt)
 
-Reach(S, x) == ReachFrom(S, { y \in Nodes : <<x, y>> \in S }, {})
+Reach(S, x) ==
+    LET seed == { y \in Nodes : <<x, y>> \in S }
+    IN ReachFrom(S, seed, seed)
 
 AddNode(n) ==
     /\ status[n] = "none"
