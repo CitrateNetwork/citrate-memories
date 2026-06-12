@@ -25,6 +25,10 @@ default = []
 rocksdb = ["dep:rocksdb"]
 
 [[example]]
+name = "repair_store"
+required-features = ["rocksdb"]
+
+[[example]]
 name = "reencrypt"
 required-features = ["rocksdb"]
 

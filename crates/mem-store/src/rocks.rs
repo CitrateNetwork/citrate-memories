@@ -34,6 +34,19 @@ impl RocksKv {
             .cf_handle(cf)
             .ok_or_else(|| format!("unknown column family: {cf}"))
     }
+
+    /// Rebuild a damaged RocksDB's MANIFEST/catalog from the SST files actually
+    /// present on disk (e.g. after a daemon was killed mid-compaction and left a
+    /// stale MANIFEST referencing a since-deleted SST). This operates at the
+    /// RocksDB layer only — the app-level XChaCha20 envelopes are opaque value
+    /// bytes to RocksDB, so repair never needs (and never sees) the tenant keys.
+    /// Any range that existed *only* in a genuinely-missing SST cannot be
+    /// recovered; ranges that were compacted into surviving SSTs are preserved.
+    /// Always back up the directory before calling this.
+    pub fn repair<P: AsRef<std::path::Path>>(path: P) -> Result<(), String> {
+        let opts = Options::default();
+        DB::repair(&opts, path).map_err(|e| e.to_string())
+    }
 }
 
 impl KvStore for RocksKv {
