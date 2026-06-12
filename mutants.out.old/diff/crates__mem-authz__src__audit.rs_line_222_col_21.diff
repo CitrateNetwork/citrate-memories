@@ -1,0 +1,21 @@
+--- crates/mem-authz/src/audit.rs
++++ replace != with == in AuditChain::open
+@@ -214,17 +214,17 @@
+         if prefix_hash != head_hash {
+             return Err(AuditError::Corrupt(format!(
+                 "head hash does not match the log at length {}",
+                 head.len
+             )));
+         }
+ 
+         // Repair the head after an accepted crash window.
+-        if head.len != log_len {
++        if head.len == /* ~ changed by cargo-mutants ~ */ log_len {
+             write_head(&head_path, log_len, &last_hash)?;
+         }
+ 
+         let log = OpenOptions::new().append(true).open(&log_path)?;
+         Ok(Self {
+             records,
+             last_hash,
+             next_seq: log_len,

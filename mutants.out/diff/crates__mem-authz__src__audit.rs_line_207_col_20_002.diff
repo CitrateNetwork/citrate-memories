@@ -1,0 +1,21 @@
+--- crates/mem-authz/src/audit.rs
++++ replace > with >= in AuditChain::open
+@@ -199,17 +199,17 @@
+         let head_hash: [u8; 32] = hex::decode(&head.last_hash)
+             .ok()
+             .and_then(|v| v.try_into().ok())
+             .ok_or_else(|| AuditError::Corrupt("head last_hash is not 32 hex bytes".into()))?;
+ 
+         if head.len > log_len {
+             return Err(AuditError::Truncated { head: head.len, log: log_len });
+         }
+-        if log_len > head.len + 1 {
++        if log_len >= /* ~ changed by cargo-mutants ~ */ head.len + 1 {
+             return Err(AuditError::Corrupt(format!(
+                 "log holds {log_len} records but head commits to {} — more than one in-flight append",
+                 head.len
+             )));
+         }
+         let prefix_hash = if head.len == 0 { [0u8; 32] } else { hash_after[head.len as usize - 1] };
+         if prefix_hash != head_hash {
+             return Err(AuditError::Corrupt(format!(

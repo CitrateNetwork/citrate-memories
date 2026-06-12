@@ -1,0 +1,21 @@
+--- crates/mem-authz/src/audit.rs
++++ replace AuditChain::log_path -> Option<&Path> with None
+@@ -229,17 +229,17 @@
+             last_hash,
+             next_seq: log_len,
+             sink: Some(FileSink { log, log_path, head_path }),
+         })
+     }
+ 
+     /// Path of the backing log, when persistent.
+     pub fn log_path(&self) -> Option<&Path> {
+-        self.sink.as_ref().map(|s| s.log_path.as_path())
++        None /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Append a record. For a persistent chain the record is durably written
+     /// (log line fsync'd, head replaced) BEFORE it becomes visible in memory;
+     /// on error the in-memory chain is unchanged, so callers can fail closed.
+     pub fn append(
+         &mut self,
+         event: MemoryEvent,

@@ -1,0 +1,2568 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 3.263250959,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.407013875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 176,
+              "column": 27
+            },
+            "end": {
+              "line": 176,
+              "column": 29
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_176_col_27.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_176_col_27.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.345752375,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.334977959,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 207,
+              "column": 20
+            },
+            "end": {
+              "line": 207,
+              "column": 21
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_207_col_20.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_207_col_20.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.3531775,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.403221334,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::records",
+            "return_type": "-> &[AuditRecord]",
+            "span": {
+              "start": {
+                "line": 283,
+                "column": 5
+              },
+              "end": {
+                "line": 285,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 284,
+              "column": 9
+            },
+            "end": {
+              "line": 284,
+              "column": 22
+            }
+          },
+          "replacement": "Vec::leak(Vec::new())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_284_col_9.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_284_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.359127166,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.342731083,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 183,
+              "column": 28
+            },
+            "end": {
+              "line": 183,
+              "column": 30
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_183_col_28.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_183_col_28.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.352580709,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.345500459,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::append",
+            "return_type": "-> Result<&AuditRecord, AuditError>",
+            "span": {
+              "start": {
+                "line": 240,
+                "column": 5
+              },
+              "end": {
+                "line": 273,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 270,
+              "column": 23
+            },
+            "end": {
+              "line": 270,
+              "column": 25
+            }
+          },
+          "replacement": "*=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_270_col_23.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_270_col_23.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.347641125,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.351928208,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 213,
+              "column": 94
+            },
+            "end": {
+              "line": 213,
+              "column": 95
+            }
+          },
+          "replacement": "/",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_213_col_94.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_213_col_94.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.386155459,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.382123125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 204,
+              "column": 21
+            },
+            "end": {
+              "line": 204,
+              "column": 22
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_204_col_21.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_204_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.354497834,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.335006583,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 207,
+              "column": 20
+            },
+            "end": {
+              "line": 207,
+              "column": 21
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_207_col_20_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_207_col_20_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.402162166,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.400980833,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::append",
+            "return_type": "-> Result<&AuditRecord, AuditError>",
+            "span": {
+              "start": {
+                "line": 240,
+                "column": 5
+              },
+              "end": {
+                "line": 273,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 267,
+              "column": 57
+            },
+            "end": {
+              "line": 267,
+              "column": 58
+            }
+          },
+          "replacement": "*",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_267_col_57.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_267_col_57.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.357659,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.341629541,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::log_path",
+            "return_type": "-> Option<&Path>",
+            "span": {
+              "start": {
+                "line": 235,
+                "column": 5
+              },
+              "end": {
+                "line": 238,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 237,
+              "column": 9
+            },
+            "end": {
+              "line": 237,
+              "column": 57
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_237_col_9.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_237_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.329529083,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.4019805,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "head_path_for",
+            "return_type": "-> PathBuf",
+            "span": {
+              "start": {
+                "line": 91,
+                "column": 1
+              },
+              "end": {
+                "line": 95,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 92,
+              "column": 5
+            },
+            "end": {
+              "line": 94,
+              "column": 21
+            }
+          },
+          "replacement": "Default::default()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_92_col_5.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_92_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.39316225,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.289647542,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 204,
+              "column": 21
+            },
+            "end": {
+              "line": 204,
+              "column": 22
+            }
+          },
+          "replacement": "<",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_204_col_21_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_204_col_21_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.396709125,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.404389459,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::append",
+            "return_type": "-> Result<&AuditRecord, AuditError>",
+            "span": {
+              "start": {
+                "line": 240,
+                "column": 5
+              },
+              "end": {
+                "line": 273,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 267,
+              "column": 57
+            },
+            "end": {
+              "line": 267,
+              "column": 58
+            }
+          },
+          "replacement": "-",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_267_col_57_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_267_col_57_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.394757542,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.294366208,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 207,
+              "column": 31
+            },
+            "end": {
+              "line": 207,
+              "column": 32
+            }
+          },
+          "replacement": "-",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_207_col_31.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_207_col_31.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.342862166,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.347436125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::verify_integrity",
+            "return_type": "-> Result<u64, String>",
+            "span": {
+              "start": {
+                "line": 287,
+                "column": 5
+              },
+              "end": {
+                "line": 300,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 294,
+              "column": 28
+            },
+            "end": {
+              "line": 294,
+              "column": 30
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_294_col_28.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_294_col_28.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.387617542,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.396113791,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 147,
+              "column": 12
+            },
+            "end": {
+              "line": 147,
+              "column": 13
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_147_col_12.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_147_col_12.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.363246125,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.240716292,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::verify_integrity",
+            "return_type": "-> Result<u64, String>",
+            "span": {
+              "start": {
+                "line": 287,
+                "column": 5
+              },
+              "end": {
+                "line": 300,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 289,
+              "column": 9
+            },
+            "end": {
+              "line": 299,
+              "column": 38
+            }
+          },
+          "replacement": "Ok(1)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_289_col_9.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_289_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.351967459,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.404639458,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::len",
+            "return_type": "-> usize",
+            "span": {
+              "start": {
+                "line": 275,
+                "column": 5
+              },
+              "end": {
+                "line": 277,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 276,
+              "column": 9
+            },
+            "end": {
+              "line": 276,
+              "column": 27
+            }
+          },
+          "replacement": "1",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_276_col_9.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_276_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.394486041,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.390916,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "record_hash",
+            "return_type": "-> [u8; 32]",
+            "span": {
+              "start": {
+                "line": 62,
+                "column": 1
+              },
+              "end": {
+                "line": 75,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 65,
+              "column": 5
+            },
+            "end": {
+              "line": 74,
+              "column": 29
+            }
+          },
+          "replacement": "[0; 32]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_65_col_5.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_65_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.407725416,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.4054125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 142,
+              "column": 9
+            },
+            "end": {
+              "line": 232,
+              "column": 11
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_142_col_9.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_142_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.394836291,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.237251209,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::log_path",
+            "return_type": "-> Option<&Path>",
+            "span": {
+              "start": {
+                "line": 235,
+                "column": 5
+              },
+              "end": {
+                "line": 238,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 237,
+              "column": 9
+            },
+            "end": {
+              "line": 237,
+              "column": 57
+            }
+          },
+          "replacement": "Some(Box::leak(Box::new(Default::default())))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_237_col_9_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_237_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.23482,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "write_head",
+            "return_type": "-> Result<(), AuditError>",
+            "span": {
+              "start": {
+                "line": 97,
+                "column": 1
+              },
+              "end": {
+                "line": 111,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 99,
+              "column": 5
+            },
+            "end": {
+              "line": 110,
+              "column": 11
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_99_col_5.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_99_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.391424917,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.298558333,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 207,
+              "column": 31
+            },
+            "end": {
+              "line": 207,
+              "column": 32
+            }
+          },
+          "replacement": "*",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_207_col_31_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_207_col_31_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.411426958,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.39092125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::append",
+            "return_type": "-> Result<&AuditRecord, AuditError>",
+            "span": {
+              "start": {
+                "line": 240,
+                "column": 5
+              },
+              "end": {
+                "line": 273,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 270,
+              "column": 23
+            },
+            "end": {
+              "line": 270,
+              "column": 25
+            }
+          },
+          "replacement": "-=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_270_col_23_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_270_col_23_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.356212542,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.289788667,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::verify_integrity",
+            "return_type": "-> Result<u64, String>",
+            "span": {
+              "start": {
+                "line": 287,
+                "column": 5
+              },
+              "end": {
+                "line": 300,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 289,
+              "column": 9
+            },
+            "end": {
+              "line": 299,
+              "column": 38
+            }
+          },
+          "replacement": "Ok(0)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_289_col_9_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_289_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.344519542,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.402815625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 213,
+              "column": 94
+            },
+            "end": {
+              "line": 213,
+              "column": 95
+            }
+          },
+          "replacement": "+",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_213_col_94_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_213_col_94_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.402915208,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.416894792,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::records",
+            "return_type": "-> &[AuditRecord]",
+            "span": {
+              "start": {
+                "line": 283,
+                "column": 5
+              },
+              "end": {
+                "line": 285,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 284,
+              "column": 9
+            },
+            "end": {
+              "line": 284,
+              "column": 22
+            }
+          },
+          "replacement": "Vec::leak(vec![Default::default()])",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_284_col_9_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_284_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.245638084,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 149,
+              "column": 20
+            },
+            "end": {
+              "line": 149,
+              "column": 21
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_149_col_20.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_149_col_20.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.350008041,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.386659625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 214,
+              "column": 24
+            },
+            "end": {
+              "line": 214,
+              "column": 26
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_214_col_24.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_214_col_24.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.398373917,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.4062015,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::len",
+            "return_type": "-> usize",
+            "span": {
+              "start": {
+                "line": 275,
+                "column": 5
+              },
+              "end": {
+                "line": 277,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 276,
+              "column": 9
+            },
+            "end": {
+              "line": 276,
+              "column": 27
+            }
+          },
+          "replacement": "0",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_276_col_9_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_276_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.385956833,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.407841584,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::append",
+            "return_type": "-> Result<&AuditRecord, AuditError>",
+            "span": {
+              "start": {
+                "line": 240,
+                "column": 5
+              },
+              "end": {
+                "line": 273,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 251,
+              "column": 9
+            },
+            "end": {
+              "line": 272,
+              "column": 54
+            }
+          },
+          "replacement": "Ok(Box::leak(Box::new(Default::default())))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_251_col_9.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_251_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.240722,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 204,
+              "column": 21
+            },
+            "end": {
+              "line": 204,
+              "column": 22
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_204_col_21_002.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_204_col_21_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.34417025,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.352960625,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 213,
+              "column": 39
+            },
+            "end": {
+              "line": 213,
+              "column": 41
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_213_col_39.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_213_col_39.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.404055208,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.4051045,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "record_hash",
+            "return_type": "-> [u8; 32]",
+            "span": {
+              "start": {
+                "line": 62,
+                "column": 1
+              },
+              "end": {
+                "line": 75,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 65,
+              "column": 5
+            },
+            "end": {
+              "line": 74,
+              "column": 29
+            }
+          },
+          "replacement": "[1; 32]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_65_col_5_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_65_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.418394584,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.410628,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 222,
+              "column": 21
+            },
+            "end": {
+              "line": 222,
+              "column": 23
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_222_col_21.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_222_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.403399416,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.409163333,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "feed",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 56,
+                "column": 1
+              },
+              "end": {
+                "line": 60,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 57,
+              "column": 5
+            },
+            "end": {
+              "line": 59,
+              "column": 21
+            }
+          },
+          "replacement": "()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_57_col_5.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_57_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.399155875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.411903834,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::open",
+            "return_type": "-> Result<Self, AuditError>",
+            "span": {
+              "start": {
+                "line": 128,
+                "column": 5
+              },
+              "end": {
+                "line": 233,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 207,
+              "column": 20
+            },
+            "end": {
+              "line": 207,
+              "column": 21
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_207_col_20_002.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_207_col_20_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.399964541,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.41059,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::is_empty",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 279,
+                "column": 5
+              },
+              "end": {
+                "line": 281,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 280,
+              "column": 9
+            },
+            "end": {
+              "line": 280,
+              "column": 32
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_280_col_9.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_280_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.349899792,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.391687875,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::verify_integrity",
+            "return_type": "-> Result<u64, String>",
+            "span": {
+              "start": {
+                "line": 287,
+                "column": 5
+              },
+              "end": {
+                "line": 300,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 291,
+              "column": 27
+            },
+            "end": {
+              "line": 291,
+              "column": 29
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_291_col_27.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_291_col_27.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.35225625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.407209084,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "package": "mem-authz",
+          "file": "crates/mem-authz/src/audit.rs",
+          "function": {
+            "function_name": "AuditChain::is_empty",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 279,
+                "column": 5
+              },
+              "end": {
+                "line": 281,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 280,
+              "column": 9
+            },
+            "end": {
+              "line": 280,
+              "column": 32
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__mem-authz__src__audit.rs_line_280_col_9_001.log",
+      "diff_path": "diff/crates__mem-authz__src__audit.rs_line_280_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.344215416,
+          "process_status": "Success",
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.408112833,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=mem-authz@0.0.1"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 40,
+  "missed": 0,
+  "caught": 37,
+  "timeout": 0,
+  "unviable": 3,
+  "success": 0
+}
