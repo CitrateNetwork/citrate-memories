@@ -290,6 +290,17 @@ where
         Ok(self.kv.kv_iter_cf(cf::EDGES_OUT).map_err(StoreError::Backend)?.len())
     }
 
+    /// Write a consistent point-in-time snapshot of the store to `dest` (which
+    /// must not already exist). For the RocksDB backend this is a cheap,
+    /// hard-linked recovery point; the in-memory backend reports `Unsupported`.
+    /// The snapshot is a complete, independently-openable store (sealed values +
+    /// keyring carried verbatim — no decryption involved). The daemon uses this
+    /// to keep rolling recovery points so an unclean death can't strand the only
+    /// on-disk copy.
+    pub fn checkpoint<P: AsRef<std::path::Path>>(&self, dest: P) -> Result<(), StoreError> {
+        self.kv.kv_checkpoint(dest.as_ref()).map_err(StoreError::Backend)
+    }
+
     /// Deserialize every node. Linear scan — fine for CLI/report use; recall uses
     /// targeted queries instead. Crypto-shredded nodes (sealed, key destroyed)
     /// are skipped — forgotten, not an error.
