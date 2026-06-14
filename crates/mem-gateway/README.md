@@ -19,13 +19,51 @@ Built + tested (19 tests, clippy `-D warnings` clean on default + `rocksdb`):
   isolated store** (proven by a collision test: two Orgs with the same repo name see
   only their own data). `open_org` (feature `rocksdb`) lazily opens per-Org stores.
 
-## Next (M0 → M1)
+## Status: HTTP read API + 3D-layout endpoint landed (constellation prototype unblocked)
 
-1. **axum HTTP layer** over this core (tokio): the read API below + SSE deltas + the
-   server-side UMAP/PCA layout endpoint.
+Built + tested (25 tests, clippy `-D warnings` clean on default + `rocksdb` + `server`).
+
+- **`http.rs`** (feature `server`) — axum read API, **fail-closed auth** (dev-auth via
+  `x-dev-sub` behind `MEM_GATEWAY_ALLOW_DEV_AUTH=1`; OIDC bearer verification is the
+  M1 wiring — until then every request is refused). Every route is Org-scoped and
+  passes the core gate (Org boundary → tenant scope). Endpoints: `health`, `orgs`,
+  `tenants`, `recall`, `search`, `as_of`, `nodes/:id`, `verify`, `neighbors`,
+  `analogy`, **`layout`**.
+- **`layout.rs`** — deterministic **PCA-to-3D** projection of the bge embeddings
+  (axes from a strided sample, all nodes projected) + the scene assembler (position +
+  material lane + plane + trust + status + contradiction + degree). Cached per Org by
+  node-count.
+- **`bin/mem-gateway`** (feature `server,rocksdb[,transformer]`) — the dev server;
+  opens a real Org store, **warms the layout cache at startup**, serves.
+
+### Run the dev server against the real graph
+
+```bash
+MEM_GATEWAY_ALLOW_DEV_AUTH=1 \
+cargo run --release -p mem-gateway --bin mem-gateway --features server,rocksdb,transformer -- \
+    --org dev-org --store ./data/federation.bge.enc.memdag --bind 127.0.0.1:8799
+
+# the constellation scene (positions + visual attrs + edges) for the whole graph:
+curl -s -H 'x-dev-sub: dev' http://127.0.0.1:8799/api/orgs/dev-org/layout | jq '.node_count, .edge_count'
+curl -s -H 'x-dev-sub: dev' 'http://127.0.0.1:8799/api/orgs/dev-org/tenants/citrate-chain/recall?budget=5'
+```
+
+Verified live on the 9,564-node federation store: layout returns the full scene
+(9,564 nodes / 5,684 edges, balanced PCA axis variance), **served in ~140ms** once
+warmed; `recall`/`verify`/`neighbors`/`analogy` return real data; no-auth → 401, a
+non-member → 403 (fail closed). **Cold layout build ≈ 23s** (one-time, hidden behind
+the startup warm) — dominated by per-node edge I/O over the encrypted store, **not**
+PCA; the optimization (single EDGES_OUT scan instead of N per-node lookups) is a noted
+follow-up, not a blocker.
+
+## Next (M1)
+
+1. **SSE deltas** (`/stream`) — live graph + audit tail + notifications.
 2. **MCP-over-HTTP (Streamable-HTTP)** BYOM endpoint, scoped per the same gate.
-3. **Control-plane persistence** (RocksDB control CF or Postgres) behind `ControlPlane`.
-4. **assert/confirm signing path** (M1 Steward needs writes) + finish F-5 wiring.
+3. **Real OIDC bearer verification** (citrate-identity JWKS) replacing dev-auth.
+4. **Control-plane persistence** (RocksDB control CF / Postgres) behind `ControlPlane`.
+5. **assert/confirm/propose write path** (M1 Steward) + finish F-5 signing wiring.
+6. **Layout cold-build speedup** (bulk edge scan) + per-member scene filtering.
 
 ## Intended HTTP contract (sketch — for the Next.js prototype to wire against)
 

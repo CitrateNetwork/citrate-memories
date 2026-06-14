@@ -15,8 +15,12 @@
 //!    ([`org::ControlPlane::revoke_cascade`]).
 
 pub mod authz;
+pub mod layout;
 pub mod org;
 pub mod registry;
+
+#[cfg(feature = "server")]
+pub mod http;
 
 pub use authz::{authorize, can_delegate, derive_grant};
 pub use org::{ControlPlane, Membership, Org, OrgId, OrgStatus, Role};
