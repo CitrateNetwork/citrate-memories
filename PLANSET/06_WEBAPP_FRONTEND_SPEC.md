@@ -83,6 +83,55 @@ and never lying about what it knows or how sure it is.
 
 ## 2. Architecture & packaging (the seam the webapp sits on)
 
+### 2.0 Multi-tenancy model — **SaaS, org-isolated** (decided 2026-06-13)
+
+> ⚠️ **Terminology — read this first.** The engine already uses the word **"tenant"**
+> to mean **a repo** inside one federation. The SaaS adds a new, higher isolation
+> level. To avoid collision, this doc uses:
+> - **Org** (a.k.a. **Workspace**) = the **SaaS customer** — the new top-level
+>   isolation boundary. (What most SaaS apps call a "tenant.")
+> - **Repo-tenant** = a repo's memory inside an Org's federation (the engine's
+>   existing `tenant`/`repo:<name>/memory` concept). An Org *contains many
+>   repo-tenants.*
+
+Mnemosyne is **multi-tenant SaaS**: one platform deployment serves many Orgs, each
+fully isolated. The isolation model:
+
+- **One isolated memory store per Org.** Each Org gets its own encrypted RocksDB
+  store + keyring + bge index + rolling checkpoints, owned by a per-Org engine
+  instance the gateway manages. **Hard isolation by construction** — an Org's data is
+  in a different store + sealed under a different keyring, so cross-Org leakage isn't a
+  query-filter bug waiting to happen, it's physically separate. (This also keeps the
+  engine's single-writer RocksDB lock + per-Org crypto-shred clean: forgetting Org A
+  never touches Org B.)
+- **`mem-gateway` is the multi-Org front door.** It resolves the caller's Org from
+  their authenticated identity, routes to that Org's engine instance, and enforces the
+  Org boundary *before* any repo-tenant scope check. Org resolution is the first gate;
+  CapabilityGrant scoping is the second. ⟦DECIDE⟧ engine-instance topology:
+  *Recommendation: a gateway process supervising N per-Org daemons (one DB lock each),
+  with lazy spin-up + idle eviction; revisit a single multi-store process only if the
+  per-process overhead bites.*
+- **Three authority levels** (see §3): **Platform Operator** (us, the SaaS host) →
+  **Org Owner** (the customer's super-admin) → **Org Admin** / **Member** (within an
+  Org, the delegation tree). The Org Owner's `*` scope means `*` **within their Org**,
+  never across Orgs.
+- **Provisioning:** an Org is created (signup/invite), its store is initialized, its
+  first Org Owner is bound, and its repos are connected (each becomes a repo-tenant
+  via backfill). Billing/quotas are an Org-level concern ⟦DECIDE⟧ (out of scope for
+  the design prototype; note the seam).
+- **OSS still works:** a self-hoster runs the same bundle with a single Org (or their
+  own set of Orgs) — multi-tenancy is additive, not a fork. The OSS artifact is the
+  platform; running it for one Org is the degenerate case.
+
+**Design consequences for the prototype:** an **Org/Workspace switcher** in the top
+chrome (for users in >1 Org, e.g. consultants; most users see one); all data,
+constellation, admin, and audit are **always Org-scoped**; the admin console gains an
+Org-provisioning + Org-settings surface for the Org Owner, and a separate (minimal,
+internal) Platform-Operator surface; "forget" is Org-Owner-scoped to their own
+repo-tenants. The designer should treat **Org** as the implicit container of
+everything — it is never mixed across Orgs on one screen.
+
+
 The engine is Rust (9 crates) speaking MCP over stdio/Unix-socket via the
 `mcp_serve` daemon. A browser can't speak that. So the package gains **one new
 service** and the webapp is **three runtimes** (mirroring how `citrate-explorer` is
@@ -138,12 +187,15 @@ the model ever touching the raw store** — it goes through the same authz + aud
 picks Claude / GPT / a local / Citrate's own model from a dropdown; the app does
 graph-grounded RAG (recall/search/neighbors as tools the model calls).
 
-**Deployment / packaging (WP-6.3).** Ship as a Docker Compose bundle: `mem-gateway`
-(owns the volume with the encrypted store + checkpoints) + the Next.js app, with
-citrate-identity as the external auth issuer. Self-hostable by any org; this is also
-the OSS-release artifact (§12). The Next.js app deploys to Vercel; `mem-gateway` runs
-where the data lives (a droplet/box with the volume), exactly like the explorer's
-indexer worker is off-Vercel.
+**Deployment / packaging (WP-6.3), multi-Org.** Ship as a Docker bundle: `mem-gateway`
+(supervises the per-Org engine instances; owns the volume holding each Org's encrypted
+store + checkpoints, isolated by Org) + the Next.js app, with citrate-identity as the
+external OIDC issuer. The Next.js app deploys to Vercel; `mem-gateway` runs where the
+data lives (a box/volume), like the explorer's off-Vercel indexer. The **same bundle is
+the OSS artifact** (§12) — a self-hoster runs it for one Org or many. For the hosted
+SaaS, `mem-gateway` scales by Org (lazy per-Org daemon spin-up + idle eviction; large
+Orgs can pin a dedicated instance). Per-Org volumes + keyrings mean an Org's data can
+be exported or forgotten as a unit.
 
 ---
 
@@ -158,6 +210,15 @@ issuer `auth.citrate.ai`. Claims consumed: `sub` (stable principal), `wallet_add
 if `OIDC_ISSUER`/`OIDC_AUDIENCE` are unset, reject all tokens (the SECREM-02 1.4 fix
 — never pass `undefined` to verify). Login screen = "Sign in with Citrate."
 
+**Org resolution (multi-tenant).** The OIDC `sub` is a *global* principal; **Org
+membership is Mnemosyne's own mapping** (`sub` → one-or-more Orgs + role), held in the
+gateway's control-plane store, established at invite/provision time. On login the
+gateway resolves the user's Org(s); if they belong to several, the Org switcher picks
+the active one and every request carries the active Org, re-verified server-side. A
+`sub` with no Org membership lands on a "request access / create an Org" screen, never
+on someone else's data. (citrate-identity stays a pure identity issuer; it does not
+need to know about Orgs — the SaaS boundary lives in Mnemosyne.)
+
 ### 3.2 Authorization — the webapp's RBAC **is** the `CapabilityGrant` model
 
 The engine already has the authz primitives; the webapp productizes them. **Do not
@@ -169,14 +230,25 @@ build a second RBAC system** — map roles onto these existing structures:
 - `PolicyProfile { ReadOnly, Guided, Operator, Maintainer }` — **four tiers already exist.**
 - `DelegationStep { delegator, at_ms }` — the **parent-child chain** the user asked for.
 
-### 3.3 The two admin tiers + RBAC, mapped
+### 3.3 The authority levels + RBAC, mapped (multi-Org aware)
 
-| Role | PolicyProfile | Scopes | Can delegate? | Can do |
-|---|---|---|---|---|
-| **Super Admin** | `Maintainer` | `*` (all tenants) | yes — issues root + admin grants | everything incl. **forget (crypto-shred)**, tenant lifecycle, ingestion, ops/recovery, manage other admins, OSS visibility flips, issue/revoke any grant |
-| **Regular Admin** | `Operator` | subtree of tenants (their `allowed_resources`) | yes — but only a **subset** of their own scopes (attenuation) | onboard members under them, run HITL review queues for their tenants, trigger ingestion for their tenants, issue/revoke **delegated** grants in their subtree. **Cannot** shred, manage other admins, or touch ops/recovery |
-| **Member** | `Guided` or `ReadOnly` | specific tenants | no (leaf) | query, visualize, BYOM-connect, **propose** (quarantined) edges/assertions; confirmation is HITL-gated to admins by default ⟦DECIDE⟧ whether `Operator` members can self-confirm |
-| **Agent / BYOM session** | inherits the connecting user's grant | == user's | no | exactly what the user can, every call audited under the user's principal |
+**Org boundary is checked first, always.** Every grant below is scoped *within one
+Org*; the gateway resolves Org from identity and refuses cross-Org access before any
+scope check. `*` means "all repo-tenants **in this Org**."
+
+| Role | Layer | PolicyProfile | Scopes | Can delegate? | Can do |
+|---|---|---|---|---|---|
+| **Platform Operator** | platform (us) | — (out-of-band) | platform | n/a | provision/suspend Orgs, platform health/ops, **never reads Org memory content** (isolation: ops-plane only, audited). The SaaS host role. |
+| **Org Owner** (Super Admin) | per-Org | `Maintainer` | `*` **within the Org** | yes — issues root + admin grants in the Org | everything in their Org incl. **forget (crypto-shred)**, repo-tenant lifecycle, ingestion, Org ops/recovery, manage Org admins, Org settings/billing, OSS export. **Cannot** cross Orgs. |
+| **Org Admin** (Regular Admin) | per-Org | `Operator` | subtree of repo-tenants (their `allowed_resources`) | yes — only a **subset** of their own scopes (attenuation) | onboard members under them, run HITL review queues for their repo-tenants, trigger ingestion for them, issue/revoke **delegated** grants in their subtree. **Cannot** shred, manage other admins, touch Org-level ops/billing. |
+| **Member** | per-Org | `Guided` or `ReadOnly` | specific repo-tenants | no (leaf) | query, visualize, BYOM-connect, **propose** (quarantined) edges/assertions; confirmation is HITL-gated to admins by default ⟦DECIDE⟧ whether `Operator` members can self-confirm. |
+| **Agent / BYOM session** | per-Org | inherits the connecting user's grant | == user's (same Org) | no | exactly what the user can, in the user's Org, every call audited under the user's principal. |
+
+> The two admin tiers the user asked for = **Org Owner** (super admin) + **Org Admin**
+> (regular admin), both *inside* an Org. The **Platform Operator** is the SaaS-host
+> super-role above all Orgs — deliberately walled off from Org memory *content* (it can
+> manage lifecycle but not read the graph), so "we host it" never means "we can read
+> your memory."
 
 **Parent-child / future onboarding = the `delegation_chain`.** When an admin
 onboards a member, the new grant's `delegation_chain` records the admin as
@@ -545,18 +617,22 @@ need >100k points later. Layout (UMAP) server-side in Rust (or a small Python si
 /org                           Federation / org overview (meta-graph)
 /audit                         Audit log viewer (integrity-verified, live tail)
 /connect                       BYOM — connect-your-model (MCP endpoint + tokens + clients)
-/admin                         Admin console
+/admin                         Org admin console (Org-scoped)
   ├─ /admin/people             users, roles, parent/delegation, scopes
   ├─ /admin/grants             delegation tree, issue/revoke (cascade preview)
-  ├─ /admin/tenants            repos, ingestion/backfill, settings
-  ├─ /admin/ops                checkpoints/recovery, CRDT sync, chain-anchor  (super admin)
-  └─ /admin/forget             crypto-shred  (super admin, high-friction)
-/me                            profile, my grants, my connected models, my audit
+  ├─ /admin/tenants            repo-tenants, ingestion/backfill, settings
+  ├─ /admin/org                Org settings, provisioning, billing/quota   (Org Owner)
+  ├─ /admin/ops                checkpoints/recovery, CRDT sync, chain-anchor  (Org Owner)
+  └─ /admin/forget             crypto-shred  (Org Owner, high-friction)
+/platform                      Platform-Operator console (Org lifecycle; NO memory content)
+/me                            profile, my Orgs, my grants, my connected models, my audit
 ```
 
-Global chrome: top bar (scope/tenant switcher constrained to readable scopes, model
-picker, notifications, profile); ⌘K omnibox anywhere; a persistent "explain this"
-help affordance.
+Global chrome: top bar with the **Org/Workspace switcher** (left-most — everything
+below it is Org-scoped; most users have one Org), then repo-tenant scope switcher
+(constrained to readable scopes), model picker, notifications, profile; ⌘K omnibox
+anywhere; a persistent "explain this" help affordance. The current Org is always
+unambiguous on screen.
 
 ---
 
@@ -669,29 +745,43 @@ exact hues (within the meaning→channel mappings), typography, motion choreogra
 HTML prototype. The `⟦DECIDE⟧` items are flagged for Saul.
 
 **For me (in parallel + after their prototype):**
-1. **Build `mem-gateway`** (the backend seam): the REST/JSON over the engine, the
-   MCP-over-HTTP BYOM endpoint, OIDC→CapabilityGrant mapping, the audit/authz gate,
-   SSE deltas, and the server-side UMAP/PCA layout endpoint. This can start **now**,
-   independent of the visual design — it's the contract the prototype wires against.
+1. **Build `mem-gateway`** (the backend seam) — **starting now**, independent of the
+   visual design; it's the contract the prototype wires against. Includes from M0:
+   **Org isolation** (per-Org engine instance routing + a control-plane store for
+   Org/membership/role), OIDC auth + Org resolution, the REST/JSON read API over the
+   engine, the audit/authz gate (Org boundary first, then CapabilityGrant scope), SSE
+   deltas, the server-side UMAP/PCA layout endpoint, and (M1) the MCP-over-HTTP BYOM
+   endpoint + the signing path for assert/confirm.
 2. **Build F-5 + F-7** (identity-bound principals + delegation-revocation cascade) —
    the backend prerequisites the RBAC needs; Mnemosyne is their trigger.
 3. **Wire the prototype** pixel-perfect + responsive against the gateway once the
    on-brand HTML lands.
 4. **Rule-8 review + fold into the Tier-1 audit** before any non-local exposure.
 
-### Suggested phasing (MVP → full)
+### Phasing (MVP → full) — **decided 2026-06-13: M1 = See + Ask + Steward**
 
-- **M0 (backend seam):** `mem-gateway` + OIDC auth + read-only JSON API + the layout
-  endpoint. No UI yet.
-- **M1 (See + Ask):** the Constellation (Galaxy + Lattice modes, Lite/Full), Node
-  Inspector/Verify, Search/Recall, and the conversational RAG with citations↔graph.
-  Read-only. **This is the demoable wow.**
-- **M2 (Steward):** HITL Review Center (proposals/contradictions/supersession/critic),
-  Assert + memory-diff, time-travel scrubber.
-- **M3 (Operate):** Admin console (people/grants/delegation tree), BYOM connect, audit
-  viewer, ops (checkpoints/sync/anchor).
-- **M4 (Forget + polish + OSS):** crypto-shred, federation islands + storyline-river
-  modes, the full shader pass, accessibility hardening, the audit + OSS release.
+- **M0 (backend seam):** `mem-gateway` with **Org isolation from day one** + OIDC auth
+  + Org resolution + read JSON API + the layout endpoint + the audit/authz gate. No UI.
+  *(Starting now, in parallel with design.)*
+- **M1 (See + Ask + Steward — the demoable MVP):**
+  - **See:** Constellation (Galaxy + Lattice modes, Lite/Full), Node Inspector/Verify,
+    Search/Recall.
+  - **Ask:** conversational RAG with model picker + citations↔graph.
+  - **Steward:** HITL Review Center (proposals · contradictions · supersession ·
+    self-critic) + Assert + time-travel scrubber.
+  - All strictly Org-scoped. This is the in-house demo — it shows the *whole trust
+    story* (the quarantine→confirm HITL loop), not just read-only wow.
+- **M2 (Operate):** Admin console (Org people/grants/delegation tree + Org
+  provisioning), BYOM connect, audit viewer, ops (checkpoints/sync/anchor),
+  memory-diff import/export.
+- **M3 (Platform + Forget):** Platform-Operator surface (Org lifecycle), crypto-shred,
+  Org billing/quota seams.
+- **M4 (Polish + OSS):** federation islands + storyline-river modes, the full shader
+  pass, accessibility hardening, the Tier-1 audit + OSS release.
+
+> Note: M1 now includes the HITL Steward surface, so **F-5 (identity-bound principals)
+> and the signing path for `assert`/`confirm` are M1 backend prerequisites**, not M2.
+> The delegation-revocation cascade (F-7) can trail to M2 with the admin console.
 
 ---
 
