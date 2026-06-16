@@ -12,6 +12,7 @@ members = [
     "crates/mem-assert",
     "crates/mem-mcp",
     "crates/mem-sync",
+    "crates/mem-gateway",
 ]
 
 [workspace.package]

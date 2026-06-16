@@ -1,0 +1,52 @@
+# Memrizz mem-gateway — systemd unit for the DGX (spark-2e01).
+#
+# WHY HERE: the federation store (RocksDB) and the bge embedder both live on the
+# DGX, so the gateway runs co-located with them. It binds to the DGX's Tailscale
+# IP; the public TLS hostname (mem-gateway.citrate.ai) is fronted by Caddy on the
+# droplet (citrate-rpc-1, 142.93.58.145), which reverse-proxies over Tailscale —
+# exactly the infer.citrate.ai pattern. So the handoff's "--bind 127.0.0.1:8799"
+# becomes the Tailscale IP here, because Caddy is NOT co-located.
+#
+# Install:
+#   sudo cp deploy/mem-gateway.service /etc/systemd/system/
+#   sudo mkdir -p /etc/memrizz /var/lib/memrizz
+#   curl -s https://auth.citrate.ai/jwks -o /etc/memrizz/jwks.json
+#   # write /etc/memrizz/mem-gateway.env (chmod 600) with the two secrets below
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mem-gateway
+
+[Unit]
+Description=Memrizz mem-gateway (citrate-memories HTTP API)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=saul
+WorkingDirectory=/home/saul/Projects/Citrate-Labs/citrate-memories
+
+# --- OIDC (production: fail-closed). aud MUST be the client_id `memrizz`. ---
+Environment=OIDC_ISSUER=https://auth.citrate.ai
+Environment=OIDC_AUDIENCE=memrizz
+Environment=OIDC_JWKS_FILE=/etc/memrizz/jwks.json
+
+# --- durable state (survives restart; back this volume up) ---
+Environment=MEM_GATEWAY_CONTROL_PATH=/var/lib/memrizz/control.json
+Environment=MEM_GATEWAY_AUDIT_PATH=/var/lib/memrizz/gateway-audit.jsonl
+
+# --- secrets: MEM_GATEWAY_ASSERTER_SEED + MEM_CONNECT_SECRET (chmod 600) ---
+#     MEM_CONNECT_SECRET MUST byte-match the value set on Vercel (memrizz).
+EnvironmentFile=/etc/memrizz/mem-gateway.env
+
+ExecStart=/home/saul/Projects/Citrate-Labs/citrate-memories/target/release/mem-gateway \
+  --org citrate-federation \
+  --store /home/saul/Projects/Citrate-Labs/citrate-memories/data/federation.bge.memdag \
+  --bind 100.68.173.64:8799
+
+Restart=always
+RestartSec=3
+# Hardening (store + state dirs are the only writable paths it needs).
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
