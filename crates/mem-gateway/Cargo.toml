@@ -5,46 +5,48 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Memrizz backend seam: multi-Org isolation, OIDC->grant authz, and the network surface over the citrate-memories engine."
+description = "HTTP gateway over the citrate-memories DAG: OIDC-gated, Org-scoped recall/search/assert + MCP-over-HTTP (BYOM). Net-new transport over the proven mem-{store,query,assert,authz,mcp} primitives."
 
 [dependencies]
 mem-core = { path = "../mem-core" }
 mem-store = { path = "../mem-store" }
-mem-query = { path = "../mem-query" }
 mem-index = { path = "../mem-index" }
+mem-ingest = { path = "../mem-ingest" }
+mem-query = { path = "../mem-query" }
 mem-authz = { path = "../mem-authz" }
-# Signing identity for the HTTP write routes (gap G-1): assert / propose_edge.
 mem-assert = { path = "../mem-assert" }
-# The JSON-RPC tool surface, reused behind the MCP-over-HTTP endpoint (gap G-7).
 mem-mcp = { path = "../mem-mcp" }
-# Durability/ops: anchors + tenant-root for the ops surface (WP-6.5).
-mem-sync = { path = "../mem-sync" }
+
 serde = { workspace = true }
 serde_json = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 ed25519-dalek = "2"
-blake3 = { workspace = true }
-# Real OIDC bearer verification (gap G-2): RS256 JWT against the authority JWKS,
-# enforcing issuer + audience + expiry. Core (not behind `server`) so the
-# fail-closed auth path is covered by the default `cargo test --workspace`.
-jsonwebtoken = "9"
-# HTTP layer (feature `server`): kept optional so the security-critical core tests
-# compile without the tokio/axum tree.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"], optional = true }
+# MEM-S7 WP-7.2: GitHub webhook HMAC-SHA256 (X-Hub-Signature-256) verification.
+hmac = "0.12"
+sha2 = "0.10"
+
+# --- server stack (only compiled with the `server` feature) ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"], optional = true }
 axum = { version = "0.7", optional = true }
+jsonwebtoken = { version = "9", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [features]
 default = []
-# Open per-Org RocksDB stores (the real engine backend). Off by default so the
-# control-plane + authz core tests stay fast on the in-memory path.
-rocksdb = ["mem-store/rocksdb", "mem-query/rocksdb"]
-# The axum HTTP/JSON read API + 3D-layout endpoint.
-server = ["dep:tokio", "dep:axum"]
-# Surface the on-chain anchor (tenant-root → 40204 block) in the ops route.
-chain = ["mem-sync/chain"]
-# Load the bge transformer embedder (needed for `search` over a bge-embedded store).
-transformer = ["mem-index/transformer", "mem-query/transformer"]
+# The HTTP server + OIDC verification stack. The library (control model, scene
+# projection, grant minting) builds without it so it stays unit-testable.
+server = ["dep:tokio", "dep:axum", "dep:jsonwebtoken", "dep:tracing", "dep:tracing-subscriber"]
+# Durable RocksDB store, forwarded to every layer that opens it.
+rocksdb = ["mem-store/rocksdb", "mem-query/rocksdb", "mem-mcp/rocksdb"]
+# bge transformer embedder, so `search` works over the bge-embedded federation store.
+transformer = ["mem-index/transformer", "mem-query/transformer", "mem-mcp/transformer"]
+# Surface the on-chain (40204) anchor in /ops. Stubbed until the chain client is wired.
+chain = []
 
 [[bin]]
 name = "mem-gateway"
+path = "src/main.rs"
 required-features = ["server", "rocksdb"]

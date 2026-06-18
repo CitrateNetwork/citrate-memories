@@ -131,6 +131,23 @@ poison into LoRAs) and P1's backfill (rich graph). P6 gates any external/public 
 | WP-6.4 | OSS extraction ADR + Rule-13 visibility flip (if approved) | D6.4 |
 **Exit.** Audit findings resolved/accepted; migrations tested; (if approved) public-flip ADR with sign-offs.
 
+## Sprint MEM-S7 — Live Federation Feed (secure auto-ingest)
+**Goal.** The graph stays canonical/never-stale by auto-ingesting every federation
+change (webhook + poller, one single-writer ingest worker), so no human/agent ever
+re-runs `backfill`. Full design + WPs + adversarial test matrix:
+[`06_AUTO_INGEST_FEED.md`](06_AUTO_INGEST_FEED.md).
+| WP | Title | Deliv |
+|---|---|---|
+| WP-7.1 | Incremental `ingest_range` + watermark-gated; idempotency proof | D7.1 |
+| WP-7.2 | Webhook receiver (HMAC, allowlist, fail-closed) → enqueue | D7.2 |
+| WP-7.3 | Durable queue + single-writer worker; crash-atomic watermark | D7.3 |
+| WP-7.4 | Poller/reconciler (ls-remote vs watermark) backstop | D7.4 |
+| WP-7.5 | Debounce/coalesce + rate limit + audit-chain logging | D7.5 |
+| WP-7.6 | Adversarial + fuzz suite + TLA+ invariants | D7.6 |
+| WP-7.7 | Ops: Caddy + systemd + org-webhook runbook + secret mgmt | D7.7 |
+**Exit.** A push to any repo reflects in `memory.recall` freshness within minutes,
+no human action; crash mid-ingest loses nothing; double-delivery makes no dup nodes.
+
 ---
 
 ## Agentile compliance checklist (applies to every WP)

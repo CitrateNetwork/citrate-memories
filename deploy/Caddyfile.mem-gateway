@@ -1,0 +1,36 @@
+# mem-gateway.citrate.ai — append this block to the droplet Caddyfile
+# (/etc/caddy/Caddyfile on citrate-rpc-1, 142.93.58.145), then:
+#   caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy
+#
+# Mirrors the infer.citrate.ai block: Caddy owns public TLS and reverse-proxies
+# over Tailscale to the service running on the DGX. The DGX mem-gateway listens
+# on its Tailscale IP 100.68.173.64:8799.
+#
+# NO CORS: the Memrizz webapp reaches this server-to-server (Vercel BFF →
+# gateway), never browser → gateway. Do not add Access-Control-Allow-Origin.
+
+https://mem-gateway.citrate.ai {
+	encode gzip
+
+	# Caddy-handled liveness (the app also serves GET /api/health).
+	@health path /healthz
+	respond @health "ok" 200
+
+	reverse_proxy 100.68.173.64:8799 {
+		# CRITICAL: forward the bearer — the gateway independently verifies
+		# the user's id_token (iss+aud+exp, RS256). Caddy forwards by default;
+		# explicit so a future edit can't silently strip it.
+		header_up Authorization {http.request.header.Authorization}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Proto https
+
+		transport http {
+			# The /api/orgs/:org/layout endpoint can be heavy on first build
+			# (PCA over the federation embeddings), then it's cached.
+			read_timeout 300s
+			write_timeout 300s
+			dial_timeout 5s
+			keepalive 5m
+		}
+	}
+}
