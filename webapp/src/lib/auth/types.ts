@@ -26,6 +26,10 @@ export interface AuthSession {
   sub?: string;
   /** The user's wallet address, if the identity carries one. Provisional claim. */
   walletAddress?: string;
+  /** Live KYC status (AUTHSPINE); snapshot from the id_token, re-check /userinfo for high-value gates. Absent => "none". */
+  kycStatus?: import("./entitlement").KycStatus;
+  /** Centralized access entitlement (tier/role); null/undefined => Public (fail-safe). */
+  entitlement?: import("./entitlement").Entitlement | null;
 }
 
 /** Client-side auth state + actions exposed by `useAuth()`. */

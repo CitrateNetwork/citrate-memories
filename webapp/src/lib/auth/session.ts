@@ -16,6 +16,7 @@
  */
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { ID_COOKIE, cookieValue } from "./cookies";
+import { parseKycStatus, parseEntitlement } from "./entitlement";
 import type { AuthSession } from "./types";
 
 /**
@@ -121,7 +122,8 @@ async function verifyOidc(req: Request): Promise<AuthSession> {
     });
     const sub = payload[claimSub()] as string | undefined;
     const walletAddress = (payload[claimWallet()] as string | undefined)?.toLowerCase();
-    return { required: true, authenticated: Boolean(sub), sub, walletAddress };
+    const claims = payload as Record<string, unknown>;
+    return { required: true, authenticated: Boolean(sub), sub, walletAddress, kycStatus: parseKycStatus(claims), entitlement: parseEntitlement(claims) };
   } catch {
     return { required: true, authenticated: false };
   }
@@ -138,7 +140,7 @@ function verifyMock(req: Request): AuthSession {
       const sub = json[claimSub()] ?? json.sub;
       const walletAddress = (json[claimWallet()] ?? json.wallet_address)?.toLowerCase();
       if (sub || walletAddress) {
-        return { required: false, authenticated: true, sub, walletAddress };
+        return { required: false, authenticated: true, sub, walletAddress, kycStatus: parseKycStatus(json), entitlement: parseEntitlement(json) };
       }
     } catch {
       /* fall through to header */
