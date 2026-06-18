@@ -26,6 +26,8 @@ pub mod webhook;
 
 #[cfg(feature = "server")]
 pub mod http;
+#[cfg(feature = "server")]
+pub mod ingest_worker;
 
 /// Wall-clock epoch milliseconds. A backwards clock yields 0 rather than panicking.
 pub fn now_ms() -> u64 {
