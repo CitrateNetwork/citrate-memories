@@ -457,4 +457,51 @@ mod tests {
         assert!(matches!(AuditChain::open(&path), Err(AuditError::Corrupt(_))));
         cleanup(&path);
     }
+
+    // --- mutation-coverage closers (SECREM-02 Phase 8.3) ---
+    // These pin accessors + the open() parent-dir guard that the cargo-mutants
+    // run on 2026-06-11 left as surviving mutants (mem-authz/src/audit.rs).
+
+    #[test]
+    fn is_empty_and_len_track_records() {
+        // Kills: `is_empty -> true` and `is_empty -> false` mutants (audit.rs:280).
+        let mut c = AuditChain::new();
+        assert!(c.is_empty(), "a fresh chain is empty");
+        assert_eq!(c.len(), 0);
+        c.append(MemoryEvent::Read, "agent", "repo:x/memory", "recall", 1).expect("append");
+        assert!(!c.is_empty(), "after one append the chain is not empty");
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn log_path_is_some_for_persistent_and_none_for_in_memory() {
+        // Kills: `log_path -> None` mutant (audit.rs:237).
+        let mem = AuditChain::new();
+        assert!(mem.log_path().is_none(), "an in-memory chain has no backing log");
+        let path = temp_log("logpath");
+        let c = AuditChain::open(&path).expect("open");
+        assert_eq!(c.log_path(), Some(path.as_path()), "a persistent chain exposes its log path");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_creates_missing_parent_directory() {
+        // Kills: `delete ! in AuditChain::open` (audit.rs:149) — the guard that
+        // only calls create_dir_all when the parent path is non-empty. Open a log
+        // under a not-yet-existing nested dir and confirm it is created + usable.
+        let base = {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let mut p = std::env::temp_dir();
+            p.push(format!("memauthz-nested-{}-{nanos}", std::process::id()));
+            p
+        };
+        let nested = base.join("a").join("b");
+        let path = nested.join("audit.jsonl");
+        assert!(!nested.exists(), "parent dir does not exist yet");
+        let mut c = AuditChain::open(&path).expect("open creates the parent dir");
+        assert!(nested.exists(), "open must create the missing parent directory");
+        c.append(MemoryEvent::Read, "agent", "repo:x/memory", "recall", 1).expect("append works");
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

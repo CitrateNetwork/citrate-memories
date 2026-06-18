@@ -1,0 +1,1202 @@
+[
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 176,
+        "column": 27
+      },
+      "end": {
+        "line": 176,
+        "column": 29
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 207,
+        "column": 20
+      },
+      "end": {
+        "line": 207,
+        "column": 21
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::records",
+      "return_type": "-> &[AuditRecord]",
+      "span": {
+        "start": {
+          "line": 283,
+          "column": 5
+        },
+        "end": {
+          "line": 285,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 284,
+        "column": 9
+      },
+      "end": {
+        "line": 284,
+        "column": 22
+      }
+    },
+    "replacement": "Vec::leak(Vec::new())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 183,
+        "column": 28
+      },
+      "end": {
+        "line": 183,
+        "column": 30
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::append",
+      "return_type": "-> Result<&AuditRecord, AuditError>",
+      "span": {
+        "start": {
+          "line": 240,
+          "column": 5
+        },
+        "end": {
+          "line": 273,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 270,
+        "column": 23
+      },
+      "end": {
+        "line": 270,
+        "column": 25
+      }
+    },
+    "replacement": "*=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 213,
+        "column": 94
+      },
+      "end": {
+        "line": 213,
+        "column": 95
+      }
+    },
+    "replacement": "/",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 204,
+        "column": 21
+      },
+      "end": {
+        "line": 204,
+        "column": 22
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 207,
+        "column": 20
+      },
+      "end": {
+        "line": 207,
+        "column": 21
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::append",
+      "return_type": "-> Result<&AuditRecord, AuditError>",
+      "span": {
+        "start": {
+          "line": 240,
+          "column": 5
+        },
+        "end": {
+          "line": 273,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 267,
+        "column": 57
+      },
+      "end": {
+        "line": 267,
+        "column": 58
+      }
+    },
+    "replacement": "*",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::log_path",
+      "return_type": "-> Option<&Path>",
+      "span": {
+        "start": {
+          "line": 235,
+          "column": 5
+        },
+        "end": {
+          "line": 238,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 237,
+        "column": 9
+      },
+      "end": {
+        "line": 237,
+        "column": 57
+      }
+    },
+    "replacement": "None",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "head_path_for",
+      "return_type": "-> PathBuf",
+      "span": {
+        "start": {
+          "line": 91,
+          "column": 1
+        },
+        "end": {
+          "line": 95,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 92,
+        "column": 5
+      },
+      "end": {
+        "line": 94,
+        "column": 21
+      }
+    },
+    "replacement": "Default::default()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 204,
+        "column": 21
+      },
+      "end": {
+        "line": 204,
+        "column": 22
+      }
+    },
+    "replacement": "<",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::append",
+      "return_type": "-> Result<&AuditRecord, AuditError>",
+      "span": {
+        "start": {
+          "line": 240,
+          "column": 5
+        },
+        "end": {
+          "line": 273,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 267,
+        "column": 57
+      },
+      "end": {
+        "line": 267,
+        "column": 58
+      }
+    },
+    "replacement": "-",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 207,
+        "column": 31
+      },
+      "end": {
+        "line": 207,
+        "column": 32
+      }
+    },
+    "replacement": "-",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::verify_integrity",
+      "return_type": "-> Result<u64, String>",
+      "span": {
+        "start": {
+          "line": 287,
+          "column": 5
+        },
+        "end": {
+          "line": 300,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 294,
+        "column": 28
+      },
+      "end": {
+        "line": 294,
+        "column": 30
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 147,
+        "column": 12
+      },
+      "end": {
+        "line": 147,
+        "column": 13
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::verify_integrity",
+      "return_type": "-> Result<u64, String>",
+      "span": {
+        "start": {
+          "line": 287,
+          "column": 5
+        },
+        "end": {
+          "line": 300,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 289,
+        "column": 9
+      },
+      "end": {
+        "line": 299,
+        "column": 38
+      }
+    },
+    "replacement": "Ok(1)",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::len",
+      "return_type": "-> usize",
+      "span": {
+        "start": {
+          "line": 275,
+          "column": 5
+        },
+        "end": {
+          "line": 277,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 276,
+        "column": 9
+      },
+      "end": {
+        "line": 276,
+        "column": 27
+      }
+    },
+    "replacement": "1",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "record_hash",
+      "return_type": "-> [u8; 32]",
+      "span": {
+        "start": {
+          "line": 62,
+          "column": 1
+        },
+        "end": {
+          "line": 75,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 65,
+        "column": 5
+      },
+      "end": {
+        "line": 74,
+        "column": 29
+      }
+    },
+    "replacement": "[0; 32]",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 142,
+        "column": 9
+      },
+      "end": {
+        "line": 232,
+        "column": 11
+      }
+    },
+    "replacement": "Ok(Default::default())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::log_path",
+      "return_type": "-> Option<&Path>",
+      "span": {
+        "start": {
+          "line": 235,
+          "column": 5
+        },
+        "end": {
+          "line": 238,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 237,
+        "column": 9
+      },
+      "end": {
+        "line": 237,
+        "column": 57
+      }
+    },
+    "replacement": "Some(Box::leak(Box::new(Default::default())))",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "write_head",
+      "return_type": "-> Result<(), AuditError>",
+      "span": {
+        "start": {
+          "line": 97,
+          "column": 1
+        },
+        "end": {
+          "line": 111,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 99,
+        "column": 5
+      },
+      "end": {
+        "line": 110,
+        "column": 11
+      }
+    },
+    "replacement": "Ok(())",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 207,
+        "column": 31
+      },
+      "end": {
+        "line": 207,
+        "column": 32
+      }
+    },
+    "replacement": "*",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::append",
+      "return_type": "-> Result<&AuditRecord, AuditError>",
+      "span": {
+        "start": {
+          "line": 240,
+          "column": 5
+        },
+        "end": {
+          "line": 273,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 270,
+        "column": 23
+      },
+      "end": {
+        "line": 270,
+        "column": 25
+      }
+    },
+    "replacement": "-=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::verify_integrity",
+      "return_type": "-> Result<u64, String>",
+      "span": {
+        "start": {
+          "line": 287,
+          "column": 5
+        },
+        "end": {
+          "line": 300,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 289,
+        "column": 9
+      },
+      "end": {
+        "line": 299,
+        "column": 38
+      }
+    },
+    "replacement": "Ok(0)",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 213,
+        "column": 94
+      },
+      "end": {
+        "line": 213,
+        "column": 95
+      }
+    },
+    "replacement": "+",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::records",
+      "return_type": "-> &[AuditRecord]",
+      "span": {
+        "start": {
+          "line": 283,
+          "column": 5
+        },
+        "end": {
+          "line": 285,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 284,
+        "column": 9
+      },
+      "end": {
+        "line": 284,
+        "column": 22
+      }
+    },
+    "replacement": "Vec::leak(vec![Default::default()])",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 149,
+        "column": 20
+      },
+      "end": {
+        "line": 149,
+        "column": 21
+      }
+    },
+    "replacement": "",
+    "genre": "UnaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 214,
+        "column": 24
+      },
+      "end": {
+        "line": 214,
+        "column": 26
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::len",
+      "return_type": "-> usize",
+      "span": {
+        "start": {
+          "line": 275,
+          "column": 5
+        },
+        "end": {
+          "line": 277,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 276,
+        "column": 9
+      },
+      "end": {
+        "line": 276,
+        "column": 27
+      }
+    },
+    "replacement": "0",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::append",
+      "return_type": "-> Result<&AuditRecord, AuditError>",
+      "span": {
+        "start": {
+          "line": 240,
+          "column": 5
+        },
+        "end": {
+          "line": 273,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 251,
+        "column": 9
+      },
+      "end": {
+        "line": 272,
+        "column": 54
+      }
+    },
+    "replacement": "Ok(Box::leak(Box::new(Default::default())))",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 204,
+        "column": 21
+      },
+      "end": {
+        "line": 204,
+        "column": 22
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 213,
+        "column": 39
+      },
+      "end": {
+        "line": 213,
+        "column": 41
+      }
+    },
+    "replacement": "!=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "record_hash",
+      "return_type": "-> [u8; 32]",
+      "span": {
+        "start": {
+          "line": 62,
+          "column": 1
+        },
+        "end": {
+          "line": 75,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 65,
+        "column": 5
+      },
+      "end": {
+        "line": 74,
+        "column": 29
+      }
+    },
+    "replacement": "[1; 32]",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 222,
+        "column": 21
+      },
+      "end": {
+        "line": 222,
+        "column": 23
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "feed",
+      "return_type": "",
+      "span": {
+        "start": {
+          "line": 56,
+          "column": 1
+        },
+        "end": {
+          "line": 60,
+          "column": 2
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 57,
+        "column": 5
+      },
+      "end": {
+        "line": 59,
+        "column": 21
+      }
+    },
+    "replacement": "()",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::open",
+      "return_type": "-> Result<Self, AuditError>",
+      "span": {
+        "start": {
+          "line": 128,
+          "column": 5
+        },
+        "end": {
+          "line": 233,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 207,
+        "column": 20
+      },
+      "end": {
+        "line": 207,
+        "column": 21
+      }
+    },
+    "replacement": ">=",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::is_empty",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 279,
+          "column": 5
+        },
+        "end": {
+          "line": 281,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 280,
+        "column": 9
+      },
+      "end": {
+        "line": 280,
+        "column": 32
+      }
+    },
+    "replacement": "true",
+    "genre": "FnValue"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::verify_integrity",
+      "return_type": "-> Result<u64, String>",
+      "span": {
+        "start": {
+          "line": 287,
+          "column": 5
+        },
+        "end": {
+          "line": 300,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 291,
+        "column": 27
+      },
+      "end": {
+        "line": 291,
+        "column": 29
+      }
+    },
+    "replacement": "==",
+    "genre": "BinaryOperator"
+  },
+  {
+    "package": "mem-authz",
+    "file": "crates/mem-authz/src/audit.rs",
+    "function": {
+      "function_name": "AuditChain::is_empty",
+      "return_type": "-> bool",
+      "span": {
+        "start": {
+          "line": 279,
+          "column": 5
+        },
+        "end": {
+          "line": 281,
+          "column": 6
+        }
+      }
+    },
+    "span": {
+      "start": {
+        "line": 280,
+        "column": 9
+      },
+      "end": {
+        "line": 280,
+        "column": 32
+      }
+    },
+    "replacement": "false",
+    "genre": "FnValue"
+  }
+]

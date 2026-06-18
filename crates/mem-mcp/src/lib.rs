@@ -181,6 +181,9 @@ impl<'a> MemoryMcpServer<'a> {
             "memory.recall" => self.call_recall(&args),
             "memory.search" => self.call_search(&args),
             "memory.neighbors" => self.call_neighbors(&args),
+            "memory.as_of" => self.call_as_of(&args),
+            "memory.verify" => self.call_verify(&args),
+            "memory.critique" => self.call_critique(&args),
             "memory.analogy" => self.call_analogy(&args),
             "memory.assert" => self.call_assert(&args),
             "memory.merge_diff" => self.call_merge_diff(&args),
@@ -308,6 +311,129 @@ impl<'a> MemoryMcpServer<'a> {
                 .unwrap_or_default();
             let title = nb.node.as_ref().map(|n| n.title.replace('\n', " ")).unwrap_or_else(|| "(dangling)".into());
             text.push_str(&format!("  {arrow} [{:?}{proposed}]{cross} {}\n", nb.edge_kind, title));
+        }
+        Ok(tool_text(text))
+    }
+
+    /// `memory.as_of` (WP-3.4): decision-replay — the Derived-plane snapshot of a
+    /// tenant as it stood at a point in time. Tenant-scoped + audited like recall.
+    fn call_as_of(&mut self, args: &Value) -> Result<Value, (i64, String)> {
+        let repo = arg_str(args, "repo")?;
+        let as_of_ms = args
+            .get("as_of_ms")
+            .and_then(|v| v.as_u64())
+            .ok_or((-32602, "missing integer argument 'as_of_ms' (epoch ms)".to_string()))?;
+        let budget = arg_usize(args, "budget", 15);
+        if let Err(deny) = self.authorize_read(&repo, &format!("memory.as_of t={as_of_ms} budget={budget}")) {
+            return Ok(deny);
+        }
+        let result = Recall::new(self.store).as_of(&repo, as_of_ms, budget).map_err(store_err)?;
+        let mut text = format!("as-of {as_of_ms}ms — Derived-plane snapshot:\n");
+        text.push_str(&render_result(&result));
+        Ok(tool_text(text))
+    }
+
+    /// `memory.verify` (WP-2.4): provenance check for one node — signature posture,
+    /// supersession/refutation, contradiction. Tenant-scoped: the resolved node
+    /// must belong to the authorized repo (cross-tenant hit reads as "not found",
+    /// matching `memory.neighbors`' FUA-MEMORIES-01 guard).
+    fn call_verify(&mut self, args: &Value) -> Result<Value, (i64, String)> {
+        let repo = arg_str(args, "repo")?;
+        let prefix = arg_str(args, "id_prefix")?;
+        if let Err(deny) = self.authorize_read(&repo, &format!("memory.verify {prefix}")) {
+            return Ok(deny);
+        }
+        let recall = Recall::new(self.store);
+        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
+            Some(id) => id,
+            None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
+        };
+        // Don't leak existence of a node in another tenant.
+        match self.store.get_node(&id).map_err(store_err)? {
+            Some(n) if n.repo == repo => {}
+            _ => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
+        }
+        let v = match recall.verify(&id).map_err(store_err)? {
+            Some(v) => v,
+            None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
+        };
+        let sig = match &v.signature {
+            mem_query::SignatureStatus::NotApplicableDerived => "derived (trusted by construction)".to_string(),
+            mem_query::SignatureStatus::Valid => "signature VALID".to_string(),
+            mem_query::SignatureStatus::Invalid(e) => format!("signature INVALID: {e}"),
+            mem_query::SignatureStatus::Missing => "signature MISSING".to_string(),
+        };
+        let mut text = format!(
+            "verify {}:\n  trustworthy: {}\n  {}\n  plane: {:?}  tier: {:?}  status: {:?}\n",
+            &id.to_hex()[..12],
+            v.is_trustworthy(),
+            sig,
+            v.item.plane,
+            v.item.trust_tier,
+            v.item.status,
+        );
+        if !v.superseded_by.is_empty() {
+            text.push_str(&format!("  ⚠ superseded by {} node(s)\n", v.superseded_by.len()));
+        }
+        if !v.refuted_by.is_empty() {
+            text.push_str(&format!("  ⚠ refuted/contradicted by {} node(s)\n", v.refuted_by.len()));
+        }
+        if v.contradicted {
+            text.push_str("  ⚠ Belnap contradiction (Both) recorded\n");
+        }
+        Ok(tool_text(text))
+    }
+
+    /// `memory.critique` (WP-3.5): run the self-critic over a fresh storyline (or a
+    /// search, when `query` is given) for a tenant and report completeness gaps —
+    /// what an agent acting on the result might be missing.
+    fn call_critique(&mut self, args: &Value) -> Result<Value, (i64, String)> {
+        let repo = arg_str(args, "repo")?;
+        let budget = arg_usize(args, "budget", 15);
+        let query = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let detail = match &query {
+            Some(q) => format!("memory.critique search {q:?} budget={budget}"),
+            None => format!("memory.critique storyline budget={budget}"),
+        };
+        if let Err(deny) = self.authorize_read(&repo, &detail) {
+            return Ok(deny);
+        }
+        let result = match &query {
+            Some(q) => {
+                let mut recall = match &self.query_embedder {
+                    Some(e) => Recall::with_embedder(self.store, Box::new(Arc::clone(e))),
+                    None => Recall::new(self.store),
+                };
+                if let Some(cache) = &self.index_cache {
+                    recall = recall.with_index_cache(Arc::clone(cache));
+                }
+                recall.search(&repo, q, budget).map_err(store_err)?
+            }
+            None => Recall::new(self.store).storyline(&repo, budget).map_err(store_err)?,
+        };
+        let critique = Recall::new(self.store).critique(&result, now_ms()).map_err(store_err)?;
+        let mut text = format!("self-critic over '{repo}' (completeness {:.2}):\n", critique.completeness);
+        if let Some(age) = critique.watermark_age_ms {
+            text.push_str(&format!("  freshness: index is {}ms behind now\n", age));
+        }
+        if critique.gaps.is_empty() {
+            text.push_str("  no completeness gaps found.\n");
+        }
+        for g in &critique.gaps {
+            match g {
+                mem_query::Gap::TruncatedCoverage { shown, total } => {
+                    text.push_str(&format!("  ⚠ truncated: showing {shown} of {total} — raise budget or narrow the query\n"));
+                }
+                mem_query::Gap::SupersededInResult(ids) => {
+                    text.push_str(&format!("  ⚠ {} superseded node(s) in the result — stale memory\n", ids.len()));
+                }
+                mem_query::Gap::Contradicted(id) => {
+                    text.push_str(&format!("  ⚠ contradiction recorded on {}\n", &id.to_hex()[..12]));
+                }
+                mem_query::Gap::AdjacentProposal(id) => {
+                    text.push_str(&format!("  ⚠ unconfirmed proposal adjacent to {} — check memory.neighbors\n", &id.to_hex()[..12]));
+                }
+            }
         }
         Ok(tool_text(text))
     }
@@ -697,6 +823,44 @@ fn tools_list() -> Value {
             }
         },
         {
+            "name": "memory.as_of",
+            "description": "Decision-replay: the Derived-plane snapshot of a repo tenant as it stood at a point in time (epoch ms). Shows only nodes that were already valid and not yet retired at that instant.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string" },
+                    "as_of_ms": { "type": "integer", "description": "epoch milliseconds — the replay instant" },
+                    "budget": { "type": "integer", "default": 15 }
+                },
+                "required": ["repo", "as_of_ms"]
+            }
+        },
+        {
+            "name": "memory.verify",
+            "description": "Provenance check for one node (by id prefix): signature posture, whether it has been superseded/refuted, and whether a contradiction is recorded — so a caller knows if it is safe to act on.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string" },
+                    "id_prefix": { "type": "string" }
+                },
+                "required": ["repo", "id_prefix"]
+            }
+        },
+        {
+            "name": "memory.critique",
+            "description": "Self-critic completeness pass: runs a storyline (or a search, if 'query' is given) and reports what an agent acting on the result might be missing — truncated coverage, stale/superseded items, contradictions, adjacent unconfirmed proposals, index staleness.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string" },
+                    "query": { "type": "string", "description": "optional — critique a search instead of a storyline" },
+                    "budget": { "type": "integer", "default": 15 }
+                },
+                "required": ["repo"]
+            }
+        },
+        {
             "name": "memory.analogy",
             "description": "Cross-tenant analogues of a node (coarse embedding shortlist + structural edge-shape verify), searched only across tenants this session may read.",
             "inputSchema": {
@@ -888,7 +1052,81 @@ mod tests {
 
         let list = srv.handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let v: Value = serde_json::from_str(&list).unwrap();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 8);
+        let tools = v["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 11);
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for t in ["memory.as_of", "memory.verify", "memory.critique"] {
+            assert!(names.contains(&t), "{t} must be advertised");
+        }
+    }
+
+    #[test]
+    fn as_of_is_tenant_scoped_and_audited() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        // Authorized tenant, replay instant after the node's valid_from=1.
+        let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.as_of","arguments":{"repo":"citrate-chain","as_of_ms":100}}}"#;
+        let v: Value = serde_json::from_str(&srv.handle_line(call).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("ghostdag"));
+        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Read);
+
+        // Ungranted tenant is denied.
+        let denied = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory.as_of","arguments":{"repo":"citrate-identity","as_of_ms":100}}}"#;
+        let v: Value = serde_json::from_str(&srv.handle_line(denied).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+    }
+
+    #[test]
+    fn verify_reports_derived_node_trustworthy() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let id = node("citrate-chain", "ghostdag tip selection").compute_id();
+        let prefix = &id.to_hex()[..10];
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory.verify","arguments":{{"repo":"citrate-chain","id_prefix":"{prefix}"}}}}}}"#
+        );
+        let v: Value = serde_json::from_str(&srv.handle_line(&call).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("trustworthy: true"));
+        assert!(text.contains("derived"));
+    }
+
+    #[test]
+    fn verify_will_not_leak_cross_tenant_node() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant()); // read on citrate-chain only
+        // Prefix of a node that lives in the ungranted citrate-identity tenant.
+        let id = node("citrate-identity", "siwe login").compute_id();
+        let prefix = &id.to_hex()[..10];
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory.verify","arguments":{{"repo":"citrate-chain","id_prefix":"{prefix}"}}}}}}"#
+        );
+        let v: Value = serde_json::from_str(&srv.handle_line(&call).unwrap()).unwrap();
+        // Authorized on citrate-chain, but the resolved node is in another tenant →
+        // reads as "no unique node" (existence not leaked), never the node's content.
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no unique node"), "must not surface a cross-tenant node");
+    }
+
+    #[test]
+    fn critique_flags_truncated_coverage_over_mcp() {
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        s.commit(
+            &[
+                node("citrate-chain", "n1"),
+                node("citrate-chain", "n2"),
+                node("citrate-chain", "n3"),
+            ],
+            &[],
+        )
+        .unwrap();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.critique","arguments":{"repo":"citrate-chain","budget":2}}}"#;
+        let v: Value = serde_json::from_str(&srv.handle_line(call).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("truncated"));
     }
 
     #[test]

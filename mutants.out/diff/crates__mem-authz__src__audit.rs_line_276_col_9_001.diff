@@ -1,0 +1,21 @@
+--- crates/mem-authz/src/audit.rs
++++ replace AuditChain::len -> usize with 0
+@@ -268,17 +268,17 @@
+         }
+         self.last_hash = hash;
+         self.next_seq += 1;
+         self.records.push(record);
+         Ok(self.records.last().expect("just pushed"))
+     }
+ 
+     pub fn len(&self) -> usize {
+-        self.records.len()
++        0 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+         self.records.is_empty()
+     }
+ 
+     pub fn records(&self) -> &[AuditRecord] {
+         &self.records

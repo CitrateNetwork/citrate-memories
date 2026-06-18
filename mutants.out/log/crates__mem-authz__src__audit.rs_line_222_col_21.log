@@ -1,0 +1,158 @@
+
+*** crates/mem-authz/src/audit.rs:222:21: replace != with == in AuditChain::open
+
+*** mutation diff:
+--- crates/mem-authz/src/audit.rs
++++ replace != with == in AuditChain::open
+@@ -214,17 +214,17 @@
+         if prefix_hash != head_hash {
+             return Err(AuditError::Corrupt(format!(
+                 "head hash does not match the log at length {}",
+                 head.len
+             )));
+         }
+ 
+         // Repair the head after an accepted crash window.
+-        if head.len != log_len {
++        if head.len == /* ~ changed by cargo-mutants ~ */ log_len {
+             write_head(&head_path, log_len, &last_hash)?;
+         }
+ 
+         let log = OpenOptions::new().append(true).open(&log_path)?;
+         Ok(Self {
+             records,
+             last_hash,
+             next_seq: log_len,
+
+
+*** /Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo test --no-run --verbose --package=mem-authz@0.0.1
+       Fresh version_check v0.9.5
+       Fresh typenum v1.20.1
+       Fresh unicode-ident v1.0.24
+       Fresh semver v1.0.28
+       Fresh find-msvc-tools v0.1.9
+       Fresh cfg-if v1.0.4
+       Fresh shlex v2.0.1
+       Fresh zeroize v1.8.2
+       Fresh rustc_version v0.4.1
+       Fresh cc v1.2.63
+       Fresh signature v2.2.0
+       Fresh subtle v2.6.1
+       Fresh generic-array v0.14.7
+       Fresh proc-macro2 v1.0.106
+       Fresh libc v0.2.186
+       Fresh serde_core v1.0.228
+       Fresh zmij v1.0.21
+       Fresh ed25519 v2.2.3
+       Fresh arrayref v0.3.9
+       Fresh arrayvec v0.7.6
+       Fresh quote v1.0.45
+       Fresh block-buffer v0.10.4
+       Fresh crypto-common v0.1.7
+       Fresh cpufeatures v0.2.17
+       Fresh memchr v2.8.1
+       Fresh itoa v1.0.18
+       Fresh constant_time_eq v0.4.2
+       Fresh hex v0.4.3
+       Fresh syn v2.0.117
+       Fresh digest v0.10.7
+       Fresh serde_json v1.0.150
+       Fresh blake3 v1.8.5
+       Fresh serde_derive v1.0.228
+       Fresh curve25519-dalek v4.1.3
+       Fresh sha2 v0.10.9
+       Fresh thiserror-impl v1.0.69
+       Fresh thiserror v1.0.69
+       Fresh serde v1.0.228
+       Fresh ed25519-dalek v2.2.0
+       Dirty mem-authz v0.0.1 (/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/crates/mem-authz): the file `crates/mem-authz/src/audit.rs` has changed (1781237611.502221962s, 1s after last build at 1781237610.752459672s)
+   Compiling mem-authz v0.0.1 (/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/crates/mem-authz)
+     Running `/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name mem_authz --edition=2021 crates/mem-authz/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=ec00f971c9897dca -C extra-filename=-7895e4adb5dd2228 --out-dir /private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps -C incremental=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/incremental -L dependency=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps --extern blake3=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libblake3-5e79647cef734f26.rlib --extern ed25519_dalek=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libed25519_dalek-c5c80f345522c3d2.rlib --extern hex=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libhex-ce021e0d3a439a1a.rlib --extern serde=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libserde-12fadd0e99e71f99.rlib --extern serde_json=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libserde_json-6e1f8c5a9adebcfb.rlib --extern thiserror=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libthiserror-f03c6e1b004b6523.rlib -L native=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/build/blake3-846e69b79921f296/out`
+     Running `/Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name mem_authz --edition=2021 crates/mem-authz/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=f84cc755cba72046 -C extra-filename=-43cb7d104291aed7 --out-dir /private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps -C incremental=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/incremental -L dependency=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps --extern blake3=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libblake3-5e79647cef734f26.rmeta --extern ed25519_dalek=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libed25519_dalek-c5c80f345522c3d2.rmeta --extern hex=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libhex-ce021e0d3a439a1a.rmeta --extern serde=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libserde-12fadd0e99e71f99.rmeta --extern serde_json=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libserde_json-6e1f8c5a9adebcfb.rmeta --extern thiserror=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/libthiserror-f03c6e1b004b6523.rmeta -L native=/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/build/blake3-846e69b79921f296/out`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+  Executable `/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/mem_authz-7895e4adb5dd2228`
+
+*** result: Success
+
+*** /Users/learnlikelarry/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo test --verbose --package=mem-authz@0.0.1
+       Fresh version_check v0.9.5
+       Fresh unicode-ident v1.0.24
+       Fresh typenum v1.20.1
+       Fresh semver v1.0.28
+       Fresh find-msvc-tools v0.1.9
+       Fresh cfg-if v1.0.4
+       Fresh shlex v2.0.1
+       Fresh rustc_version v0.4.1
+       Fresh cc v1.2.63
+       Fresh subtle v2.6.1
+       Fresh signature v2.2.0
+       Fresh zeroize v1.8.2
+       Fresh generic-array v0.14.7
+       Fresh proc-macro2 v1.0.106
+       Fresh libc v0.2.186
+       Fresh serde_core v1.0.228
+       Fresh ed25519 v2.2.3
+       Fresh zmij v1.0.21
+       Fresh constant_time_eq v0.4.2
+       Fresh memchr v2.8.1
+       Fresh quote v1.0.45
+       Fresh crypto-common v0.1.7
+       Fresh block-buffer v0.10.4
+       Fresh cpufeatures v0.2.17
+       Fresh arrayvec v0.7.6
+       Fresh arrayref v0.3.9
+       Fresh itoa v1.0.18
+       Fresh hex v0.4.3
+       Fresh syn v2.0.117
+       Fresh digest v0.10.7
+       Fresh serde_json v1.0.150
+       Fresh blake3 v1.8.5
+       Fresh thiserror-impl v1.0.69
+       Fresh serde_derive v1.0.228
+       Fresh curve25519-dalek v4.1.3
+       Fresh sha2 v0.10.9
+       Fresh serde v1.0.228
+       Fresh thiserror v1.0.69
+       Fresh ed25519-dalek v2.2.0
+       Fresh mem-authz v0.0.1 (/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/crates/mem-authz)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running `/private/var/folders/1s/3q3l6nws2g51h8l00lp0nm7h0000gn/T/cargo-mutants-citrate-memories-z1vdqe.tmp/target/debug/deps/mem_authz-7895e4adb5dd2228`
+
+running 17 tests
+test audit::tests::is_empty_and_len_track_records ... ok
+test audit::tests::appends_and_verifies ... ok
+test audit::tests::tampering_is_detected ... ok
+test grant::tests::denies_unscoped_resource ... ok
+test grant::tests::expiry_and_revocation_block ... ok
+test grant::tests::signed_grant_allows_scoped_read ... ok
+test grant::tests::denies_write_when_read_only ... ok
+test grant::tests::tampering_invalidates_signature ... ok
+test grant::tests::wildcard_scope_matches_any_repo ... ok
+test audit::tests::log_path_is_some_for_persistent_and_none_for_in_memory ... ok
+test audit::tests::open_creates_missing_parent_directory ... ok
+test audit::tests::missing_head_sidecar_is_detected_on_open ... ok
+test audit::tests::tampered_log_record_is_detected_on_open ... ok
+test audit::tests::log_more_than_one_ahead_of_head_is_rejected ... ok
+test audit::tests::truncated_log_is_detected_on_open ... ok
+test audit::tests::crash_window_log_one_ahead_of_head_is_accepted_and_repaired ... FAILED
+test audit::tests::persists_resumes_and_continues_across_reopen ... ok
+
+failures:
+
+---- audit::tests::crash_window_log_one_ahead_of_head_is_accepted_and_repaired stdout ----
+
+thread 'audit::tests::crash_window_log_one_ahead_of_head_is_accepted_and_repaired' (2780392) panicked at crates/mem-authz/src/audit.rs:440:9:
+assertion `left == right` failed
+  left: 2
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    audit::tests::crash_window_log_one_ahead_of_head_is_accepted_and_repaired
+
+test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `-p mem-authz --lib`
+
+*** result: Failure(101)

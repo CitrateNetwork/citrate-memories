@@ -5,3 +5,8 @@
 # local DAG stores / scratch
 *.memdag/
 /data
+
+# TLA+ TLC local artifacts (jar fetched per-run; traces are transient)
+specs/tla2tools.jar
+specs/*_TTrace_*
+specs/states/

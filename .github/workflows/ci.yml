@@ -1,0 +1,51 @@
+name: ci
+
+# citrate-memories CI: workspace tests (Rule 2 — count only goes up), clippy
+# (Rule 8 — zero warnings), and the WP-0.5 TLC gate (model-check every TLA+
+# spec; a violated invariant fails the build — the one hard block).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (workspace)
+        run: cargo test --workspace
+      - name: clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  tla-model-check:
+    # WP-0.5 gate: TLC over SupersededDag / Ingestion / Authz. This is where a
+    # broken safety invariant hard-blocks the merge (it caught the SupersededDag
+    # reachability bug on 2026-06-11). Complements the soft trailer nudge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Temurin JRE
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch tla2tools.jar
+        run: |
+          mkdir -p "$HOME/.local/share/tla"
+          curl -fsSL -o "$HOME/.local/share/tla/tla2tools.jar" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+      - name: TLC model-check all specs
+        env:
+          TLA_TOOLS: ${{ github.workspace }}/.tla/tla2tools.jar
+        run: |
+          export TLA_TOOLS="$HOME/.local/share/tla/tla2tools.jar"
+          ./specs/check.sh

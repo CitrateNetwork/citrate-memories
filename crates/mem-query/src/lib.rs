@@ -103,6 +103,74 @@ const ANALOGY_STRUCTURAL_WEIGHT: f32 = 0.3;
 /// Shortlist factor: how many coarse candidates survive to the structural pass.
 const ANALOGY_SHORTLIST_FACTOR: usize = 4;
 
+/// Signature posture of a node, as reported by [`Recall::verify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureStatus {
+    /// Derived plane: trusted by construction (deterministic projection of a
+    /// canonical artifact), so a signature is not applicable.
+    NotApplicableDerived,
+    /// Asserted plane: the ed25519 signature over the content id holds.
+    Valid,
+    /// Asserted plane: claims to be signed but the signature does not verify.
+    Invalid(String),
+    /// Asserted plane: no signature present (should never land via the write
+    /// boundary, but reported honestly if encountered).
+    Missing,
+}
+
+/// The provenance answer for a single node (WP-2.4 `verify`): everything a caller
+/// needs to decide whether to trust and act on a memory.
+#[derive(Debug, Clone)]
+pub struct Verification {
+    pub item: RecallItem,
+    pub signature: SignatureStatus,
+    /// Non-quarantined `Supersedes` edges pointing at this node (newer nodes that
+    /// override it). Non-empty ⇒ this memory is stale.
+    pub superseded_by: Vec<ContentHash>,
+    /// Non-quarantined `Refutes`/`Contradicts` edges pointing at this node.
+    pub refuted_by: Vec<ContentHash>,
+    /// The node's Belnap confidence records a contradiction (`Both`).
+    pub contradicted: bool,
+}
+
+impl Verification {
+    /// A node is "safe to act on" iff its signature posture is acceptable AND it
+    /// is current (not superseded), not refuted, and not contradicted.
+    pub fn is_trustworthy(&self) -> bool {
+        matches!(self.signature, SignatureStatus::NotApplicableDerived | SignatureStatus::Valid)
+            && self.superseded_by.is_empty()
+            && self.refuted_by.is_empty()
+            && !self.contradicted
+            && self.item.status == Status::Active
+    }
+}
+
+/// One completeness gap the self-critic ([`Recall::critique`]) found in a recall
+/// result — something an agent acting on the result might be missing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Gap {
+    /// The budget hid part of the tenant (`shown` of `total`).
+    TruncatedCoverage { shown: usize, total: usize },
+    /// Superseded node(s) are present in the result — acting on stale memory.
+    SupersededInResult(Vec<ContentHash>),
+    /// A returned node carries a Belnap `Both` contradiction.
+    Contradicted(ContentHash),
+    /// A returned node has an adjacent quarantined (proposed, unconfirmed) edge
+    /// the result didn't surface.
+    AdjacentProposal(ContentHash),
+}
+
+/// The self-critic's verdict over a recall result (WP-3.5 / D3.5).
+#[derive(Debug, Clone)]
+pub struct Critique {
+    pub gaps: Vec<Gap>,
+    /// Milliseconds between the result's freshness watermark and `now`; `None`
+    /// if the tenant has no watermark.
+    pub watermark_age_ms: Option<Timestamp>,
+    /// 1.0 = no gaps; decreases as gaps accumulate. Advisory shaping signal.
+    pub completeness: f32,
+}
+
 /// A minted placeholder reference node (trailer/block target not yet resolved).
 fn is_reference(n: &MemoryNode) -> bool {
     matches!(&n.source_ref, SourceRef::DagNative { key } if key.starts_with("ref:"))
@@ -488,6 +556,163 @@ impl<'a> Recall<'a> {
         }
         Ok(found)
     }
+
+    /// As-of / decision-replay (WP-3.4, D3.4): reconstruct what the **Derived**
+    /// plane knew about a tenant at a point in time `as_of_ms`.
+    ///
+    /// A node is "known and current as of T" iff it was already valid
+    /// (`valid_from <= T`) and had not yet been retired (`valid_to` is `None` or
+    /// `> T`). This is a pure bitemporal filter — the Derived plane is a
+    /// deterministic projection of git/markdown, so replaying it at T is
+    /// well-defined and reproducible (the core invariant). The Asserted plane is
+    /// append-only *signed* claims, not a deterministic projection, so
+    /// decision-replay is scoped to Derived only: an "as-of" snapshot answers
+    /// "what did the deterministic record show," not "what had anyone claimed."
+    ///
+    /// `valid_from` is excluded from `compute_id`, but for dated Derived nodes it
+    /// is itself deterministic (frontmatter `created:` / commit date — see
+    /// `mem-ingest` F-3), so the snapshot is stable across rebuilds.
+    pub fn as_of(&self, repo: &str, as_of_ms: Timestamp, budget: usize) -> Result<RecallResult, StoreError> {
+        let nodes = self.tenant_nodes(repo)?;
+        let total = nodes.len();
+        let mut current: Vec<&MemoryNode> = nodes
+            .iter()
+            .filter(|n| n.plane == Plane::Derived)
+            .filter(|n| n.valid_from <= as_of_ms)
+            .filter(|n| n.valid_to.map(|vt| vt > as_of_ms).unwrap_or(true))
+            .collect();
+        // Newest-as-of-T first; ties broken by id for determinism.
+        current.sort_by(|a, b| {
+            b.valid_from
+                .cmp(&a.valid_from)
+                .then_with(|| a.compute_id().cmp(&b.compute_id()))
+        });
+        let items = current.iter().take(budget).map(|n| RecallItem::from_node(n, None)).collect();
+        Ok(RecallResult {
+            repo: repo.to_string(),
+            watermark: self.watermark(repo),
+            total_in_tenant: total,
+            items,
+        })
+    }
+
+    /// Provenance verification (WP-2.4 `verify`): answer "can I trust this node,
+    /// and is it still current?" for a single node by id.
+    ///
+    /// Gathers, in one pass, everything a caller needs to decide whether to act on
+    /// a memory: its plane/tier/status, whether its Asserted-plane signature
+    /// actually holds (re-checked here, not assumed), whether it has been
+    /// superseded or refuted (and by what), and whether its Belnap confidence
+    /// records a contradiction. A `Derived` node verifies by construction (it
+    /// points at a canonical artifact and is rebuildable); an `Asserted` node
+    /// verifies iff its signature over the content id holds.
+    pub fn verify(&self, id: &ContentHash) -> Result<Option<Verification>, StoreError> {
+        let node = match self.store.get_node(id)? {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+
+        // Signature check. Derived nodes are trusted by construction (deterministic
+        // projection of a canonical artifact); Asserted nodes must carry a valid
+        // ed25519 signature over their content id (mem-assert is the authority).
+        let signature = match node.plane {
+            Plane::Derived => SignatureStatus::NotApplicableDerived,
+            Plane::Asserted => match mem_assert::verify_node(&node) {
+                Ok(()) => SignatureStatus::Valid,
+                Err(mem_assert::AssertError::Unsigned) => SignatureStatus::Missing,
+                Err(e) => SignatureStatus::Invalid(e.to_string()),
+            },
+        };
+
+        // Supersession / refutation: an incoming Supersedes/Refutes edge means
+        // something newer overrides or disputes this node. (Edge is from→to where
+        // `from` supersedes/refutes `to`, so we want this node's in-edges.)
+        let mut superseded_by = Vec::new();
+        let mut refuted_by = Vec::new();
+        for e in self.store.in_edges(id)? {
+            if e.quarantined {
+                continue; // a proposal is advisory, never load-bearing
+            }
+            match e.kind {
+                mem_core::EdgeKind::Supersedes => superseded_by.push(e.from),
+                mem_core::EdgeKind::Refutes | mem_core::EdgeKind::Contradicts => refuted_by.push(e.from),
+                _ => {}
+            }
+        }
+
+        let contradicted = node.confidence.iter().any(|c| matches!(c, mem_core::BelnapValue::Both));
+
+        Ok(Some(Verification {
+            item: RecallItem::from_node(&node, None),
+            signature,
+            superseded_by,
+            refuted_by,
+            contradicted,
+        }))
+    }
+
+    /// Self-critic completeness pass (WP-3.5, D3.5): an agentic verification loop
+    /// that reads a recall/search result and reports what an agent acting on it
+    /// might be *missing*, so it never treats a partial or stale answer as
+    /// complete.
+    ///
+    /// v1 is a **deterministic** critic — it does not call an LLM. That is a
+    /// deliberate plane-invariant choice: an LLM critique is nondeterministic and
+    /// would be an *assertion*, not a derivation, so it cannot be a trusted
+    /// completeness gate. The deterministic critic instead surfaces the concrete,
+    /// checkable gaps that recall's budget-shaping and the two-plane model can
+    /// hide: truncated coverage, superseded/contradicted items still in the set,
+    /// adjacent quarantined (unconfirmed) edges, and a stale freshness watermark.
+    /// An optional LLM elaboration over these gaps is a v2 follow-up (it would
+    /// land as a quarantined assertion, never load-bearing).
+    pub fn critique(&self, result: &RecallResult, now_ms: Timestamp) -> Result<Critique, StoreError> {
+        let mut gaps = Vec::new();
+
+        // 1. Truncated coverage: the budget hid part of the tenant.
+        if result.total_in_tenant > result.items.len() {
+            gaps.push(Gap::TruncatedCoverage {
+                shown: result.items.len(),
+                total: result.total_in_tenant,
+            });
+        }
+
+        // 2. Acting on stale memory: superseded/archived items are in the answer.
+        let superseded = result
+            .items
+            .iter()
+            .filter(|i| i.status == Status::Superseded)
+            .map(|i| i.id)
+            .collect::<Vec<_>>();
+        if !superseded.is_empty() {
+            gaps.push(Gap::SupersededInResult(superseded));
+        }
+
+        // 3. Unresolved contradictions: Belnap `Both` recorded on a returned node.
+        for i in &result.items {
+            if let Some(n) = self.store.get_node(&i.id)? {
+                if n.confidence.iter().any(|c| matches!(c, mem_core::BelnapValue::Both)) {
+                    gaps.push(Gap::Contradicted(i.id));
+                }
+                // 4. Adjacent unconfirmed knowledge: a returned node has a
+                //    quarantined (proposed, advisory) edge the answer didn't show.
+                let has_quarantined = self
+                    .store
+                    .out_edges(&i.id)?
+                    .into_iter()
+                    .chain(self.store.in_edges(&i.id)?)
+                    .any(|e| e.quarantined);
+                if has_quarantined {
+                    gaps.push(Gap::AdjacentProposal(i.id));
+                }
+            }
+        }
+
+        // 5. Stale freshness: the Derived index may be behind the repo.
+        let watermark_age_ms = result.watermark.as_ref().map(|w| now_ms.saturating_sub(w.ingested_at_ms));
+
+        let completeness = if gaps.is_empty() { 1.0 } else { 1.0 / (1.0 + gaps.len() as f32) };
+        Ok(Critique { gaps, watermark_age_ms, completeness })
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +749,184 @@ mod tests {
         let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
         s.commit(nodes, &[]).unwrap();
         s
+    }
+
+    /// A Derived node with an explicit retirement instant (`valid_to`).
+    fn node_retired(repo: &str, subject: &str, valid_from: Timestamp, valid_to: Timestamp) -> MemoryNode {
+        let mut n = node(repo, subject, valid_from);
+        n.valid_to = Some(valid_to);
+        n
+    }
+
+    fn supersedes_edge(from: &ContentHash, to: &ContentHash) -> Edge {
+        Edge {
+            from: *from,
+            to: *to,
+            kind: EdgeKind::Supersedes,
+            plane: Plane::Derived,
+            trust_tier: TrustTier::DerivedDeterministic,
+            provenance: EdgeProvenance { method: EdgeMethod::Ingest, asserter: "t".into(), at: 0, evidence: None },
+            confidence: vec![],
+            quarantined: false,
+            signature: None,
+        }
+    }
+
+    // ---- WP-3.4 as_of / decision-replay ----
+
+    #[test]
+    fn as_of_excludes_nodes_not_yet_valid() {
+        let s = store_with(&[node("a", "early", 100), node("a", "later", 300)]);
+        // At T=200 only the first node existed.
+        let r = Recall::new(&s).as_of("a", 200, 10).unwrap();
+        let titles: Vec<_> = r.items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["early"], "a node valid_from=300 must not appear in an as-of T=200 snapshot");
+    }
+
+    #[test]
+    fn as_of_excludes_retired_nodes() {
+        // valid in [100,200); queried at 250 → already retired.
+        let s = store_with(&[node_retired("a", "retired", 100, 200), node("a", "live", 100)]);
+        let r = Recall::new(&s).as_of("a", 250, 10).unwrap();
+        let titles: Vec<_> = r.items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["live"], "a node with valid_to<=T must be excluded from the as-of snapshot");
+        // ...but it IS present mid-validity.
+        let mid = Recall::new(&s).as_of("a", 150, 10).unwrap();
+        assert_eq!(mid.items.len(), 2, "both nodes valid at T=150");
+    }
+
+    #[test]
+    fn as_of_is_derived_plane_only() {
+        let mut asserted = node("a", "an assertion", 100);
+        asserted.plane = Plane::Asserted;
+        asserted.trust_tier = TrustTier::AgentAsserted;
+        let s = store_with(&[node("a", "derived", 100), asserted]);
+        let r = Recall::new(&s).as_of("a", 150, 10).unwrap();
+        let titles: Vec<_> = r.items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["derived"], "decision-replay is over the deterministic Derived projection only");
+    }
+
+    // ---- WP-2.4 verify ----
+
+    fn signed_assertion(repo: &str, content: &str) -> MemoryNode {
+        use ed25519_dalek::SigningKey;
+        let a = mem_assert::Asserter::new(SigningKey::from_bytes(&[7u8; 32]));
+        a.assert_node(repo, NodeKind::Rationale, content, 1_000)
+    }
+
+    #[test]
+    fn verify_derived_node_is_trustworthy_without_a_signature() {
+        let s = store_with(&[node("a", "deterministic", 100)]);
+        let id = node("a", "deterministic", 100).compute_id();
+        let v = Recall::new(&s).verify(&id).unwrap().expect("node exists");
+        assert_eq!(v.signature, SignatureStatus::NotApplicableDerived);
+        assert!(v.is_trustworthy());
+    }
+
+    #[test]
+    fn verify_validly_signed_assertion_passes() {
+        let n = signed_assertion("a", "tried X, it failed");
+        let s = store_with(std::slice::from_ref(&n));
+        let v = Recall::new(&s).verify(&n.compute_id()).unwrap().expect("node exists");
+        assert_eq!(v.signature, SignatureStatus::Valid);
+        assert!(v.is_trustworthy());
+    }
+
+    #[test]
+    fn verify_tampered_signature_is_rejected() {
+        let mut n = signed_assertion("a", "load-bearing claim");
+        // Flip a signature byte — the content id still resolves, but the sig breaks.
+        if let Some(sig) = n.signature.as_mut() {
+            sig[0] ^= 0xff;
+        }
+        let s = store_with(&[n.clone()]);
+        let v = Recall::new(&s).verify(&n.compute_id()).unwrap().expect("node exists");
+        assert!(matches!(v.signature, SignatureStatus::Invalid(_)), "a tampered signature must not verify");
+        assert!(!v.is_trustworthy());
+    }
+
+    #[test]
+    fn verify_surfaces_supersession() {
+        let old = node("a", "old decision", 100);
+        let new = node("a", "new decision", 200);
+        let s = store_with(&[old.clone(), new.clone()]);
+        s.add_edge(&supersedes_edge(&new.compute_id(), &old.compute_id())).unwrap();
+        let v = Recall::new(&s).verify(&old.compute_id()).unwrap().expect("node exists");
+        assert_eq!(v.superseded_by, vec![new.compute_id()]);
+        assert!(!v.is_trustworthy(), "a superseded node is not safe to act on");
+    }
+
+    #[test]
+    fn verify_quarantined_supersedes_does_not_count() {
+        let old = node("a", "old", 100);
+        let new = node("a", "new", 200);
+        let s = store_with(&[old.clone(), new.clone()]);
+        let mut e = supersedes_edge(&new.compute_id(), &old.compute_id());
+        e.quarantined = true; // a proposal — advisory only
+        s.add_edge(&e).unwrap();
+        let v = Recall::new(&s).verify(&old.compute_id()).unwrap().expect("node exists");
+        assert!(v.superseded_by.is_empty(), "a quarantined proposal must not mark the node stale");
+        assert!(v.is_trustworthy());
+    }
+
+    #[test]
+    fn verify_flags_contradiction() {
+        let mut n = node("a", "contested", 100);
+        n.confidence = vec![mem_core::BelnapValue::Both];
+        let s = store_with(&[n.clone()]);
+        let v = Recall::new(&s).verify(&n.compute_id()).unwrap().expect("node exists");
+        assert!(v.contradicted);
+        assert!(!v.is_trustworthy());
+    }
+
+    #[test]
+    fn verify_unknown_id_is_none() {
+        let s = store_with(&[node("a", "x", 1)]);
+        let missing = node("a", "not in store", 9).compute_id();
+        assert!(Recall::new(&s).verify(&missing).unwrap().is_none());
+    }
+
+    // ---- WP-3.5 self-critic ----
+
+    #[test]
+    fn critique_flags_truncated_coverage() {
+        let s = store_with(&[node("a", "n1", 1), node("a", "n2", 2), node("a", "n3", 3)]);
+        let r = Recall::new(&s).storyline("a", 2).unwrap();
+        let c = Recall::new(&s).critique(&r, 10).unwrap();
+        assert!(c.gaps.iter().any(|g| matches!(g, Gap::TruncatedCoverage { shown: 2, total: 3 })));
+        assert!(c.completeness < 1.0);
+    }
+
+    #[test]
+    fn critique_flags_superseded_in_result() {
+        let mut stale = node("a", "stale", 100);
+        stale.status = Status::Superseded;
+        let s = store_with(&[stale]);
+        let r = Recall::new(&s).storyline("a", 10).unwrap();
+        let c = Recall::new(&s).critique(&r, 10).unwrap();
+        assert!(c.gaps.iter().any(|g| matches!(g, Gap::SupersededInResult(ids) if ids.len() == 1)));
+    }
+
+    #[test]
+    fn critique_clean_result_has_no_gaps() {
+        let s = store_with(&[node("a", "only", 1)]);
+        let r = Recall::new(&s).storyline("a", 10).unwrap();
+        let c = Recall::new(&s).critique(&r, 10).unwrap();
+        assert!(c.gaps.is_empty(), "a complete, current, single-item result has no completeness gaps");
+        assert_eq!(c.completeness, 1.0);
+    }
+
+    #[test]
+    fn critique_flags_adjacent_proposal() {
+        let n = node("a", "anchor", 100);
+        let other = node("a", "other", 50);
+        let s = store_with(&[n.clone(), other.clone()]);
+        let mut e = supersedes_edge(&n.compute_id(), &other.compute_id());
+        e.quarantined = true; // an unconfirmed proposal adjacent to a returned node
+        s.add_edge(&e).unwrap();
+        let r = Recall::new(&s).storyline("a", 10).unwrap();
+        let c = Recall::new(&s).critique(&r, 10).unwrap();
+        assert!(c.gaps.iter().any(|g| matches!(g, Gap::AdjacentProposal(_))));
     }
 
     #[test]

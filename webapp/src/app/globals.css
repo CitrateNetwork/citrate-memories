@@ -1,0 +1,146 @@
+/* =============================================================
+   Memrizz — design tokens, ported 1:1 from the on-brand prototype
+   (design-prototype/colors_and_type.css + the dark constellation chrome
+   from memrizz.css / UI_IMPLEMENTATION_SPEC.md).
+
+   NOTE: the prototype's `@import url(fonts.googleapis.com…)` is intentionally
+   REMOVED — fonts are self-hosted via next/font (src/app/layout.tsx) so the
+   nonce CSP needs no Google Fonts origin. The CSS var names below match the
+   font-family vars next/font exposes.
+   ============================================================= */
+
+:root {
+  /* ---------- BRAND ---------- */
+  --citrate-green:        #8ecc09;
+  --citrate-green-deep:   #5a8205;
+  --citrate-green-dark:   #2f4502;
+  --citrate-green-tint:   #e8f3c6;
+  --citrate-yellow:       #ffbd10;
+  --citrate-yellow-deep:  #c89400;
+  --citrate-yellow-dark:  #6e5100;
+  --citrate-yellow-tint:  #fff1c4;
+
+  /* ---------- INK / STONE / PAPER ---------- */
+  --ink: #0e0f0c;  --ink-2: #1f221d;  --graphite: #3a3d36;
+  --stone-900: #2a2c27; --stone-700: #555851; --stone-500: #84867f;
+  --stone-400: #a5a79f; --stone-300: #c3c4be; --stone-200: #d9dad4;
+  --stone-150: #e3e2dc; --stone-100: #ecebe4; --stone-50: #f1efe8;
+  --paper: #f4f1ea; --paper-2: #faf8f3; --paper-pure: #ffffff;
+  --deep-evergreen: #0f2a1a; --deep-evergreen-2: #1a3b27;
+
+  /* ---------- SEMANTIC ---------- */
+  --semantic-success: #4f8a05;  --semantic-success-bg: #ecf5d4;
+  --semantic-warning: #b07b00;  --semantic-warning-bg: #fff1c4;
+  --semantic-danger:  #a72414;  --semantic-danger-bg:  #f6e1de;
+  --semantic-info:    #1b4965;  --semantic-info-bg:    #dbe7ef;
+
+  /* ---------- FG / BG / BORDER ---------- */
+  --fg-1: var(--ink); --fg-2: var(--stone-700); --fg-3: var(--stone-500);
+  --fg-on-dark: var(--paper); --fg-accent: var(--citrate-green-deep);
+  --bg-1: var(--paper); --bg-2: var(--paper-2); --bg-3: var(--paper-pure);
+  --bg-inverse: var(--ink); --bg-accent: var(--citrate-green);
+  --border-1: var(--stone-200); --border-2: var(--stone-300); --border-strong: var(--ink);
+
+  /* ---------- DARK CONSTELLATION CHROME (from memrizz.css / spec §1.1) ---------- */
+  --field:        #0a1810;                       /* dark evergreen space — canvas */
+  --field-warm:   #0f2a1a;
+  --panel:        rgba(9, 22, 14, 0.74);
+  --panel-2:      rgba(13, 30, 20, 0.92);
+  --nav-bg:       rgba(6, 15, 10, 0.92);
+  --ondark:       #eef0e6;                        /* primary text on dark */
+  --ondark-2:     #aab7a6;
+  --ondark-3:     #74866f;
+  --hair:         rgba(205, 231, 214, 0.12);
+  --hair-2:       rgba(205, 231, 214, 0.20);
+  --glass-blur:   blur(18px) saturate(1.1);
+
+  /* ---------- MATERIAL LANES (node color = kind) ---------- */
+  --mat-code:   #8ecc09;  --mat-docs:   #ffc83a;  --mat-specs:  #5fa8e6;
+  --mat-config: #34c7b0;  --mat-audit:  #f0743a;  --mat-claims: #b58cff;
+
+  /* ---------- TRUST RINGS ---------- */
+  --trust-derived:   #cfe9b0;  --trust-confirmed: #ffd24a;
+  --trust-asserted:  #9fc0e8;  --trust-proposed:  #b58cff;
+
+  /* ---------- TYPE (families resolved by next/font in layout.tsx) ---------- */
+  /* Space Grotesk = the Citrate brand display/title font (federation-wide). */
+  --font-display: var(--font-space-grotesk), var(--font-geist-sans), system-ui, sans-serif;
+  --font-sans:    var(--font-geist-sans), system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono:    var(--font-geist-mono), ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* type scale */
+  --t-3xs: 11px; --t-2xs: 12px; --t-xs: 13px; --t-sm: 14px; --t-md: 16px;
+  --t-lg: 18px; --t-xl: 22px; --t-2xl: 28px; --t-3xl: 36px; --t-4xl: 48px;
+  --t-5xl: 64px; --t-6xl: 84px; --t-7xl: 112px;
+  /* line height + tracking */
+  --lh-tight: 1.04; --lh-snug: 1.15; --lh-normal: 1.45; --lh-loose: 1.65;
+  --tr-display: -0.022em; --tr-tight: -0.011em; --tr-normal: 0;
+  --tr-eyebrow: 0.14em; --tr-caps: 0.06em;
+
+  /* ---------- SPACING (8pt grid) ---------- */
+  --s-0: 0; --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px;
+  --s-6: 24px; --s-7: 32px; --s-8: 40px; --s-9: 48px; --s-10: 64px;
+  --s-11: 80px; --s-12: 96px; --s-13: 128px; --s-14: 160px;
+
+  /* ---------- RADII ---------- */
+  --r-0: 0; --r-1: 6px; --r-2: 8px; --r-3: 12px; --r-pill: 999px;
+
+  /* ---------- ELEVATION ---------- */
+  --shadow-hairline: 0 0 0 1px var(--stone-200);
+  --shadow-1: 0 1px 0 0 rgba(14,15,12,.06), 0 0 0 1px var(--stone-200);
+  --shadow-2: 0 2px 0 0 rgba(14,15,12,.04), 0 0 0 1px var(--stone-200);
+  --shadow-lift: 0 12px 32px -16px rgba(14,15,12,.18), 0 0 0 1px var(--stone-200);
+  --shadow-focus: 0 0 0 3px rgba(142,204,9,.35);
+
+  /* ---------- MOTION ---------- */
+  --ease-standard: cubic-bezier(.2,.0,.0,1);
+  --ease-exit: cubic-bezier(.4,.0,1,1);
+  --ease-spring: cubic-bezier(.34,1.18,.4,1);
+  --dur-fast: 140ms; --dur-base: 220ms; --dur-slow: 420ms; --dur-narrative: 900ms;
+
+  /* ---------- LAYOUT ---------- */
+  --container: 1280px; --container-wide: 1440px; --gutter: var(--s-7);
+  --rule-thin: 1px; --rule-thick: 2px;
+
+  /* shell dimensions (UI_IMPLEMENTATION_SPEC §2) */
+  --navrail-w: 60px; --topbar-h: 56px; --leftrail-w: 268px;
+  --leftrail-w-collapsed: 52px; --rightdock-w: 392px; --minimap: 132px;
+}
+
+/* =============================================================
+   Semantic typography classes (ported verbatim)
+   ============================================================= */
+.t-eyebrow, .eyebrow {
+  font-family: var(--font-sans); font-size: var(--t-2xs); font-weight: 500;
+  letter-spacing: var(--tr-eyebrow); text-transform: uppercase; color: var(--fg-2);
+}
+.t-h3, h4 { font-family: var(--font-sans); font-weight: 600; font-size: var(--t-xl); line-height: var(--lh-snug); letter-spacing: var(--tr-tight); color: var(--fg-1); }
+.t-h4, h5 { font-family: var(--font-sans); font-weight: 600; font-size: var(--t-lg); line-height: var(--lh-snug); color: var(--fg-1); }
+.t-display, h1 { font-family: var(--font-display); font-weight: 380; font-size: var(--t-6xl); line-height: var(--lh-tight); letter-spacing: var(--tr-display); color: var(--fg-1); font-variation-settings: "opsz" 48; }
+.t-h1, h2 { font-family: var(--font-display); font-weight: 420; font-size: var(--t-4xl); line-height: var(--lh-snug); letter-spacing: var(--tr-tight); color: var(--fg-1); font-variation-settings: "opsz" 32; }
+.t-h2, h3 { font-family: var(--font-display); font-weight: 460; font-size: var(--t-3xl); line-height: var(--lh-snug); letter-spacing: var(--tr-tight); color: var(--fg-1); font-variation-settings: "opsz" 24; }
+.t-lede { font-family: var(--font-display); font-weight: 360; font-size: var(--t-xl); line-height: var(--lh-loose); color: var(--fg-2); font-variation-settings: "opsz" 24; }
+.t-body, p { font-family: var(--font-sans); font-weight: 400; font-size: var(--t-md); line-height: var(--lh-normal); color: var(--fg-1); }
+.t-body-sm, .small { font-family: var(--font-sans); font-weight: 400; font-size: var(--t-sm); line-height: var(--lh-normal); color: var(--fg-2); }
+.t-caption, .caption { font-family: var(--font-sans); font-weight: 400; font-size: var(--t-2xs); line-height: var(--lh-normal); color: var(--fg-3); }
+.t-mono, code, kbd, samp, pre { font-family: var(--font-mono); font-weight: 400; font-size: 0.92em; color: var(--fg-1); }
+.t-compliance { font-family: var(--font-mono); font-size: var(--t-2xs); font-weight: 500; letter-spacing: var(--tr-caps); text-transform: uppercase; color: var(--fg-2); }
+
+/* =============================================================
+   Base — the app is a fixed, dark, scrollless command deck
+   ============================================================= */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  font-family: var(--font-sans);
+  background: var(--field);
+  color: var(--ondark);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden; /* 100vh command deck, no page scroll */
+}
+::selection { background: var(--citrate-yellow); color: var(--ink); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}

@@ -15,6 +15,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
+# WP-5.3 chain-anchor checkpoint binding (feature-gated so the default build
+# stays network-free). ureq is already a transitive workspace dependency.
+ureq = { version = "2", features = ["json"], optional = true }
 
 [dev-dependencies]
 ed25519-dalek = "2"
@@ -22,7 +25,17 @@ ed25519-dalek = "2"
 [features]
 default = []
 rocksdb = ["mem-store/rocksdb"]
+# Bind a tenant merkle root to a live citrate-chain block (read-only JSON-RPC;
+# no signing, no money). The durable on-chain *write* is a separate operator step.
+chain = ["dep:ureq"]
+# WP-5.4 minimal HTTP bundle transport (push/pull) so federation sync needs no
+# operator file-moves. Server is std-net only; client is ureq. Gossip is deferred.
+http = ["dep:ureq"]
 
 [[example]]
 name = "sync"
 required-features = ["rocksdb"]
+
+[[example]]
+name = "chain_anchor"
+required-features = ["rocksdb", "chain"]

@@ -1,0 +1,49 @@
+name: webapp-ci
+
+# Memrizz webapp gates (planset §3.B.7): hermetic typecheck → lint → test →
+# build, plus the test-count ratchet (Rule 3 — never decreases). Scoped to
+# webapp/** so Rust-only changes don't trigger it (the Rust workspace has its own
+# ci.yml). Federation-wide gitleaks runs from the repo-root secret-scan.yml.
+
+on:
+  push:
+    branches: [main]
+    paths: ['citrate-memories/webapp/**', '.github/workflows/webapp-ci.yml']
+  pull_request:
+    paths: ['citrate-memories/webapp/**']
+
+defaults:
+  run:
+    working-directory: citrate-memories/webapp
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: citrate-memories/webapp/pnpm-lock.yaml
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Test
+        run: pnpm test
+      - name: Build
+        run: pnpm build
+      - name: Test-count ratchet (Rule 3 — never decreases)
+        run: |
+          baseline=$(node -e "process.stdout.write(String(require('./.agentile/coverage/baseline.json').tests.count))")
+          actual=$(pnpm vitest run --reporter=json 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>process.stdout.write(String(JSON.parse(d).numTotalTests)))")
+          echo "baseline=$baseline actual=$actual"
+          if [ "$actual" -lt "$baseline" ]; then
+            echo "::error::test count $actual is below baseline $baseline (Rule 3 ratchet)"; exit 1
+          fi

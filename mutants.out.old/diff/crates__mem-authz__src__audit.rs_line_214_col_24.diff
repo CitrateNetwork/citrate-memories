@@ -1,0 +1,21 @@
+--- crates/mem-authz/src/audit.rs
++++ replace != with == in AuditChain::open
+@@ -206,17 +206,17 @@
+         }
+         if log_len > head.len + 1 {
+             return Err(AuditError::Corrupt(format!(
+                 "log holds {log_len} records but head commits to {} — more than one in-flight append",
+                 head.len
+             )));
+         }
+         let prefix_hash = if head.len == 0 { [0u8; 32] } else { hash_after[head.len as usize - 1] };
+-        if prefix_hash != head_hash {
++        if prefix_hash == /* ~ changed by cargo-mutants ~ */ head_hash {
+             return Err(AuditError::Corrupt(format!(
+                 "head hash does not match the log at length {}",
+                 head.len
+             )));
+         }
+ 
+         // Repair the head after an accepted crash window.
+         if head.len != log_len {

@@ -1792,6 +1792,8 @@ dependencies = [
 name = "mem-query"
 version = "0.0.1"
 dependencies = [
+ "ed25519-dalek",
+ "mem-assert",
  "mem-core",
  "mem-index",
  "mem-ingest",
@@ -1825,6 +1827,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "ureq",
 ]
 
 [[package]]

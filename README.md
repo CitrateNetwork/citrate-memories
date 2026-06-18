@@ -17,6 +17,12 @@ The complete design lives in [`PLANSET/`](PLANSET/):
 - [`03_TLA_SPECS.md`](PLANSET/03_TLA_SPECS.md) — formal invariants
 - [`04_FEATURES_BDD.md`](PLANSET/04_FEATURES_BDD.md) — Gherkin features
 - [`05_SPRINTS_AND_WPS.md`](PLANSET/05_SPRINTS_AND_WPS.md) — sprints & work packages
+- [`06_WEBAPP_FRONTEND_SPEC.md`](PLANSET/06_WEBAPP_FRONTEND_SPEC.md) — the front-end brief (capability→UI, auth/RBAC, viz semantics)
+- [`07_IMPLEMENTATION_AND_HARDENING_PLAN.md`](PLANSET/07_IMPLEMENTATION_AND_HARDENING_PLAN.md) — **the webapp build plan**: 1:1 design pin, connection hardening, quantum-safe crypto roadmap, test strategy, WPs
+
+## Webapp (Memrizz)
+The on-brand design landed; see [`webapp/`](webapp/) — the design prototype
+(1:1 source of truth) plus the Next.js 16 foundation. Built per `PLANSET/07`.
 
 ## The core invariant
 > **Derived = deterministic & rebuildable. Asserted = nondeterministic but signed &

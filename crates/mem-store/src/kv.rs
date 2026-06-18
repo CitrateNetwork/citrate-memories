@@ -45,6 +45,14 @@ pub trait KvStore: Send + Sync {
         }
         Ok(())
     }
+
+    /// Create a consistent point-in-time snapshot of the whole store at `dest`
+    /// (a fresh, independently-openable copy). Backends that support it (RocksDB)
+    /// produce a recovery point cheaply; the default is `Unsupported` so the
+    /// in-memory backend doesn't pretend to be durable. `dest` must not exist.
+    fn kv_checkpoint(&self, _dest: &std::path::Path) -> Result<(), String> {
+        Err("checkpoint not supported by this backend".to_string())
+    }
 }
 
 /// A real, fully-functional in-memory backend (not a mock — Rule 1). Used as the

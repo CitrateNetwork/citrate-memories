@@ -1,0 +1,21 @@
+--- crates/mem-authz/src/audit.rs
++++ replace += with -= in AuditChain::append
+@@ -262,17 +262,17 @@
+             let mut line = serde_json::to_vec(&record)
+                 .map_err(|e| AuditError::Corrupt(format!("record serialize: {e}")))?;
+             line.push(b'\n');
+             sink.log.write_all(&line)?;
+             sink.log.sync_data()?;
+             write_head(&sink.head_path, record.sequence + 1, &hash)?;
+         }
+         self.last_hash = hash;
+-        self.next_seq += 1;
++        self.next_seq -= /* ~ changed by cargo-mutants ~ */ 1;
+         self.records.push(record);
+         Ok(self.records.last().expect("just pushed"))
+     }
+ 
+     pub fn len(&self) -> usize {
+         self.records.len()
+     }
+ 

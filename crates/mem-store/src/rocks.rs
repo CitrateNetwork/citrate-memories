@@ -34,6 +34,19 @@ impl RocksKv {
             .cf_handle(cf)
             .ok_or_else(|| format!("unknown column family: {cf}"))
     }
+
+    /// Rebuild a damaged RocksDB's MANIFEST/catalog from the SST files actually
+    /// present on disk (e.g. after a daemon was killed mid-compaction and left a
+    /// stale MANIFEST referencing a since-deleted SST). This operates at the
+    /// RocksDB layer only — the app-level XChaCha20 envelopes are opaque value
+    /// bytes to RocksDB, so repair never needs (and never sees) the tenant keys.
+    /// Any range that existed *only* in a genuinely-missing SST cannot be
+    /// recovered; ranges that were compacted into surviving SSTs are preserved.
+    /// Always back up the directory before calling this.
+    pub fn repair<P: AsRef<std::path::Path>>(path: P) -> Result<(), String> {
+        let opts = Options::default();
+        DB::repair(&opts, path).map_err(|e| e.to_string())
+    }
 }
 
 impl KvStore for RocksKv {
@@ -54,6 +67,17 @@ impl KvStore for RocksKv {
 
     fn kv_exists(&self, cf: &str, key: &[u8]) -> Result<bool, String> {
         Ok(self.kv_get(cf, key)?.is_some())
+    }
+
+    fn kv_checkpoint(&self, dest: &std::path::Path) -> Result<(), String> {
+        // RocksDB checkpoints hard-link the live SSTs into `dest`, so they are
+        // cheap + consistent and — crucially — pin the data even if a later
+        // compaction deletes the original SST (the hard link keeps it alive).
+        // The result is a complete, independently-openable store; because the
+        // XChaCha20 envelopes are value bytes, the snapshot carries the sealed
+        // data + the keyring CF verbatim (no tenant key needed to checkpoint).
+        let cp = rocksdb::checkpoint::Checkpoint::new(&self.db).map_err(|e| e.to_string())?;
+        cp.create_checkpoint(dest).map_err(|e| e.to_string())
     }
 
     fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
@@ -125,5 +149,44 @@ mod tests {
             assert_eq!(kv.kv_get("cf", b"durable").expect("get"), Some(b"yes".to_vec()));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- MEM-S6 WP-6.5 daemon durability: checkpoints are recovery points ---
+
+    #[test]
+    fn checkpoint_is_an_independently_openable_copy() {
+        let src = temp_dir("ckpt-src");
+        let dest = temp_dir("ckpt-dest");
+        {
+            let kv = RocksKv::open(&src, &["cf"]).expect("open src");
+            kv.kv_put("cf", b"k1", b"v1").expect("put");
+            kv.kv_put("cf", b"k2", b"v2").expect("put");
+            // dest must NOT exist before create_checkpoint.
+            kv.kv_checkpoint(&dest).expect("checkpoint");
+        }
+        // The checkpoint opens on its own and carries the data.
+        let restored = RocksKv::open(&dest, &["cf"]).expect("open checkpoint");
+        assert_eq!(restored.kv_get("cf", b"k1").expect("get"), Some(b"v1".to_vec()));
+        assert_eq!(restored.kv_get("cf", b"k2").expect("get"), Some(b"v2".to_vec()));
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn checkpoint_survives_source_deletion() {
+        // The whole point: a recovery point must outlive the original. After
+        // checkpointing, blow away the source dir entirely and confirm the
+        // checkpoint still opens with the data (hard-linked SSTs keep it alive).
+        let src = temp_dir("ckpt-outlive-src");
+        let dest = temp_dir("ckpt-outlive-dest");
+        {
+            let kv = RocksKv::open(&src, &["cf"]).expect("open src");
+            kv.kv_put("cf", b"survivor", b"present").expect("put");
+            kv.kv_checkpoint(&dest).expect("checkpoint");
+        }
+        std::fs::remove_dir_all(&src).expect("nuke the source");
+        let restored = RocksKv::open(&dest, &["cf"]).expect("checkpoint still opens after source is gone");
+        assert_eq!(restored.kv_get("cf", b"survivor").expect("get"), Some(b"present".to_vec()));
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

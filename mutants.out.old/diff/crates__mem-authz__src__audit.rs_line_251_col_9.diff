@@ -1,0 +1,42 @@
+--- crates/mem-authz/src/audit.rs
++++ replace AuditChain::append -> Result<&AuditRecord, AuditError> with Ok(Box::leak(Box::new(Default::default())))
+@@ -243,38 +243,17 @@
+     pub fn append(
+         &mut self,
+         event: MemoryEvent,
+         actor: impl Into<String>,
+         resource_id: impl Into<String>,
+         detail: impl Into<String>,
+         now_ms: u64,
+     ) -> Result<&AuditRecord, AuditError> {
+-        let record = AuditRecord {
+-            sequence: self.next_seq,
+-            timestamp_ms: now_ms,
+-            prev_hash: self.last_hash,
+-            event,
+-            actor: actor.into(),
+-            resource_id: resource_id.into(),
+-            detail: detail.into(),
+-        };
+-        let hash = record_hash(&record);
+-        if let Some(sink) = &mut self.sink {
+-            let mut line = serde_json::to_vec(&record)
+-                .map_err(|e| AuditError::Corrupt(format!("record serialize: {e}")))?;
+-            line.push(b'\n');
+-            sink.log.write_all(&line)?;
+-            sink.log.sync_data()?;
+-            write_head(&sink.head_path, record.sequence + 1, &hash)?;
+-        }
+-        self.last_hash = hash;
+-        self.next_seq += 1;
+-        self.records.push(record);
+-        Ok(self.records.last().expect("just pushed"))
++        Ok(Box::leak(Box::new(Default::default()))) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     pub fn len(&self) -> usize {
+         self.records.len()
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+         self.records.is_empty()

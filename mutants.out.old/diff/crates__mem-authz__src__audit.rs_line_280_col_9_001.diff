@@ -1,0 +1,21 @@
+--- crates/mem-authz/src/audit.rs
++++ replace AuditChain::is_empty -> bool with false
+@@ -272,17 +272,17 @@
+         Ok(self.records.last().expect("just pushed"))
+     }
+ 
+     pub fn len(&self) -> usize {
+         self.records.len()
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+-        self.records.is_empty()
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     pub fn records(&self) -> &[AuditRecord] {
+         &self.records
+     }
+ 
+     /// Re-walk the chain; returns the count or the sequence where linkage breaks.
+     pub fn verify_integrity(&self) -> Result<u64, String> {

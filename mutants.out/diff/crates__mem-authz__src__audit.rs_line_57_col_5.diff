@@ -1,0 +1,23 @@
+--- crates/mem-authz/src/audit.rs
++++ replace feed with ()
+@@ -49,19 +49,17 @@
+     Corrupt(String),
+     /// The head sidecar commits to more records than the log holds — the log
+     /// was truncated (or rolled back) behind the chain head.
+     #[error("audit log truncated: head commits to {head} records but log holds {log}")]
+     Truncated { head: u64, log: u64 },
+ }
+ 
+ fn feed(h: &mut blake3::Hasher, tag: u8, bytes: &[u8]) {
+-    h.update(&[tag]);
+-    h.update(&(bytes.len() as u64).to_le_bytes());
+-    h.update(bytes);
++    () /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// blake3 over the record's fields including `sequence` and `prev_hash`, so the
+ /// chain linkage is part of each hash.
+ pub fn record_hash(r: &AuditRecord) -> [u8; 32] {
+     let mut h = blake3::Hasher::new();
+     feed(&mut h, 0, b"mem-authz:audit:v1");
+     feed(&mut h, 1, &r.sequence.to_le_bytes());

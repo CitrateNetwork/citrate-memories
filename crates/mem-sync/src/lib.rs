@@ -50,6 +50,11 @@ pub enum SyncError {
     Store(#[from] StoreError),
     #[error("serialization error: {0}")]
     Serde(String),
+    /// WP-5.3: a chain-anchor checkpoint binding failed (RPC unreachable,
+    /// malformed response, or wrong chain). Fail closed — never record an
+    /// unverified checkpoint.
+    #[error("chain anchor error: {0}")]
+    Chain(String),
 }
 
 /// A tenant replica's exported state: the unit of federation transfer. Plain
@@ -368,6 +373,12 @@ pub fn verify_anchor(
     };
     Ok(Some(tenant_root(store, repo)?.to_hex() == record.root))
 }
+
+#[cfg(feature = "chain")]
+pub mod chain;
+
+#[cfg(feature = "http")]
+pub mod transport;
 
 #[cfg(test)]
 mod tests;
