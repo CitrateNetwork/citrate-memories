@@ -1,6 +1,6 @@
 # mem-gateway
 
-The Mnemosyne backend seam — turns the headless citrate-memories engine into a
+The Memrizz backend seam — turns the headless citrate-memories engine into a
 multi-Org SaaS surface. Spec: `../../PLANSET/06_WEBAPP_FRONTEND_SPEC.md`.
 
 ## Status: M0 core landed (security-critical foundation)

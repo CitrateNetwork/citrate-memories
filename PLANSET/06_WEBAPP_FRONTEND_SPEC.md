@@ -7,9 +7,9 @@ sprint: MEM-S6 (WP-6.3 packaging + new front-end track)
 purpose: Designer-ready front-end spec for the citrate-memories webapp — decomposes every capability into UI, defines auth/RBAC, and specs the 3D graph visualization. Hand to the Claude design team to produce an HTML prototype; implementation (pixel-perfect, Next.js) follows their on-brand work.
 ---
 
-# Mnemosyne — citrate-memories Webapp Front-End Spec
+# Memrizz — citrate-memories Webapp Front-End Spec
 
-> **Working codename: "Mnemosyne"** (the constellation of org memory). Final name
+> **Working codename: "Memrizz"** (the constellation of org memory). Final name
 > is the team's call — alongside the federation's `CitrateScan` (explorer), this is
 > the **memory** surface. Treat the name as a token to replace.
 
@@ -30,7 +30,7 @@ citrate-memories is "git for agents" — a content-addressed knowledge **DAG** t
 holds the entire story and code-shape of a 34-repo software federation (today:
 **9,567 nodes / 6,079 edges**), so any agent or human can get the context of any
 part of the org in seconds without reading the code. It already works headlessly
-over MCP. **Mnemosyne is the human face of it**: a Next.js webapp where a
+over MCP. **Memrizz is the human face of it**: a Next.js webapp where a
 non-technical teammate logs in with their Citrate identity, *sees* the org's memory
 as a living 3D constellation, asks it questions in plain language with the model of
 their choice, watches the answer's sources light up, and — where a human's judgment
@@ -94,7 +94,7 @@ and never lying about what it knows or how sure it is.
 >   existing `tenant`/`repo:<name>/memory` concept). An Org *contains many
 >   repo-tenants.*
 
-Mnemosyne is **multi-tenant SaaS**: one platform deployment serves many Orgs, each
+Memrizz is **multi-tenant SaaS**: one platform deployment serves many Orgs, each
 fully isolated. The isolation model:
 
 - **One isolated memory store per Org.** Each Org gets its own encrypted RocksDB
@@ -139,7 +139,7 @@ structured):
 
 ```
                 ┌─────────────────────────────────────────────┐
-  Browser  ───► │  Next.js app (Mnemosyne)                     │
+  Browser  ───► │  Next.js app (Memrizz)                     │
   (RP)          │  • UI: 3D constellation, chat, HITL, admin   │
                 │  • Server actions / route handlers (BFF)     │
                 │  • OIDC RP (citrate-identity, PKCE)          │
@@ -203,7 +203,7 @@ be exported or forgotten as a unit.
 
 ### 3.1 Authentication — citrate-identity OIDC (same seam as explorer/dashboard)
 
-Mnemosyne is a **generic OIDC Relying Party** behind one seam (matching the
+Memrizz is a **generic OIDC Relying Party** behind one seam (matching the
 `citrate-explorer-auth-seam` pattern): **Authorization Code + PKCE**, public client,
 issuer `auth.citrate.ai`. Claims consumed: `sub` (stable principal), `wallet_address`
 (the user's counterfactual smart-wallet or EOA), `signing_method`. **Fail closed:**
@@ -211,13 +211,13 @@ if `OIDC_ISSUER`/`OIDC_AUDIENCE` are unset, reject all tokens (the SECREM-02 1.4
 — never pass `undefined` to verify). Login screen = "Sign in with Citrate."
 
 **Org resolution (multi-tenant).** The OIDC `sub` is a *global* principal; **Org
-membership is Mnemosyne's own mapping** (`sub` → one-or-more Orgs + role), held in the
+membership is Memrizz's own mapping** (`sub` → one-or-more Orgs + role), held in the
 gateway's control-plane store, established at invite/provision time. On login the
 gateway resolves the user's Org(s); if they belong to several, the Org switcher picks
 the active one and every request carries the active Org, re-verified server-side. A
 `sub` with no Org membership lands on a "request access / create an Org" screen, never
 on someone else's data. (citrate-identity stays a pure identity issuer; it does not
-need to know about Orgs — the SaaS boundary lives in Mnemosyne.)
+need to know about Orgs — the SaaS boundary lives in Memrizz.)
 
 ### 3.2 Authorization — the webapp's RBAC **is** the `CapabilityGrant` model
 
@@ -255,7 +255,7 @@ onboards a member, the new grant's `delegation_chain` records the admin as
 `delegator`. Attenuation is enforced: **a child's `allowed_resources` must be a
 subset of the parent's** (you cannot grant what you don't hold). **Revocation
 cascades down the tree** (revoking a parent invalidates descendants) — this is the
-F-7 "delegation-revocation cascade" the engine deferred to v2; **Mnemosyne is the
+F-7 "delegation-revocation cascade" the engine deferred to v2; **Memrizz is the
 trigger to build it**, together with F-5 (binding the grant's principal to the real
 OIDC `sub`/wallet instead of a bare pubkey). Flag both as backend prerequisites.
 
@@ -452,7 +452,7 @@ Engine: per-tenant crypto-shred (destroy the key → the data is unreadable fore
 
 ## 5. The 3D Data-Visualization Spec (the centerpiece — make it out of this world)
 
-> Goal: the moment someone opens Mnemosyne, they *get it* and want to fly around. It
+> Goal: the moment someone opens Memrizz, they *get it* and want to fly around. It
 > must be beautiful, **fast on a laptop**, and — critically — **honest** (the visuals
 > encode real trust/plane/status, never decoration for its own sake).
 
@@ -699,7 +699,7 @@ unambiguous on screen.
 
 ## 11. Security model for the webapp/dapp (it's on Citrate — treat it like a target)
 
-Mnemosyne is a privileged window onto the org's entire memory; it must meet the same
+Memrizz is a privileged window onto the org's entire memory; it must meet the same
 bar SECREM-02 set for the federation. The designer needs to know these because they
 shape flows:
 
@@ -753,7 +753,7 @@ HTML prototype. The `⟦DECIDE⟧` items are flagged for Saul.
    deltas, the server-side UMAP/PCA layout endpoint, and (M1) the MCP-over-HTTP BYOM
    endpoint + the signing path for assert/confirm.
 2. **Build F-5 + F-7** (identity-bound principals + delegation-revocation cascade) —
-   the backend prerequisites the RBAC needs; Mnemosyne is their trigger.
+   the backend prerequisites the RBAC needs; Memrizz is their trigger.
 3. **Wire the prototype** pixel-perfect + responsive against the gateway once the
    on-brand HTML lands.
 4. **Rule-8 review + fold into the Tier-1 audit** before any non-local exposure.

@@ -110,6 +110,38 @@ impl ControlPlane {
         serde_json::from_str(s).map_err(|e| e.to_string())
     }
 
+    /// G-3 — durable load. Read the control plane from `path`, or return a fresh
+    /// empty one if the file does not exist yet (first boot). Any other IO/parse
+    /// error is surfaced so a corrupt control plane fails LOUD rather than silently
+    /// resetting Org membership.
+    pub fn load_or_default(path: &std::path::Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => Self::from_json(&s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("read control plane {}: {e}", path.display())),
+        }
+    }
+
+    /// G-3 — durable, **atomic** save. Serialize, write to a temp sibling, fsync,
+    /// then rename over the target (a crash mid-write leaves the previous good file
+    /// intact — never a half-written control plane). Creates the parent dir if
+    /// needed.
+    pub fn save_atomic(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        let json = self.to_json()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+            f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+            f.sync_all().map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+        Ok(())
+    }
+
     pub fn upsert_org(&mut self, org: Org) {
         if let Some(existing) = self.orgs.iter_mut().find(|o| o.id == org.id) {
             *existing = org;
@@ -140,6 +172,11 @@ impl ControlPlane {
     /// scope check or store access.
     pub fn membership(&self, sub: &str, org: &OrgId) -> Option<&Membership> {
         self.memberships.iter().find(|m| m.sub == sub && &m.org == org)
+    }
+
+    /// All memberships in an Org (the roster + delegation tree). Org-scoped read.
+    pub fn members_of(&self, org: &OrgId) -> Vec<&Membership> {
+        self.memberships.iter().filter(|m| &m.org == org).collect()
     }
 
     /// All direct children of a member in an Org's delegation tree (by parent `sub`).
@@ -208,6 +245,31 @@ mod tests {
         assert!(cp.membership("alice", &OrgId::new("globex")).is_none());
         // A stranger is in no org.
         assert!(cp.membership("mallory", &OrgId::new("acme")).is_none());
+    }
+
+    #[test]
+    fn control_plane_persists_durably_and_atomically() {
+        // G-3: a saved control plane survives a reload (process restart proxy).
+        let dir = std::env::temp_dir().join(format!("mnemo-cp-{}", std::process::id()));
+        let path = dir.join("control.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Absent file → fresh empty plane (first boot).
+        assert!(ControlPlane::load_or_default(&path).unwrap().orgs().is_empty());
+
+        let mut cp = ControlPlane::new();
+        cp.upsert_org(org("acme"));
+        cp.upsert_membership(member("alice", "acme", Role::OrgOwner, vec![], None));
+        cp.save_atomic(&path).unwrap();
+
+        // Reload reconstructs orgs + memberships exactly.
+        let loaded = ControlPlane::load_or_default(&path).unwrap();
+        assert_eq!(loaded.org(&OrgId::new("acme")).unwrap().name, "acme");
+        assert!(loaded.membership("alice", &OrgId::new("acme")).is_some());
+
+        // The temp sidecar must not linger after a successful atomic rename.
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

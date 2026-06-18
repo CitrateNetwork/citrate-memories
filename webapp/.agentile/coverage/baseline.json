@@ -1,0 +1,21 @@
+{
+  "_comment": "Four-ratchet baseline for the Memrizz webapp (planset §5.1). These counts NEVER decrease — a drop is a BLOCKER. Seeded at WP-7.1 (auth seam + CSP + proxy); raised at WP-7.3 (shell chrome + design token-parity) and WP-7.2 (BFF↔gateway wiring).",
+  "tests": {
+    "command": "pnpm vitest run --reporter=json | jq '.numTotalTests'",
+    "count": 74,
+    "seeded": "2026-06-14",
+    "note": "auth seam + CSP + token-parity + gateway client/BFF + streaming chat/LLM + audit + BYOM token + ops/checkpoints + rate limiter + constellation engine math + DB conversation persistence (owner-scoped, fail-closed)"
+  },
+  "specs": {
+    "command": "ls ../specs/*.tla | wc -l",
+    "count": 3,
+    "note": "Authz.tla, Ingestion.tla, SupersededDag.tla in citrate-memories/specs; new write/authz obligations added per planset §5.4"
+  },
+  "tripwires": {
+    "count": 2,
+    "note": "token-storage.guard.test.ts (no OIDC tokens in web storage), csp.guard.test.ts (script-src lockdown). Semgrep tripwires from scripts/semgrep/* wired in the CI WP."
+  },
+  "frontmatter": {
+    "note": "Rule-12 frontmatter coverage on docs under webapp/ and PLANSET/."
+  }
+}

@@ -41,6 +41,10 @@ pub enum AssertError {
 
 /// A signing identity for assertions. The author is the hex of the ed25519
 /// verifying key, which is also the node's `author` field (identity-bearing).
+///
+/// `Clone` so a shared identity (e.g. the gateway's `Arc<Asserter>`) can be handed
+/// by value to a per-request MCP session (`MemoryMcpServer::new_with_asserter`).
+#[derive(Clone)]
 pub struct Asserter {
     pubkey_hex: String,
     sk: SigningKey,

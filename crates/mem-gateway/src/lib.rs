@@ -1,4 +1,4 @@
-//! `mem-gateway` — the Mnemosyne backend seam.
+//! `mem-gateway` — the Memrizz backend seam.
 //!
 //! Turns the headless citrate-memories engine into a multi-Org SaaS surface. This
 //! crate's M0 core is the **security-critical** part: Org isolation, the
@@ -16,6 +16,7 @@
 
 pub mod authz;
 pub mod layout;
+pub mod oidc;
 pub mod org;
 pub mod registry;
 

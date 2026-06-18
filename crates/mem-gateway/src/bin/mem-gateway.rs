@@ -1,4 +1,4 @@
-//! The Mnemosyne gateway server (feature `server,rocksdb`).
+//! The Memrizz gateway server (feature `server,rocksdb`).
 //!
 //! M0 dev runner: serves the HTTP read API + 3D-layout endpoint over one or more
 //! Org stores. For local/prototype use it registers a single dev Org pointing at a
@@ -73,9 +73,20 @@ async fn main() {
     };
     let embedder = load_embedder(&engine);
 
-    // Control plane: the dev Org + a dev Org-Owner membership (only meaningful with
-    // dev-auth; in prod, memberships come from provisioning/invites).
-    let mut control = ControlPlane::new();
+    // Control plane (gap G-3): durable. Load the Org/membership graph from disk so
+    // it survives restarts; ensure this Org is present, add the dev Org-Owner when
+    // dev-auth is on, and persist atomically. Production memberships come from
+    // provisioning/invites (which re-save through the same path).
+    let control_path = std::path::PathBuf::from(
+        std::env::var("MEM_GATEWAY_CONTROL_PATH").unwrap_or_else(|_| "data/control.json".to_string()),
+    );
+    let mut control = match ControlPlane::load_or_default(&control_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("mem-gateway: FATAL — control plane unreadable at {} ({e}); refusing to start.", control_path.display());
+            std::process::exit(1);
+        }
+    };
     control.upsert_org(org);
     if allow_dev_auth {
         control.upsert_membership(Membership {
@@ -87,10 +98,15 @@ async fn main() {
         });
         eprintln!("mem-gateway: DEV-AUTH ON — 'dev' is Org Owner of '{org_id}'. Do NOT use in production.");
     } else {
-        eprintln!("mem-gateway: dev-auth OFF — all requests fail closed until OIDC is wired (M1).");
+        eprintln!("mem-gateway: dev-auth OFF — requests need a verified OIDC bearer (G-2).");
+    }
+    if let Err(e) = control.save_atomic(&control_path) {
+        eprintln!("mem-gateway: WARN — could not persist control plane: {e}");
+    } else {
+        eprintln!("mem-gateway: control plane persisted at {} ({} orgs).", control_path.display(), control.orgs().len());
     }
 
-    let state = AppState::new(
+    let mut state = AppState::new(
         Arc::new(RwLock::new(control)),
         engines,
         Arc::new(SigningKey::from_bytes(&[42u8; 32])),
@@ -98,6 +114,55 @@ async fn main() {
         3_600_000,
         embedder,
     );
+
+    // Real OIDC bearer verification (gap G-2). Enabled when issuer + audience +
+    // a JWKS source are all configured. The JWKS is provided as config (a file or
+    // inline JSON) to avoid a startup network fetch; rotate it by redeploying the
+    // secret. When set, OIDC takes precedence and dev-auth is ignored.
+    if let (Ok(issuer), Ok(audience)) = (std::env::var("OIDC_ISSUER"), std::env::var("OIDC_AUDIENCE")) {
+        let jwks = std::env::var("OIDC_JWKS_JSON").ok().or_else(|| {
+            std::env::var("OIDC_JWKS_FILE").ok().and_then(|p| std::fs::read_to_string(p).ok())
+        });
+        match jwks.as_deref().map(|j| mem_gateway::oidc::OidcVerifier::from_jwks_json(&issuer, &audience, j)) {
+            Some(Ok(v)) => {
+                state = state.with_oidc(Arc::new(v));
+                eprintln!("mem-gateway: OIDC ON — issuer={issuer} audience={audience} (dev-auth ignored).");
+            }
+            Some(Err(e)) => {
+                eprintln!("mem-gateway: FATAL — OIDC configured but JWKS is invalid ({e}); refusing to start fail-open.");
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("mem-gateway: FATAL — OIDC_ISSUER/AUDIENCE set but no OIDC_JWKS_JSON/OIDC_JWKS_FILE; refusing to start.");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Write path (gap G-1): a signing identity for assert/propose, plus the
+    // tamper-evident mutation audit chain. The asserter key is derived from
+    // MEM_GATEWAY_ASSERTER_SEED (any string → blake3 → 32-byte ed25519 seed); a
+    // dev default is used when unset. Without these, write routes 503 / proceed
+    // unaudited respectively.
+    let asserter_seed = std::env::var("MEM_GATEWAY_ASSERTER_SEED")
+        .unwrap_or_else(|_| "mem-gateway-dev-asserter".to_string());
+    let asserter = mem_assert::Asserter::new(SigningKey::from_bytes(blake3::hash(asserter_seed.as_bytes()).as_bytes()));
+    state = state.with_asserter(Arc::new(asserter));
+
+    let audit_path = std::env::var("MEM_GATEWAY_AUDIT_PATH")
+        .unwrap_or_else(|_| "data/gateway-audit.jsonl".to_string());
+    match mem_authz::AuditChain::open(&audit_path) {
+        Ok(chain) => {
+            state = state.with_audit(Arc::new(std::sync::Mutex::new(chain)));
+            eprintln!("mem-gateway: write audit chain at {audit_path} (mutations + denials recorded).");
+        }
+        Err(e) => {
+            eprintln!("mem-gateway: WARN — audit chain unavailable ({e}); writes proceed UNAUDITED.");
+        }
+    }
+
+    // Persist provisioning mutations (gap G-4) through the durable control plane.
+    state = state.with_control_path(std::sync::Arc::new(control_path.clone()));
 
     // Warm the 3D-layout cache before serving (dev-auth only — we have a known
     // subject to build it for). The expensive PCA runs once here at boot, so the

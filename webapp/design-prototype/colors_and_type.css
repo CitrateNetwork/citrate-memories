@@ -1,0 +1,343 @@
+/* =============================================================
+   Citrate Network — Foundations
+   Colors, type, spacing, radii, shadows, motion
+   ============================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,300..900;1,8..60,300..900&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* ---------- BRAND ---------- */
+  --citrate-green:        #8ecc09;   /* primary accent — citric, alive */
+  --citrate-green-deep:   #5a8205;   /* hover, AA text on cream */
+  --citrate-green-dark:   #2f4502;   /* pressed, accent text on white */
+  --citrate-green-tint:   #e8f3c6;   /* surface wash */
+
+  --citrate-yellow:       #ffbd10;   /* secondary accent — sun, evidence */
+  --citrate-yellow-deep:  #c89400;
+  --citrate-yellow-dark:  #6e5100;
+  --citrate-yellow-tint:  #fff1c4;
+
+  /* ---------- INK (warm near-blacks) ---------- */
+  --ink:                  #0e0f0c;   /* primary text, marks */
+  --ink-2:                #1f221d;
+  --graphite:             #3a3d36;
+
+  /* ---------- STONE (warm neutrals) ---------- */
+  --stone-900:            #2a2c27;
+  --stone-700:            #555851;
+  --stone-500:            #84867f;   /* tertiary text */
+  --stone-400:            #a5a79f;
+  --stone-300:            #c3c4be;
+  --stone-200:            #d9dad4;   /* hairlines */
+  --stone-150:            #e3e2dc;
+  --stone-100:            #ecebe4;   /* card divider */
+  --stone-50:             #f1efe8;
+
+  /* ---------- PAPER (warm surfaces) ---------- */
+  --paper:                #f4f1ea;   /* page background — document feel */
+  --paper-2:              #faf8f3;   /* raised card */
+  --paper-pure:           #ffffff;   /* high-contrast surfaces */
+
+  /* ---------- DEPTH (used only on near-white) ---------- */
+  --deep-evergreen:       #0f2a1a;   /* trust anchor; data viz */
+  --deep-evergreen-2:     #1a3b27;
+
+  /* ---------- SEMANTIC ---------- */
+  --semantic-success:     #4f8a05;   /* darker than brand green for legibility */
+  --semantic-success-bg:  #ecf5d4;
+  --semantic-warning:     #b07b00;
+  --semantic-warning-bg:  #fff1c4;
+  --semantic-danger:      #a72414;
+  --semantic-danger-bg:   #f6e1de;
+  --semantic-info:        #1b4965;
+  --semantic-info-bg:     #dbe7ef;
+
+  /* ---------- FOREGROUND / BACKGROUND TOKENS ---------- */
+  --fg-1:                 var(--ink);          /* primary text */
+  --fg-2:                 var(--stone-700);    /* secondary text */
+  --fg-3:                 var(--stone-500);    /* tertiary, captions */
+  --fg-on-dark:           var(--paper);
+  --fg-accent:            var(--citrate-green-deep);
+
+  --bg-1:                 var(--paper);        /* page */
+  --bg-2:                 var(--paper-2);      /* card */
+  --bg-3:                 var(--paper-pure);   /* raised card */
+  --bg-inverse:           var(--ink);
+  --bg-accent:            var(--citrate-green);
+
+  --border-1:             var(--stone-200);    /* hairlines, table cells */
+  --border-2:             var(--stone-300);    /* form fields, dividers */
+  --border-strong:        var(--ink);          /* government-document rules */
+
+  /* ---------- TYPE FAMILIES ---------- */
+  --font-display: "Source Serif 4", "Source Serif Pro", "Iowan Old Style", Georgia, serif;
+  --font-sans:    "Geist", "Söhne", "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono:    "Geist Mono", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* ---------- TYPE SCALE (modular, 1.200 minor third) ---------- */
+  --t-3xs: 11px;
+  --t-2xs: 12px;
+  --t-xs:  13px;
+  --t-sm:  14px;
+  --t-md:  16px;
+  --t-lg:  18px;
+  --t-xl:  22px;
+  --t-2xl: 28px;
+  --t-3xl: 36px;
+  --t-4xl: 48px;
+  --t-5xl: 64px;
+  --t-6xl: 84px;
+  --t-7xl: 112px;
+
+  /* ---------- LINE HEIGHT ---------- */
+  --lh-tight:   1.04;   /* display */
+  --lh-snug:    1.15;
+  --lh-normal:  1.45;   /* body */
+  --lh-loose:   1.65;   /* long-form serif */
+
+  /* ---------- TRACKING ---------- */
+  --tr-display:  -0.022em;   /* display serif optical */
+  --tr-tight:    -0.011em;
+  --tr-normal:   0;
+  --tr-eyebrow:   0.14em;    /* uppercase labels — compliance-form feel */
+  --tr-caps:      0.06em;
+
+  /* ---------- SPACING (8pt grid + half steps) ---------- */
+  --s-0:   0;
+  --s-1:   4px;
+  --s-2:   8px;
+  --s-3:   12px;
+  --s-4:   16px;
+  --s-5:   20px;
+  --s-6:   24px;
+  --s-7:   32px;
+  --s-8:   40px;
+  --s-9:   48px;
+  --s-10:  64px;
+  --s-11:  80px;
+  --s-12:  96px;
+  --s-13:  128px;
+  --s-14:  160px;
+
+  /* ---------- RADII (intentionally restrained) ---------- */
+  --r-0:    0;        /* default — government documents */
+  --r-1:    6px;      /* buttons, inputs — softened from 2px */
+  --r-2:    8px;      /* cards */
+  --r-3:    12px;     /* large surfaces, modals */
+  --r-pill: 999px;    /* tags, status */
+
+  /* ---------- ELEVATION (sparing, single-direction) ---------- */
+  --shadow-hairline: 0 0 0 1px var(--stone-200);
+  --shadow-1:        0 1px 0 0 rgba(14,15,12,.06), 0 0 0 1px var(--stone-200);
+  --shadow-2:        0 2px 0 0 rgba(14,15,12,.04), 0 0 0 1px var(--stone-200);
+  --shadow-lift:     0 12px 32px -16px rgba(14,15,12,.18), 0 0 0 1px var(--stone-200);
+  --shadow-focus:    0 0 0 3px rgba(142,204,9,.35);
+
+  /* ---------- MOTION ---------- */
+  --ease-standard:   cubic-bezier(.2,.0,.0,1);     /* slight overshoot pull */
+  --ease-exit:       cubic-bezier(.4,.0,1,1);
+  --ease-spring:     cubic-bezier(.34,1.18,.4,1);
+  --dur-fast:        140ms;
+  --dur-base:        220ms;
+  --dur-slow:        420ms;
+  --dur-narrative:   900ms;   /* hero / animated marks */
+
+  /* ---------- LAYOUT ---------- */
+  --container:       1280px;
+  --container-wide:  1440px;
+  --gutter:          var(--s-7);
+  --rule-thin:       1px;
+  --rule-thick:      2px;
+}
+
+/* =============================================================
+   Semantic typography classes
+   Use these directly OR as a reference for component CSS
+   ============================================================= */
+
+.t-eyebrow,
+.eyebrow {
+  font-family: var(--font-sans);
+  font-size: var(--t-2xs);
+  font-weight: 500;
+  letter-spacing: var(--tr-eyebrow);
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+
+.t-display-xl, h1.display {
+  font-family: var(--font-display);
+  font-weight: 360;
+  font-size: clamp(56px, 8vw, var(--t-7xl));
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tr-display);
+  color: var(--fg-1);
+  font-variation-settings: "opsz" 60;
+}
+
+.t-display, h1 {
+  font-family: var(--font-display);
+  font-weight: 380;
+  font-size: var(--t-6xl);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tr-display);
+  color: var(--fg-1);
+  font-variation-settings: "opsz" 48;
+}
+
+.t-h1, h2 {
+  font-family: var(--font-display);
+  font-weight: 420;
+  font-size: var(--t-4xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--tr-tight);
+  color: var(--fg-1);
+  font-variation-settings: "opsz" 32;
+}
+
+.t-h2, h3 {
+  font-family: var(--font-display);
+  font-weight: 460;
+  font-size: var(--t-3xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--tr-tight);
+  color: var(--fg-1);
+  font-variation-settings: "opsz" 24;
+}
+
+.t-h3, h4 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--t-xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--tr-tight);
+  color: var(--fg-1);
+}
+
+.t-h4, h5 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--t-lg);
+  line-height: var(--lh-snug);
+  color: var(--fg-1);
+}
+
+.t-lede {
+  font-family: var(--font-display);
+  font-weight: 360;
+  font-size: var(--t-xl);
+  line-height: var(--lh-loose);
+  letter-spacing: 0;
+  color: var(--fg-2);
+  font-variation-settings: "opsz" 24;
+}
+
+.t-body, p {
+  font-family: var(--font-sans);
+  font-weight: 400;
+  font-size: var(--t-md);
+  line-height: var(--lh-normal);
+  color: var(--fg-1);
+}
+
+.t-body-sm, .small {
+  font-family: var(--font-sans);
+  font-weight: 400;
+  font-size: var(--t-sm);
+  line-height: var(--lh-normal);
+  color: var(--fg-2);
+}
+
+.t-caption, .caption {
+  font-family: var(--font-sans);
+  font-weight: 400;
+  font-size: var(--t-2xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-3);
+}
+
+.t-mono, code, kbd, samp, pre {
+  font-family: var(--font-mono);
+  font-weight: 400;
+  font-size: 0.92em;
+  letter-spacing: 0;
+  color: var(--fg-1);
+}
+
+.t-tabular {
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: "tnum", "lnum";
+}
+
+/* Document-styled long-form serif (filings, briefs, docs) */
+.t-prose {
+  font-family: var(--font-display);
+  font-weight: 380;
+  font-size: var(--t-lg);
+  line-height: var(--lh-loose);
+  letter-spacing: 0.005em;
+  color: var(--fg-1);
+  font-variation-settings: "opsz" 18;
+}
+
+/* Compliance label — small uppercase used on forms, status, receipts */
+.t-compliance {
+  font-family: var(--font-mono);
+  font-size: var(--t-2xs);
+  font-weight: 500;
+  letter-spacing: var(--tr-caps);
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+
+/* =============================================================
+   Lattice motif — the brand's one decorative element
+   Sparse grid suggesting GhostDAG topology, never the focus
+   ============================================================= */
+
+.lattice-grid {
+  background-image:
+    linear-gradient(to right,  rgba(14,15,12,.045) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(14,15,12,.045) 1px, transparent 1px);
+  background-size: 64px 64px;
+}
+
+.lattice-grid-fine {
+  background-image:
+    linear-gradient(to right,  rgba(14,15,12,.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(14,15,12,.035) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.lattice-dots {
+  background-image: radial-gradient(circle at 1px 1px, rgba(14,15,12,.16) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.lattice-dots-dark {
+  background-image: radial-gradient(circle at 1px 1px, rgba(205,231,214,.18) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.lattice-dots-green {
+  background-image: radial-gradient(circle at 1px 1px, rgba(142,204,9,.32) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* =============================================================
+   Base resets — apply selectively, not by default to body
+   ============================================================= */
+
+.citrate-page {
+  font-family: var(--font-sans);
+  color: var(--fg-1);
+  background: var(--bg-1);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "ss01", "cv01", "kern";
+}
+
+.citrate-page ::selection {
+  background: var(--citrate-yellow);
+  color: var(--ink);
+}
