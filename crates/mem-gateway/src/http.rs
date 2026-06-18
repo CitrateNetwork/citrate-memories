@@ -93,6 +93,8 @@ pub fn router(state: AppState) -> Router {
 
 /// Bind and serve until the process is killed.
 pub async fn run(state: AppState, bind: &str) -> std::io::Result<()> {
+    // MEM-S7 WP-7.3: drain webhook-enqueued ingest jobs in the background.
+    crate::ingest_worker::spawn(state.clone());
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("mem-gateway listening on http://{bind}");
