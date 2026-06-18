@@ -21,12 +21,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use std::collections::VecDeque;
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -68,6 +70,9 @@ pub struct AppState {
     pub connect_secret: Option<Arc<String>>,
     pub allow_dev_auth: bool,
     pub layout_cache: Arc<Mutex<Option<Scene>>>,
+    /// MEM-S7 WP-7.2: verified, in-scope push events awaiting incremental ingest.
+    /// The receiver only enqueues; the single-writer worker (WP-7.3) drains it.
+    pub ingest_queue: Arc<Mutex<VecDeque<crate::webhook::PushEvent>>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -82,6 +87,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/orgs/:org/assert", post(assert))
         .route("/ops", get(ops))
         .route("/mcp/u/:sub", post(byom))
+        .route("/webhook/github", post(github_webhook))
         .with_state(state)
 }
 
@@ -312,6 +318,51 @@ fn parse_kind(s: &str) -> NodeKind {
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "mem-gateway" }))
+}
+
+/// MEM-S7 WP-7.2 — GitHub push webhook. Authenticity FIRST (HMAC over the raw
+/// body, fail-closed when `MEM_INGEST_WEBHOOK_SECRET` is unset), then org
+/// allowlist + parse, then enqueue an incremental-ingest job. The single-writer
+/// worker (WP-7.3) drains the queue; this handler never writes the store.
+async fn github_webhook(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let secret = std::env::var("MEM_INGEST_WEBHOOK_SECRET").unwrap_or_default();
+    if secret.is_empty() {
+        // Fail closed: an unconfigured secret must never accept an unauthenticated body.
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ingest webhook disabled (MEM_INGEST_WEBHOOK_SECRET unset)",
+        )
+        .into_response();
+    }
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok());
+    if !crate::webhook::verify_signature(secret.as_bytes(), sig, &body) {
+        return unauthorized("invalid or missing webhook signature").into_response();
+    }
+    // GitHub's connectivity check.
+    if headers.get("x-github-event").and_then(|v| v.to_str().ok()) == Some("ping") {
+        return (StatusCode::OK, Json(json!({ "pong": true }))).into_response();
+    }
+    match crate::webhook::parse_push_event(&body) {
+        Some(ev) => {
+            let depth = {
+                let mut q = lock(&app.ingest_queue);
+                q.push_back(ev.clone());
+                q.len()
+            };
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "queued": ev.repo, "ref": ev.git_ref, "queue_depth": depth })),
+            )
+                .into_response()
+        }
+        None => bad("not an in-scope CitrateNetwork push event").into_response(),
+    }
 }
 
 async fn layout(

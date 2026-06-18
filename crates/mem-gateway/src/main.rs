@@ -216,6 +216,7 @@ async fn main() {
         connect_secret,
         allow_dev_auth,
         layout_cache: Arc::new(Mutex::new(None)),
+        ingest_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
     };
 
     if let Err(e) = run(state, &args.bind).await {

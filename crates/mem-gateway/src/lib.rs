@@ -22,6 +22,7 @@
 pub mod auth;
 pub mod control;
 pub mod scene;
+pub mod webhook;
 
 #[cfg(feature = "server")]
 pub mod http;

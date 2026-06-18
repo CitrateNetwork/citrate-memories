@@ -507,6 +507,87 @@ impl Ingestor {
             }
         }
     }
+
+    /// Incremental ingest (MEM-S7 WP-7.1): embed only the commits added since the
+    /// stored watermark, then refresh the docs. This is the per-push update path —
+    /// O(new commits) instead of O(full history) — so the change-feed can keep the
+    /// graph current without re-embedding everything on each push.
+    ///
+    /// Falls back to a full {@link ingest} when there is no prior watermark, when
+    /// the previous head is no longer reachable from HEAD (force-push / history
+    /// rewrite), or when the watermark has no head. Idempotent: with HEAD already
+    /// at the watermark, no new commit nodes are produced.
+    ///
+    /// Docs are always rebuilt against the current tree (they are few and
+    /// content-addressed, so re-running dedupes); commit embedding — the expensive
+    /// part — is what we make incremental.
+    pub fn ingest_incremental(
+        &self,
+        repo_path: &Path,
+        store: &MemoryDagStore<MemoryNode>,
+    ) -> Result<IngestReport, IngestError> {
+        let root = git::repo_root(repo_path)?;
+
+        // Decide range: only when the prior head is still an ancestor of HEAD.
+        let prior = self.read_watermark(store)?;
+        let since: Option<String> = match prior.as_ref().and_then(|w| w.head.clone()) {
+            Some(head) if git::is_ancestor(&root, &head)? => Some(head),
+            // No watermark, no head, or rewritten history → re-derive fully.
+            _ => None,
+        };
+        if since.is_none() {
+            return self.ingest(repo_path, store);
+        }
+        let since = since.expect("checked is_some");
+
+        let now = now_millis();
+        let recs = git::read_commits_range(&root, Some(&since))?;
+
+        // Commit nodes/edges for ONLY the new commits.
+        let (mut nodes, mut edges) = build_graph_gated(
+            &self.repo_name,
+            &recs,
+            now,
+            self.embedder.as_ref(),
+            &self.authoritative_authors,
+        )?;
+        // Refresh docs against the current tree (idempotent on unchanged docs).
+        let (doc_nodes, doc_edges, doc_count) = build_doc_graph(
+            &self.repo_name,
+            &root,
+            now,
+            self.embedder.as_ref(),
+            &self.authoritative_authors,
+        )?;
+        nodes.extend(doc_nodes);
+        edges.extend(doc_edges);
+
+        let (supersessions, plain): (Vec<Edge>, Vec<Edge>) =
+            edges.into_iter().partition(|e| e.kind == EdgeKind::Supersedes && !e.quarantined);
+        store.commit(&nodes, &plain)?;
+        let (superseded, supersessions_rejected) = apply_supersessions(store, &supersessions)?;
+
+        // Stamp the watermark from git directly so head/head_count stay exact
+        // regardless of merges (additive counting would drift).
+        let watermark = Watermark {
+            repo: self.repo_name.clone(),
+            head: Some(git::head_sha(&root)?),
+            head_count: git::commit_count(&root)?,
+            ingested_at_ms: now,
+        };
+        let bytes = serde_json::to_vec(&watermark).map_err(|e| IngestError::Serde(e.to_string()))?;
+        store.put_meta(&watermark_key(&self.repo_name), &bytes)?;
+
+        Ok(IngestReport {
+            commits: recs.len(),
+            docs: doc_count,
+            nodes_in_store: store.node_count()?,
+            edges_in_store: store.edge_count()?,
+            superseded,
+            supersessions_rejected,
+            watermark,
+        })
+    }
 }
 
 /// Apply a batch of ingest-derived supersedes edges (targets must already be
@@ -694,5 +775,86 @@ mod tests {
         let wm = Watermark { repo: "r".into(), head: Some("aaa".into()), head_count: 1, ingested_at_ms: 7 };
         store.put_meta(&watermark_key("r"), &serde_json::to_vec(&wm).unwrap()).unwrap();
         assert_eq!(ing.read_watermark(&store).unwrap(), Some(wm));
+    }
+
+    // ── MEM-S7 WP-7.1: incremental ingest over a real temp git repo ──────────
+    use std::process::Command as Cmd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn tmp_repo() -> std::path::PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mem-s7-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Cmd::new("git").arg("-C").arg(&dir).args(args).status().unwrap().success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        dir
+    }
+
+    fn commit(dir: &std::path::Path, file: &str, contents: &str, msg: &str) {
+        std::fs::write(dir.join(file), contents).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Cmd::new("git").arg("-C").arg(dir).args(args).status().unwrap().success());
+        };
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", msg]);
+    }
+
+    #[test]
+    fn ingest_incremental_only_embeds_new_commits() {
+        let dir = tmp_repo();
+        commit(&dir, "a.txt", "1", "first");
+        commit(&dir, "a.txt", "2", "second");
+
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        let ing = Ingestor::new("r");
+
+        // No prior watermark → falls back to a full ingest (both commits).
+        let r1 = ing.ingest_incremental(&dir, &store).unwrap();
+        assert_eq!(r1.commits, 2, "first run ingests full history");
+        let n1 = store.node_count().unwrap();
+        assert_eq!(ing.read_watermark(&store).unwrap().unwrap().head_count, 2);
+
+        // Re-run with no new commits → idempotent: 0 commits, no node growth.
+        let r2 = ing.ingest_incremental(&dir, &store).unwrap();
+        assert_eq!(r2.commits, 0, "no new commits to ingest");
+        assert_eq!(store.node_count().unwrap(), n1, "idempotent: store does not grow");
+
+        // One new commit → only that commit is embedded.
+        commit(&dir, "a.txt", "3", "third");
+        let r3 = ing.ingest_incremental(&dir, &store).unwrap();
+        assert_eq!(r3.commits, 1, "only the single new commit is ingested");
+        assert_eq!(store.node_count().unwrap(), n1 + 1, "exactly one new commit node");
+        assert_eq!(ing.read_watermark(&store).unwrap().unwrap().head_count, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ingest_incremental_full_rederive_on_history_rewrite() {
+        let dir = tmp_repo();
+        commit(&dir, "a.txt", "1", "first");
+        commit(&dir, "a.txt", "2", "second");
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        let ing = Ingestor::new("r");
+        ing.ingest_incremental(&dir, &store).unwrap();
+
+        // Rewrite history so the watermark head is no longer reachable.
+        assert!(Cmd::new("git").arg("-C").arg(&dir)
+            .args(["reset", "--hard", "HEAD~1"]).status().unwrap().success());
+        commit(&dir, "a.txt", "2-rewritten", "second-prime");
+
+        // The prior head is not an ancestor → full re-derive, no panic.
+        let r = ing.ingest_incremental(&dir, &store).unwrap();
+        assert_eq!(r.commits, 2, "rewrite triggers a full re-derive");
+        assert_eq!(ing.read_watermark(&store).unwrap().unwrap().head_count, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
