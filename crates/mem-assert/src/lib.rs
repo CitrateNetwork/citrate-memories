@@ -56,6 +56,32 @@ impl Asserter {
         Self { pubkey_hex, sk }
     }
 
+    /// FWA-C10-04 — bind authorship to the authenticated principal.
+    ///
+    /// The gateway holds ONE signing key but serves many principals; using it
+    /// directly made every node's `author` the gateway pubkey, so `blame()`
+    /// could not tell two users apart. Derive a deterministic per-principal
+    /// ed25519 sub-identity from the gateway key + the authenticated `sub`
+    /// (domain-separated HKDF-like blake3 of the gateway secret scalar bytes and
+    /// the sub). The subkey:
+    /// - is unique per `sub` → `blame()` now identifies the actor, not the gateway;
+    /// - is deterministic → the same principal always signs under the same author,
+    ///   so content-addressing and idempotent re-merge are preserved;
+    /// - cannot be derived without the gateway secret → a client cannot forge
+    ///   another principal's author (no per-user key escrow needed in v1).
+    ///
+    /// Full SIWE/OIDC-wallet–bound identities (citrate-identity) remain the v2
+    /// upgrade; this closes the attribution gap without that integration.
+    pub fn for_principal(gateway_sk: &SigningKey, sub: &str) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(b"mem-assert:principal-subkey:v1");
+        h.update(&gateway_sk.to_bytes());
+        h.update(&(sub.len() as u64).to_le_bytes());
+        h.update(sub.as_bytes());
+        let seed: [u8; 32] = *h.finalize().as_bytes();
+        Self::new(SigningKey::from_bytes(&seed))
+    }
+
     pub fn pubkey_hex(&self) -> &str {
         &self.pubkey_hex
     }
@@ -339,6 +365,32 @@ mod tests {
         let mut d = a.assert_node("r", NodeKind::Rationale, "x", 1);
         d.plane = Plane::Derived;
         assert!(matches!(verify_node(&d), Err(AssertError::NotAssertable(_))));
+    }
+
+    #[test]
+    fn fwa_c10_04_authorship_is_bound_to_principal_not_gateway() {
+        // One gateway key, two principals → two DISTINCT, deterministic authors,
+        // each different from the raw gateway author, and `blame()` names the actor.
+        let gateway = SigningKey::from_bytes(&[9u8; 32]);
+        let gateway_author = Asserter::new(gateway.clone());
+
+        let alice = Asserter::for_principal(&gateway, "did:alice");
+        let bob = Asserter::for_principal(&gateway, "did:bob");
+
+        assert_ne!(alice.pubkey_hex(), bob.pubkey_hex(), "distinct principals → distinct authors");
+        assert_ne!(alice.pubkey_hex(), gateway_author.pubkey_hex(), "principal author != gateway key");
+        assert_ne!(bob.pubkey_hex(), gateway_author.pubkey_hex());
+
+        // Deterministic: re-deriving the same principal yields the same author
+        // (preserves content-addressing / idempotent re-merge).
+        let alice2 = Asserter::for_principal(&gateway, "did:alice");
+        assert_eq!(alice.pubkey_hex(), alice2.pubkey_hex(), "same principal → stable author");
+
+        // `blame()` now identifies the actual actor and the node still verifies.
+        let n = alice.assert_node("r", NodeKind::Rationale, "alice's claim", 1);
+        assert!(verify_node(&n).is_ok());
+        assert_eq!(blame(&n).author, alice.pubkey_hex(), "blame names the principal, not the gateway");
+        assert_ne!(blame(&n).author, gateway_author.pubkey_hex());
     }
 
     #[test]

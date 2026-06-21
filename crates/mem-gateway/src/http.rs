@@ -539,7 +539,7 @@ async fn assert(
     if body.content.is_empty() {
         return Err(bad("content required"));
     }
-    gate(
+    let sub = gate(
         &app,
         &headers,
         &org,
@@ -548,7 +548,9 @@ async fn assert(
         "assert",
     )?;
     let kind = parse_kind(body.kind.as_deref().unwrap_or("rationale"));
-    let asserter = Asserter::new(app.signing_key.clone());
+    // FWA-C10-04: sign under a per-principal sub-identity so `blame()` names the
+    // authenticated actor, not the shared gateway key.
+    let asserter = Asserter::for_principal(&app.signing_key, &sub);
     let id = {
         let _gate = lock(&app.write_gate); // serialize writes (single-writer store)
         let node = asserter.assert_node(&body.repo, kind, &body.content, now_ms());
@@ -619,7 +621,9 @@ async fn byom(
     };
     let now = now_ms();
     let grant = mint_grant(&app.signing_key, &app.issuer, &membership, now, GRANT_TTL_MS);
-    let asserter = Asserter::new(app.signing_key.clone());
+    // FWA-C10-04: per-principal authorship (see /assert). `sub` is the
+    // connect-token-verified principal.
+    let asserter = Asserter::for_principal(&app.signing_key, &sub);
     let mut server = MemoryMcpServer::new_with_asserter(&app.store, grant, asserter)
         .with_write_gate(app.write_gate.clone())
         .with_index_cache(app.index_cache.clone())
