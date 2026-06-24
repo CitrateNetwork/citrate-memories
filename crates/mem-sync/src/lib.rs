@@ -41,6 +41,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use mem_authz::{AuthzError, CapabilityGrant, Op};
 use mem_core::{join_confidence, ContentHash, Edge, EdgeKind, MemoryNode, Plane, Status};
 use mem_store::{MemoryDagStore, StoreError, SupersessionError};
 
@@ -55,6 +58,24 @@ pub enum SyncError {
     /// unverified checkpoint.
     #[error("chain anchor error: {0}")]
     Chain(String),
+    /// FWA-C10-01/02: the merging peer's grant does not authorize a Write to a
+    /// repo the bundle touches. The merge is refused wholesale (no partial,
+    /// no-poison) — mirroring the MCP `merge_diff` authz loop, which authorizes
+    /// EVERY touched repo before any write lands.
+    #[error("merge denied: {0}")]
+    Denied(#[from] AuthzError),
+    /// FWA-C10-01/02: a bundle edge references an endpoint node that is neither
+    /// in the bundle nor in the local store, so its owning repo cannot be
+    /// resolved and therefore cannot be authorized. Fail closed.
+    #[error("merge denied: edge endpoint {0} owns no resolvable repo (cannot authorize)")]
+    UnresolvableEndpoint(String),
+}
+
+/// Map a tenant `repo` to the capability-grant resource id. MUST match the MCP
+/// path's mapping (`mem-mcp` `authorize`: `format!("repo:{repo}/memory")`) so
+/// the two write paths authorize against the SAME resource namespace.
+fn resource_for(repo: &str) -> String {
+    format!("repo:{repo}/memory")
 }
 
 /// A tenant replica's exported state: the unit of federation transfer. Plain
@@ -151,13 +172,80 @@ fn merge_node(local: &MemoryNode, remote: &MemoryNode) -> (MemoryNode, bool, usi
     (merged, changed, contradictions)
 }
 
+/// Resolve the repo that owns a node id: prefer the bundle's own nodes (so a
+/// self-contained bundle authorizes without a store round-trip), else the local
+/// store. `None` if neither knows the endpoint — caller fails closed.
+fn endpoint_repo(
+    store: &MemoryDagStore<MemoryNode>,
+    in_bundle: &BTreeMap<ContentHash, String>,
+    endpoint: &ContentHash,
+) -> Result<Option<String>, SyncError> {
+    if let Some(repo) = in_bundle.get(endpoint) {
+        return Ok(Some(repo.clone()));
+    }
+    Ok(store.get_node(endpoint)?.map(|n| n.repo))
+}
+
+/// FWA-C10-01/02 — the unified federation-merge authorization gate.
+///
+/// Collect EVERY repo the bundle would write to (node repos + the owning repo of
+/// each edge endpoint, resolved from the bundle's own nodes or the local store)
+/// and require `grant` to authorize a `Write` to each, BEFORE any node/edge
+/// lands. This mirrors the MCP `merge_diff` authz loop (mem-mcp/src/lib.rs:665-695)
+/// so the two write paths cannot diverge again: a peer can only merge into repos
+/// its capability grant actually covers. Fails closed (whole bundle refused) on
+/// any denied repo or any edge endpoint whose owning repo cannot be resolved.
+fn authorize_bundle(
+    store: &MemoryDagStore<MemoryNode>,
+    grant: &CapabilityGrant,
+    bundle: &SyncBundle,
+    now_ms: u64,
+) -> Result<(), SyncError> {
+    let in_bundle: BTreeMap<ContentHash, String> =
+        bundle.nodes.iter().map(|n| (n.compute_id(), n.repo.clone())).collect();
+
+    let mut repos: BTreeSet<String> = bundle.nodes.iter().map(|n| n.repo.clone()).collect();
+    for e in &bundle.edges {
+        for endpoint in [&e.from, &e.to] {
+            match endpoint_repo(store, &in_bundle, endpoint)? {
+                Some(repo) => {
+                    repos.insert(repo);
+                }
+                None => {
+                    return Err(SyncError::UnresolvableEndpoint(endpoint.to_hex()));
+                }
+            }
+        }
+    }
+
+    for repo in &repos {
+        grant.check(&resource_for(repo), Op::Write, now_ms)?;
+    }
+    Ok(())
+}
+
 /// Merge a remote bundle into the local store (the CRDT join). Idempotent and
 /// order-insensitive in the final state; see the module docs for the one
 /// documented exception (concurrent contradictory supersessions).
+///
+/// **FWA-C10-01/02 (authorization).** The merging peer presents a
+/// [`CapabilityGrant`]; the merge authorizes a `Write` to EVERY repo the bundle
+/// touches (node repos + edge-endpoint repos) before any write lands — the same
+/// gate the MCP `merge_diff` path uses. A peer therefore cannot inject
+/// Derived-plane nodes or unsigned Derived `Supersedes` edges into a repo its
+/// grant does not cover. Asserted-plane items must still carry a valid signature
+/// (per-item), unchanged. Use [`merge_bundle_trusted`] only for in-process,
+/// already-trusted ingest (it grants `*`), never across a federation boundary.
 pub fn merge_bundle(
     store: &MemoryDagStore<MemoryNode>,
     bundle: &SyncBundle,
+    grant: &CapabilityGrant,
+    now_ms: u64,
 ) -> Result<MergeOutcome, SyncError> {
+    // FWA-C10-01/02: authorize the WHOLE bundle first — fail closed, no partial
+    // application, before a single node or edge can reach the store.
+    authorize_bundle(store, grant, bundle, now_ms)?;
+
     let mut out = MergeOutcome::default();
 
     // ---- nodes ----
@@ -240,6 +328,50 @@ pub fn merge_bundle(
     }
 
     Ok(out)
+}
+
+/// FWA-C10-01/02 — an explicit, signed `*`-grant for **in-process, already-trusted**
+/// ingest only (self-merge, a local replica re-importing its own export, the
+/// deterministic git/markdown ingestor). Naming the trust decision keeps it
+/// auditable and greppable — a federation/transport caller must NEVER use this;
+/// it must pass the connecting peer's real [`CapabilityGrant`] to [`merge_bundle`].
+pub fn trusted_local_grant() -> CapabilityGrant {
+    use ed25519_dalek::SigningKey;
+    use mem_authz::{PolicyProfile, ResourceScope};
+    // A throwaway, process-local signing key — the grant is self-issued and
+    // covers every resource for Read+Write. It exists solely so the trusted
+    // ingest path flows through the SAME authz gate as the untrusted one (no
+    // second, unguarded code path can exist).
+    let sk = SigningKey::from_bytes(&[0xA1u8; 32]);
+    let mut g = CapabilityGrant {
+        id: "mem-sync:trusted-local-ingest".into(),
+        issuer: "mem-sync".into(),
+        recipient: "mem-sync:local".into(),
+        allowed_resources: vec![ResourceScope {
+            resource_id: "*".into(),
+            can_read: true,
+            can_write: true,
+        }],
+        policy: PolicyProfile::Maintainer,
+        expires_at_ms: u64::MAX,
+        revoked: false,
+        delegation_chain: vec![],
+        issuer_pubkey: vec![],
+        signature: vec![],
+    };
+    g.sign_with(&sk);
+    g
+}
+
+/// Convenience for in-process, already-trusted ingest: [`merge_bundle`] with the
+/// [`trusted_local_grant`]. Use ONLY where the bundle is the local replica's own
+/// state (self-merge, re-import) or comes from the deterministic ingestor — never
+/// for a bundle received over a federation transport.
+pub fn merge_bundle_trusted(
+    store: &MemoryDagStore<MemoryNode>,
+    bundle: &SyncBundle,
+) -> Result<MergeOutcome, SyncError> {
+    merge_bundle(store, bundle, &trusted_local_grant(), 0)
 }
 
 // ---------------------------------------------------------------------------

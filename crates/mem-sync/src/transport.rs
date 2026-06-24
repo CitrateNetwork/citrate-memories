@@ -13,17 +13,24 @@
 //!
 //! The merge side keeps every safety property of `merge_bundle` — Asserted-plane
 //! items must verify, supersessions are cycle-guarded, contradictions surface as
-//! Belnap `Both`. The transport adds no trust: it is a pipe, the plane policy is
-//! the gate. **Gossip / peer-discovery is deferred** (a dated note in MEM-S5);
+//! Belnap `Both`. **Gossip / peer-discovery is deferred** (a dated note in MEM-S5);
 //! this is point-to-point pull/push, which is enough to retire file-moves.
 //!
-//! Not yet here (operator/v2): TLS, auth on the merge endpoint, and bundle-size
-//! caps at the socket. Run it behind the same loopback/relay posture the rest of
-//! the federation uses until those land.
+//! **FWA-C10-03 (auth — fail closed by construction).** `merge_bundle` now
+//! requires a [`CapabilityGrant`], and so does this transport: [`serve_one`] takes
+//! the grant the connecting peer is authorized under and passes it to
+//! `merge_bundle`, which authorizes a `Write` to every repo the pushed bundle
+//! touches. The transport therefore CANNOT be wired into a binary without an
+//! explicit authorization decision — the type system enforces it. (A real
+//! deployment binds the grant to the authenticated peer — mTLS / connect-token —
+//! rather than a static operator grant; that binding is the operator/v2 step.
+//! TLS is still expected at the edge; keep the loopback/relay posture until it
+//! lands.)
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+use mem_authz::CapabilityGrant;
 use mem_core::MemoryNode;
 use mem_store::MemoryDagStore;
 
@@ -67,14 +74,19 @@ pub fn push_bundle(base_url: &str, bundle: &SyncBundle) -> Result<MergeOutcome, 
     parse_outcome(&resp)
 }
 
-/// Pull from a peer AND merge into the local store in one call.
+/// Pull from a peer AND merge into the local store in one call. The pulled
+/// bundle is untrusted (it came off the network), so the caller must supply the
+/// `grant` the merge is authorized under and `now_ms` for expiry checks
+/// (FWA-C10-01/02/03).
 pub fn pull_and_merge(
     store: &MemoryDagStore<MemoryNode>,
     base_url: &str,
     repo: &str,
+    grant: &CapabilityGrant,
+    now_ms: u64,
 ) -> Result<MergeOutcome, SyncError> {
     let bundle = pull_bundle(base_url, repo)?;
-    merge_bundle(store, &bundle)
+    merge_bundle(store, &bundle, grant, now_ms)
 }
 
 // ---- server ----
@@ -83,18 +95,25 @@ pub fn pull_and_merge(
 /// thread (no `Send` bound needed). Returns a short label of the route handled,
 /// or `None` if the connection carried no parseable request. Loop over this for
 /// a long-running server: `loop { serve_one(&listener, &store, now)?; }`.
+///
+/// FWA-C10-03: `grant` is the capability the connecting peer is authorized
+/// under; it is handed to `merge_bundle`, which authorizes a `Write` to every
+/// repo a pushed bundle touches. There is no unauthenticated merge path — the
+/// signature requires a grant.
 pub fn serve_one(
     listener: &TcpListener,
     store: &MemoryDagStore<MemoryNode>,
+    grant: &CapabilityGrant,
     now_ms: u64,
 ) -> Result<Option<String>, SyncError> {
     let (stream, _peer) = listener.accept().map_err(io_err)?;
-    handle_conn(stream, store, now_ms)
+    handle_conn(stream, store, grant, now_ms)
 }
 
 fn handle_conn(
     mut stream: TcpStream,
     store: &MemoryDagStore<MemoryNode>,
+    grant: &CapabilityGrant,
     now_ms: u64,
 ) -> Result<Option<String>, SyncError> {
     let mut reader = BufReader::new(stream.try_clone().map_err(io_err)?);
@@ -139,7 +158,7 @@ fn handle_conn(
             let mut body = vec![0u8; content_length];
             reader.read_exact(&mut body).map_err(io_err)?;
             let text = String::from_utf8(body).map_err(|e| SyncError::Chain(format!("merge body utf8: {e}")))?;
-            match SyncBundle::from_json(&text).and_then(|b| merge_bundle(store, &b)) {
+            match SyncBundle::from_json(&text).and_then(|b| merge_bundle(store, &b, grant, now_ms)) {
                 Ok(outcome) => {
                     write_json(&mut stream, 200, "OK", &outcome_json(&outcome))?;
                     Ok(Some("POST /merge".into()))
@@ -237,8 +256,10 @@ mod transport_tests {
             edges: vec![],
         };
 
+        // The peer authorizes this connecting client to Write the pushed repo.
+        let grant = crate::tests::grant_for(&["citrate-chain"], true);
         let client = std::thread::spawn(move || push_bundle(&base, &bundle));
-        let route = serve_one(&listener, &peer, 1).expect("serve").unwrap();
+        let route = serve_one(&listener, &peer, &grant, 1).expect("serve").unwrap();
         let outcome = client.join().unwrap().expect("push ok");
 
         assert_eq!(route, "POST /merge");
@@ -257,8 +278,11 @@ mod transport_tests {
         let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
         peer.commit(&[derived_node("citrate-chain", "tip-selection")], &[]).unwrap();
 
+        // GET /bundle is a read/export — the grant is unused on this route, but
+        // serve_one still requires one (no unauthenticated merge path can exist).
+        let grant = crate::tests::grant_for(&["citrate-chain"], false);
         let client = std::thread::spawn(move || pull_bundle(&base, "citrate-chain"));
-        let route = serve_one(&listener, &peer, 1).expect("serve").unwrap();
+        let route = serve_one(&listener, &peer, &grant, 1).expect("serve").unwrap();
         let bundle = client.join().unwrap().expect("pull ok");
 
         assert_eq!(route, "GET /bundle/citrate-chain");

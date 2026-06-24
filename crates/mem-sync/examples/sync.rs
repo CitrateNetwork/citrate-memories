@@ -10,7 +10,7 @@
 
 use mem_core::MemoryNode;
 use mem_store::MemoryDagStore;
-use mem_sync::{anchor_tenant, export_tenant, merge_bundle, verify_anchor, SyncBundle};
+use mem_sync::{anchor_tenant, export_tenant, merge_bundle_trusted, verify_anchor, SyncBundle};
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,7 +51,10 @@ fn main() {
             let store = open(db);
             let json = std::fs::read_to_string(path).expect("read bundle file");
             let bundle = SyncBundle::from_json(&json).expect("parse bundle");
-            let out = merge_bundle(&store, &bundle).expect("merge bundle");
+            // Operator-local import from a file on the same host = trusted ingest.
+            // A federation/network import path must use `merge_bundle` with the
+            // connecting peer's real CapabilityGrant (FWA-C10-01/02/03).
+            let out = merge_bundle_trusted(&store, &bundle).expect("merge bundle");
             eprintln!(
                 "sync: merged tenant '{}' — +{} nodes ({} merged), +{} edges ({} merged), {} superseded; rejected: {} supersessions, {} signatures; {} contradictions surfaced",
                 bundle.repo,

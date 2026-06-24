@@ -1822,6 +1822,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "mem-assert",
+ "mem-authz",
  "mem-core",
  "mem-store",
  "serde",
