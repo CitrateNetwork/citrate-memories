@@ -14,7 +14,7 @@ pub mod kv;
 pub mod rocks;
 pub mod shred;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -74,6 +74,26 @@ pub struct SupersessionReport {
     pub transitioned: bool,
 }
 
+/// What [`MemoryDagStore::migrate_seal_v2`] did (ENCRYPT-S1 WP-6 one-shot
+/// migration: seal pre-WP-6 plaintext edge/meta rows in place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SealMigrationReport {
+    /// The marker was already present — nothing was scanned.
+    pub already_done: bool,
+    /// Plaintext edge rows (out + in adjacency) sealed in place.
+    pub edges_sealed: usize,
+    /// Plaintext meta rows sealed in place.
+    pub meta_sealed: usize,
+    /// Rows left plaintext because no owning tenant could be determined
+    /// (dangling edge with both endpoints gone, or a meta key without the
+    /// `prefix:{tenant}` shape). Reported, never silently dropped.
+    pub skipped_unknown_tenant: usize,
+}
+
+/// META-cf marker row gating [`MemoryDagStore::migrate_seal_v2`]. Plaintext by
+/// design (purely operational, carries nothing tenant-derived).
+const SEAL_V2_MARKER_KEY: &[u8] = b"__shred_seal_v2_done";
+
 /// Anything the DAG can store must know its own content-addressed id.
 pub trait Identified {
     fn id(&self) -> ContentHash;
@@ -100,8 +120,12 @@ impl Tenanted for MemoryNode {
 /// A content-addressed DAG of nodes `N` and [`Edge`]s, backed by any [`KvStore`].
 pub struct MemoryDagStore<N> {
     kv: Box<dyn KvStore>,
-    /// WP-1.6: seal node payloads with the owning tenant's key before they
-    /// touch the backend. Edges/meta are structural and stay plaintext.
+    /// WP-1.6 + ENCRYPT-S1 WP-6: seal node payloads, edge values and
+    /// operational-meta values (freshness watermark, anchors) with the owning
+    /// tenant's key before they touch the backend. Storage KEYS stay plaintext
+    /// — every edge read is a prefix scan by raw node id, issued by readers
+    /// that don't know the owning tenant (see `shred` module docs for the
+    /// accepted topology-visibility residual).
     encrypt_at_rest: bool,
     _node: std::marker::PhantomData<N>,
 }
@@ -118,9 +142,10 @@ where
         }
     }
 
-    /// A store that seals every node payload under its tenant's key (WP-1.6).
-    /// Reading is backward-compatible: plaintext values written by an
-    /// unencrypted store still parse.
+    /// A store that seals every node payload, edge value and meta value under
+    /// its tenant's key (WP-1.6 + WP-6). Reading is backward-compatible:
+    /// plaintext values written by an unencrypted (or pre-WP-6) store still
+    /// parse — run [`migrate_seal_v2`](Self::migrate_seal_v2) to seal them.
     pub fn new_encrypted(kv: Box<dyn KvStore>) -> Self {
         Self {
             kv,
@@ -133,13 +158,22 @@ where
     /// has entries. Keeps operators (daemon, backfill refresh) from accidentally
     /// writing plaintext into an encrypted store — reads work either way, but
     /// the write mode must match.
+    ///
+    /// WP-6: on an encrypted store this also runs the one-shot
+    /// [`migrate_seal_v2`](Self::migrate_seal_v2) (marker-gated — a single
+    /// point read once migrated), so pre-WP-6 stores with plaintext edge/meta
+    /// rows get sealed on their first post-upgrade open.
     pub fn new_auto(kv: Box<dyn KvStore>) -> Result<Self, StoreError> {
         let encrypted = !kv.kv_iter_cf(cf::KEYS).map_err(StoreError::Backend)?.is_empty();
-        Ok(Self {
+        let s = Self {
             kv,
             encrypt_at_rest: encrypted,
             _node: std::marker::PhantomData,
-        })
+        };
+        if encrypted {
+            s.migrate_seal_v2()?;
+        }
+        Ok(s)
     }
 
     /// Whether this store seals node payloads on write.
@@ -221,6 +255,81 @@ where
         }
     }
 
+    /// One-shot WP-6 migration: seal every pre-WP-6 **plaintext** edge and
+    /// meta row in place under its owning tenant's key. Chosen over
+    /// rebuild-from-ingest because only the Derived plane is rebuildable —
+    /// Asserted-plane edges (signed propose/confirm proposals) exist nowhere
+    /// but in this store, so they must be re-encrypted, not re-derived.
+    ///
+    /// Properties:
+    /// - **Marker-gated**: once complete, a `__shred_seal_v2_done` row in the
+    ///   META cf short-circuits every later call to a single point read
+    ///   ([`new_auto`](Self::new_auto) runs this on every encrypted open).
+    /// - **Idempotent**: already-sealed rows are skipped by shape, so a crash
+    ///   mid-migration (marker unwritten) safely re-runs.
+    /// - **Per-tenant**: each row is sealed under its own tenant's live key
+    ///   (edges via their `from`/`to` endpoint, meta via its `prefix:{tenant}`
+    ///   key shape), minting keys for tenants that never wrote a node.
+    /// - Rows whose tenant cannot be determined are left plaintext and
+    ///   **counted** in the report — the marker is still written (those rows
+    ///   are unprotectable dangling data, and re-scanning every open would
+    ///   not change that).
+    pub fn migrate_seal_v2(&self) -> Result<SealMigrationReport, StoreError> {
+        if !self.encrypt_at_rest {
+            return Err(StoreError::Crypto("seal migration requires an encrypted store".into()));
+        }
+        if self.kv.kv_get(cf::META, SEAL_V2_MARKER_KEY).map_err(StoreError::Backend)?.is_some() {
+            return Ok(SealMigrationReport { already_done: true, ..Default::default() });
+        }
+        let mut report = SealMigrationReport::default();
+        let empty_batch = HashMap::new();
+        for cf_name in [cf::EDGES_OUT, cf::EDGES_IN] {
+            for (k, v) in self.kv.kv_iter_cf(cf_name).map_err(StoreError::Backend)? {
+                if shred::parse_envelope(&v).is_some() {
+                    continue; // already sealed
+                }
+                let edge: Edge = serde_json::from_slice(&v).map_err(|e| StoreError::Serde(e.to_string()))?;
+                let tenant = match self.edge_tenant(&edge, &empty_batch) {
+                    Ok(t) => t,
+                    // Dangling edge, both endpoints gone: unprotectable — count it.
+                    Err(StoreError::Crypto(_)) => {
+                        report.skipped_unknown_tenant += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let (gen, master) = self.ensure_tenant_key(&tenant)?;
+                let sealed = shred::seal_at(&master, &tenant, gen, cf_name, &k, &v)?;
+                self.kv.kv_put(cf_name, &k, &sealed).map_err(StoreError::Backend)?;
+                report.edges_sealed += 1;
+            }
+        }
+        for (k, v) in self.kv.kv_iter_cf(cf::META).map_err(StoreError::Backend)? {
+            if k == SEAL_V2_MARKER_KEY || shred::parse_envelope(&v).is_some() {
+                continue;
+            }
+            // Meta keys are `prefix:{tenant}` (derived_watermark:, anchor:,
+            // chain_anchor:) — the tenant is the suffix after the first ':'.
+            let tenant = k
+                .iter()
+                .position(|&b| b == b':')
+                .and_then(|i| std::str::from_utf8(&k[i + 1..]).ok())
+                .filter(|t| !t.is_empty());
+            let Some(tenant) = tenant else {
+                report.skipped_unknown_tenant += 1;
+                continue;
+            };
+            let (gen, master) = self.ensure_tenant_key(tenant)?;
+            let sealed = shred::seal_at(&master, tenant, gen, cf::META, &k, &v)?;
+            self.kv.kv_put(cf::META, &k, &sealed).map_err(StoreError::Backend)?;
+            report.meta_sealed += 1;
+        }
+        self.kv
+            .kv_put(cf::META, SEAL_V2_MARKER_KEY, b"1")
+            .map_err(StoreError::Backend)?;
+        Ok(report)
+    }
+
     /// Serialize a node for storage: plaintext JSON, or a sealed envelope when
     /// encrypting at rest.
     fn encode_node(&self, node: &N) -> Result<Vec<u8>, StoreError> {
@@ -252,6 +361,103 @@ where
             return Ok(None);
         }
         let plain = shred::open(&key, &env, id)?;
+        Ok(Some(serde_json::from_slice(&plain).map_err(|e| StoreError::Serde(e.to_string()))?))
+    }
+
+    // ---- edge/meta sealing (ENCRYPT-S1 WP-6) ----
+
+    /// The tenant that owns a stored node, WITHOUT decrypting it: a sealed
+    /// envelope carries its tenant label in the clear (the reader must know
+    /// which key to fetch), and a plaintext node carries its repo. `None` if
+    /// the node isn't stored. Works even for crypto-shredded nodes — an edge
+    /// written after its endpoint's shred still resolves to the right tenant
+    /// (and gets sealed under that tenant's next-generation key).
+    fn stored_node_tenant(&self, id: &ContentHash) -> Result<Option<String>, StoreError> {
+        let Some(bytes) = self.kv.kv_get(cf::NODES, id.as_bytes()).map_err(StoreError::Backend)? else {
+            return Ok(None);
+        };
+        if let Some(env) = shred::parse_envelope(&bytes) {
+            return Ok(Some(env.tenant));
+        }
+        let n: N = serde_json::from_slice(&bytes).map_err(|e| StoreError::Serde(e.to_string()))?;
+        Ok(Some(n.tenant().to_string()))
+    }
+
+    /// The tenant an edge is sealed under: the tenant of its `from` (asserting)
+    /// endpoint, falling back to `to`. `batch` lets `commit` resolve endpoints
+    /// that arrive in the same atomic write. Only called when encrypting at
+    /// rest — there, an edge with no known endpoint is unprotectable and is
+    /// rejected rather than silently stored in the clear.
+    fn edge_tenant(&self, edge: &Edge, batch: &HashMap<ContentHash, String>) -> Result<String, StoreError> {
+        for id in [&edge.from, &edge.to] {
+            if let Some(t) = batch.get(id) {
+                return Ok(t.clone());
+            }
+            if let Some(t) = self.stored_node_tenant(id)? {
+                return Ok(t);
+            }
+        }
+        Err(StoreError::Crypto(format!(
+            "cannot seal edge {} -> {}: neither endpoint is in the store, so no tenant key applies",
+            edge.from.to_hex(),
+            edge.to.to_hex()
+        )))
+    }
+
+    /// The two `KvOp::Put`s an edge write expands to (out- and in-adjacency),
+    /// sealing each row under the owning tenant's key when encrypting at rest.
+    /// The AAD binds tenant ‖ cf ‖ storage-key, so the two rows carry distinct
+    /// ciphertexts and neither can be replayed into the other's slot.
+    fn edge_put_ops(&self, edge: &Edge, batch: &HashMap<ContentHash, String>) -> Result<[KvOp; 2], StoreError> {
+        let plain = serde_json::to_vec(edge).map_err(|e| StoreError::Serde(e.to_string()))?;
+        let (out_key, in_key) = (edge.key(), Self::in_key(edge));
+        let (out_val, in_val) = if self.encrypt_at_rest {
+            let tenant = self.edge_tenant(edge, batch)?;
+            let (gen, key) = self.ensure_tenant_key(&tenant)?;
+            (
+                shred::seal_at(&key, &tenant, gen, cf::EDGES_OUT, &out_key, &plain)?,
+                shred::seal_at(&key, &tenant, gen, cf::EDGES_IN, &in_key, &plain)?,
+            )
+        } else {
+            (plain.clone(), plain)
+        };
+        Ok([
+            KvOp::Put { cf: cf::EDGES_OUT.into(), key: out_key, value: out_val },
+            KvOp::Put { cf: cf::EDGES_IN.into(), key: in_key, value: in_val },
+        ])
+    }
+
+    /// Decode a stored edge value. `Ok(None)` means sealed under a destroyed
+    /// key — the tenant was crypto-shredded, so its relationships read as
+    /// forgotten (same contract as [`decode_node`](Self::decode_node)); a
+    /// failure under the live matching generation is tampering and errors.
+    /// `keys` caches keyring lookups across one scan.
+    fn decode_edge(
+        &self,
+        cf: &str,
+        key: &[u8],
+        bytes: &[u8],
+        keys: &mut HashMap<String, Option<(u32, [u8; shred::KEY_LEN])>>,
+    ) -> Result<Option<Edge>, StoreError> {
+        let Some(env) = shred::parse_envelope(bytes) else {
+            return Ok(Some(serde_json::from_slice(bytes).map_err(|e| StoreError::Serde(e.to_string()))?));
+        };
+        let live = match keys.get(&env.tenant) {
+            Some(cached) => *cached,
+            None => {
+                let live = match self.keyring_entry(&env.tenant)? {
+                    None => None,
+                    Some(e) => e.key_bytes()?.map(|k| (e.gen, k)),
+                };
+                keys.insert(env.tenant.clone(), live);
+                live
+            }
+        };
+        let Some((gen, master)) = live else { return Ok(None) };
+        if gen != env.kgen {
+            return Ok(None);
+        }
+        let plain = shred::open_at(&master, &env, cf, key)?;
         Ok(Some(serde_json::from_slice(&plain).map_err(|e| StoreError::Serde(e.to_string()))?))
     }
 
@@ -320,13 +526,40 @@ where
 
     // ---- operational meta (cursor, freshness watermark) ----
 
-    /// Store a small operational value (not part of the graph).
-    pub fn put_meta(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.kv.kv_put(cf::META, key, value).map_err(StoreError::Backend)
+    /// Store a small operational value (not part of the graph) owned by
+    /// `tenant` — the freshness watermark and sync anchors are per-repo state,
+    /// and WP-6 seals them under that repo's key so a crypto-shred forgets a
+    /// tenant's freshness/anchor trail along with its nodes and edges.
+    pub fn put_meta(&self, tenant: &str, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        let bytes = if self.encrypt_at_rest {
+            let (gen, master) = self.ensure_tenant_key(tenant)?;
+            shred::seal_at(&master, tenant, gen, cf::META, key, value)?
+        } else {
+            value.to_vec()
+        };
+        self.kv.kv_put(cf::META, key, &bytes).map_err(StoreError::Backend)
     }
 
+    /// `Ok(None)` for absent values — and for values sealed under a destroyed
+    /// key (the owning tenant was crypto-shredded). Plaintext (pre-WP-6)
+    /// values pass through unchanged.
     pub fn get_meta(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        self.kv.kv_get(cf::META, key).map_err(StoreError::Backend)
+        let Some(bytes) = self.kv.kv_get(cf::META, key).map_err(StoreError::Backend)? else {
+            return Ok(None);
+        };
+        let Some(env) = shred::parse_envelope(&bytes) else {
+            return Ok(Some(bytes));
+        };
+        let Some(entry) = self.keyring_entry(&env.tenant)? else {
+            return Ok(None);
+        };
+        let Some(master) = entry.key_bytes()? else {
+            return Ok(None);
+        };
+        if entry.gen != env.kgen {
+            return Ok(None);
+        }
+        Ok(Some(shred::open_at(&master, &env, cf::META, key)?))
     }
 
     // ---- edges ----
@@ -341,30 +574,22 @@ where
 
     /// Add an edge. Written to both the out- and in-adjacency CFs in one atomic
     /// batch so a half-written edge can never be observed. Idempotent by
-    /// (from, to, kind).
+    /// (from, to, kind). When encrypting at rest the value is sealed under the
+    /// `from` endpoint's tenant key (fallback: `to`) — see `shred` module docs.
     pub fn add_edge(&self, edge: &Edge) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(edge).map_err(|e| StoreError::Serde(e.to_string()))?;
-        let ops = vec![
-            KvOp::Put {
-                cf: cf::EDGES_OUT.into(),
-                key: edge.key(),
-                value: bytes.clone(),
-            },
-            KvOp::Put {
-                cf: cf::EDGES_IN.into(),
-                key: Self::in_key(edge),
-                value: bytes,
-            },
-        ];
+        let ops = self.edge_put_ops(edge, &HashMap::new())?;
         self.kv.kv_write_batch(&ops).map_err(StoreError::Backend)
     }
 
     /// Atomically commit a batch of nodes and edges (the unit a memory-diff
-    /// merge or an ingest tick uses).
+    /// merge or an ingest tick uses). Edges may reference nodes arriving in
+    /// the same batch — tenant resolution sees them before they are written.
     pub fn commit(&self, nodes: &[N], edges: &[Edge]) -> Result<(), StoreError> {
         let mut ops = Vec::with_capacity(nodes.len() + edges.len() * 2);
+        let mut batch_tenants: HashMap<ContentHash, String> = HashMap::with_capacity(nodes.len());
         for n in nodes {
             let bytes = self.encode_node(n)?;
+            batch_tenants.insert(n.id(), n.tenant().to_string());
             ops.push(KvOp::Put {
                 cf: cf::NODES.into(),
                 key: n.id().as_bytes().to_vec(),
@@ -372,27 +597,20 @@ where
             });
         }
         for e in edges {
-            let bytes = serde_json::to_vec(e).map_err(|e| StoreError::Serde(e.to_string()))?;
-            ops.push(KvOp::Put {
-                cf: cf::EDGES_OUT.into(),
-                key: e.key(),
-                value: bytes.clone(),
-            });
-            ops.push(KvOp::Put {
-                cf: cf::EDGES_IN.into(),
-                key: Self::in_key(e),
-                value: bytes,
-            });
+            ops.extend(self.edge_put_ops(e, &batch_tenants)?);
         }
         self.kv.kv_write_batch(&ops).map_err(StoreError::Backend)
     }
 
     fn scan_prefix(&self, cf: &str, prefix: &[u8]) -> Result<Vec<Edge>, StoreError> {
         let mut out = Vec::new();
+        let mut keys = HashMap::new();
         for (k, v) in self.kv.kv_iter_cf(cf).map_err(StoreError::Backend)? {
             if k.starts_with(prefix) {
-                let e: Edge = serde_json::from_slice(&v).map_err(|e| StoreError::Serde(e.to_string()))?;
-                out.push(e);
+                // Crypto-shredded edges decode to None: forgotten, not an error.
+                if let Some(e) = self.decode_edge(cf, &k, &v, &mut keys)? {
+                    out.push(e);
+                }
             }
         }
         Ok(out)
@@ -518,11 +736,9 @@ impl MemoryDagStore<MemoryNode> {
         }
 
         let transitioned = target.status == mem_core::Status::Active;
-        let edge_bytes = serde_json::to_vec(edge).map_err(|e| StoreError::Serde(e.to_string()))?;
-        let mut ops = vec![
-            KvOp::Put { cf: cf::EDGES_OUT.into(), key: edge.key(), value: edge_bytes.clone() },
-            KvOp::Put { cf: cf::EDGES_IN.into(), key: Self::in_key(edge), value: edge_bytes },
-        ];
+        // Sealed under the from-endpoint's tenant key when encrypting at rest
+        // (both endpoints are guaranteed present by the guards above).
+        let mut ops: Vec<KvOp> = self.edge_put_ops(edge, &HashMap::new())?.into();
         if transitioned {
             target.status = mem_core::Status::Superseded;
             target.valid_to = Some(edge.provenance.at);
@@ -757,6 +973,224 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_store_seals_edges_at_rest() {
+        let s = enc_store();
+        let (a, b) = (tenant_node("r1", "node a"), tenant_node("r1", "node b"));
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+        let mut e = edge(&a, &b, EdgeKind::Refutes);
+        e.provenance.asserter = "SECRET-ASSERTER".into();
+        e.provenance.evidence = Some("SECRET-EVIDENCE rationale".into());
+        s.add_edge(&e).unwrap();
+
+        // Round-trip through both adjacency views.
+        assert_eq!(s.out_edges(&a.compute_id()).unwrap(), vec![e.clone()]);
+        assert_eq!(s.in_edges(&b.compute_id()).unwrap(), vec![e.clone()]);
+
+        // The at-rest probe: both raw rows are envelopes and leak no content.
+        for (cf_name, key) in [(cf::EDGES_OUT, e.key()), (cf::EDGES_IN, MemoryDagStore::<MemoryNode>::in_key(&e))] {
+            let raw = s.kv.kv_get(cf_name, &key).unwrap().unwrap();
+            assert!(shred::parse_envelope(&raw).is_some(), "{cf_name} value stored sealed");
+            let raw_str = String::from_utf8_lossy(&raw);
+            assert!(!raw_str.contains("SECRET"), "{cf_name} must not leak edge content");
+            assert!(!raw_str.contains("quarantined"), "{cf_name} must not leak edge structure fields");
+        }
+
+        // Determinism: re-adding the same edge rewrites identical bytes.
+        let raw_before = s.kv.kv_get(cf::EDGES_OUT, &e.key()).unwrap().unwrap();
+        s.add_edge(&e).unwrap();
+        assert_eq!(s.kv.kv_get(cf::EDGES_OUT, &e.key()).unwrap().unwrap(), raw_before);
+    }
+
+    #[test]
+    fn encrypted_store_seals_meta_at_rest() {
+        let s = enc_store();
+        let key = b"derived_watermark:r1";
+        s.put_meta("r1", key, b"SECRET-HEAD-SHA state").unwrap();
+        assert_eq!(s.get_meta(key).unwrap().unwrap(), b"SECRET-HEAD-SHA state");
+
+        let raw = s.kv.kv_get(cf::META, key).unwrap().unwrap();
+        assert!(shred::parse_envelope(&raw).is_some(), "meta value stored sealed");
+        assert!(!String::from_utf8_lossy(&raw).contains("SECRET"), "meta must not leak");
+    }
+
+    #[test]
+    fn encrypted_commit_resolves_tenants_from_the_batch() {
+        // Edges referencing nodes that arrive in the SAME atomic batch.
+        let s = enc_store();
+        let (a, b) = (tenant_node("r1", "batch a"), tenant_node("r1", "batch b"));
+        let e = edge(&a, &b, EdgeKind::TemporalNext);
+        s.commit(&[a.clone(), b.clone()], std::slice::from_ref(&e)).unwrap();
+        assert_eq!(s.out_edges(&a.compute_id()).unwrap(), vec![e.clone()]);
+        let raw = s.kv.kv_get(cf::EDGES_OUT, &e.key()).unwrap().unwrap();
+        assert!(shred::parse_envelope(&raw).is_some());
+    }
+
+    #[test]
+    fn encrypted_add_edge_rejects_unknown_endpoints() {
+        // An edge with no stored endpoint has no tenant key to seal under —
+        // storing it in the clear would silently undermine crypto-shred.
+        let s = enc_store();
+        let (a, b) = (tenant_node("r1", "never stored a"), tenant_node("r1", "never stored b"));
+        let err = s.add_edge(&edge(&a, &b, EdgeKind::References)).unwrap_err();
+        assert!(matches!(err, StoreError::Crypto(_)));
+    }
+
+    #[test]
+    fn tampered_edge_ciphertext_is_a_hard_error_not_a_skip() {
+        let s = enc_store();
+        let (a, b) = (tenant_node("r1", "ta"), tenant_node("r1", "tb"));
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+        let e = edge(&a, &b, EdgeKind::Implements);
+        s.add_edge(&e).unwrap();
+
+        let mut raw = s.kv.kv_get(cf::EDGES_OUT, &e.key()).unwrap().unwrap();
+        let pos = String::from_utf8_lossy(&raw).find("\"ct\":\"").unwrap() + 7;
+        raw[pos] = if raw[pos] == b'0' { b'1' } else { b'0' };
+        s.kv.kv_put(cf::EDGES_OUT, &e.key(), &raw).unwrap();
+        assert!(matches!(s.out_edges(&a.compute_id()).unwrap_err(), StoreError::Crypto(_)));
+
+        // Replaying a valid ciphertext into another slot also fails (AAD binds
+        // tenant ‖ cf ‖ storage-key): copy the untouched IN row over the OUT row.
+        let in_raw = s.kv.kv_get(cf::EDGES_IN, &MemoryDagStore::<MemoryNode>::in_key(&e)).unwrap().unwrap();
+        s.kv.kv_put(cf::EDGES_OUT, &e.key(), &in_raw).unwrap();
+        assert!(matches!(s.out_edges(&a.compute_id()).unwrap_err(), StoreError::Crypto(_)));
+    }
+
+    #[test]
+    fn encrypted_store_reads_plaintext_edges_and_meta() {
+        // Pre-WP-6 rows (sealed nodes, plaintext edges/meta) stay readable
+        // before the migration runs.
+        let s = enc_store();
+        let (a, b) = (tenant_node("r1", "pa"), tenant_node("r1", "pb"));
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+        let e = edge(&a, &b, EdgeKind::References);
+        let plain = serde_json::to_vec(&e).unwrap();
+        s.kv.kv_put(cf::EDGES_OUT, &e.key(), &plain).unwrap();
+        s.kv.kv_put(cf::EDGES_IN, &MemoryDagStore::<MemoryNode>::in_key(&e), &plain).unwrap();
+        s.kv.kv_put(cf::META, b"derived_watermark:r1", b"legacy watermark").unwrap();
+
+        assert_eq!(s.out_edges(&a.compute_id()).unwrap(), vec![e]);
+        assert_eq!(s.get_meta(b"derived_watermark:r1").unwrap().unwrap(), b"legacy watermark");
+    }
+
+    #[test]
+    fn migration_seals_plaintext_edges_and_meta_in_place() {
+        // A pre-WP-6 store: nodes sealed, edges + meta plaintext.
+        let s = enc_store();
+        let (a, b) = (tenant_node("r1", "ma"), tenant_node("r1", "mb"));
+        let c = tenant_node("r2", "mc other tenant");
+        for n in [&a, &b, &c] {
+            s.put_node(n).unwrap();
+        }
+        let e1 = edge(&a, &b, EdgeKind::Implements);
+        let e2 = edge(&b, &c, EdgeKind::References); // owned by r1 (from-endpoint)
+        for e in [&e1, &e2] {
+            let plain = serde_json::to_vec(e).unwrap();
+            s.kv.kv_put(cf::EDGES_OUT, &e.key(), &plain).unwrap();
+            s.kv.kv_put(cf::EDGES_IN, &MemoryDagStore::<MemoryNode>::in_key(e), &plain).unwrap();
+        }
+        s.kv.kv_put(cf::META, b"derived_watermark:r1", b"WM-SECRET").unwrap();
+        s.kv.kv_put(cf::META, b"anchor:r2", b"ANCHOR-SECRET").unwrap();
+        // A dangling edge (both endpoints absent) cannot be protected: counted.
+        let orphan = edge(&tenant_node("rx", "gone1"), &tenant_node("rx", "gone2"), EdgeKind::References);
+        s.kv.kv_put(cf::EDGES_OUT, &orphan.key(), &serde_json::to_vec(&orphan).unwrap()).unwrap();
+
+        let report = s.migrate_seal_v2().unwrap();
+        assert!(!report.already_done);
+        assert_eq!(report.edges_sealed, 4, "2 edges x 2 adjacency rows");
+        assert_eq!(report.meta_sealed, 2);
+        assert_eq!(report.skipped_unknown_tenant, 1);
+
+        // Ciphertext probe post-migration + full round-trip.
+        for e in [&e1, &e2] {
+            let raw = s.kv.kv_get(cf::EDGES_OUT, &e.key()).unwrap().unwrap();
+            assert!(shred::parse_envelope(&raw).is_some());
+        }
+        let raw = s.kv.kv_get(cf::META, b"derived_watermark:r1").unwrap().unwrap();
+        assert!(shred::parse_envelope(&raw).is_some());
+        assert!(!String::from_utf8_lossy(&raw).contains("WM-SECRET"));
+        assert_eq!(s.out_edges(&a.compute_id()).unwrap(), vec![e1]);
+        assert_eq!(s.out_edges(&b.compute_id()).unwrap(), vec![e2.clone()]);
+        assert_eq!(s.get_meta(b"derived_watermark:r1").unwrap().unwrap(), b"WM-SECRET");
+        assert_eq!(s.get_meta(b"anchor:r2").unwrap().unwrap(), b"ANCHOR-SECRET");
+
+        // Marker-gated: the second run is a no-op point read.
+        let again = s.migrate_seal_v2().unwrap();
+        assert!(again.already_done);
+        assert_eq!(again.edges_sealed, 0);
+
+        // And the sealed edge now dies with its tenant: shred r1 forgets e1+e2.
+        s.shred_tenant("r1").unwrap();
+        assert!(s.out_edges(&a.compute_id()).unwrap().is_empty());
+        assert!(s.out_edges(&b.compute_id()).unwrap().is_empty());
+        assert_eq!(s.get_meta(b"derived_watermark:r1").unwrap(), None);
+        assert_eq!(s.get_meta(b"anchor:r2").unwrap().unwrap(), b"ANCHOR-SECRET", "r2 unaffected");
+    }
+
+    #[test]
+    fn cross_tenant_edge_is_owned_by_its_from_endpoint() {
+        let s = enc_store();
+        let (a, b) = (tenant_node("r1", "anchor"), tenant_node("r2", "analog"));
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+        let e = edge(&a, &b, EdgeKind::AnalogousTo);
+        s.add_edge(&e).unwrap();
+        let raw = s.kv.kv_get(cf::EDGES_OUT, &e.key()).unwrap().unwrap();
+        assert_eq!(shred::parse_envelope(&raw).unwrap().tenant, "r1");
+
+        // Shredding the ASSERTING tenant forgets the relationship — from both
+        // adjacency views — while the r2 endpoint node itself survives.
+        s.shred_tenant("r1").unwrap();
+        assert!(s.out_edges(&a.compute_id()).unwrap().is_empty());
+        assert!(s.in_edges(&b.compute_id()).unwrap().is_empty());
+        assert_eq!(s.get_node(&b.compute_id()).unwrap(), Some(b));
+    }
+
+    #[test]
+    fn edge_scan_overhead_is_bounded() {
+        // Coarse hot-path guard (recall/neighbors ride out_edges/in_edges):
+        // sealing edge values must not blow scans up by an order of magnitude.
+        // Bound is deliberately loose to stay CI-safe; the printed ratio is the
+        // honest number.
+        const N: usize = 150;
+        const PASSES: usize = 20;
+        let build = |s: &MemoryDagStore<MemoryNode>| {
+            let nodes: Vec<MemoryNode> = (0..N).map(|i| tenant_node("r1", &format!("n{i}"))).collect();
+            let edges: Vec<Edge> = nodes.windows(2).map(|w| edge(&w[0], &w[1], EdgeKind::TemporalNext)).collect();
+            s.commit(&nodes, &edges).unwrap();
+            nodes.iter().map(|n| n.compute_id()).collect::<Vec<_>>()
+        };
+        let time_scans = |s: &MemoryDagStore<MemoryNode>, ids: &[ContentHash]| {
+            let start = std::time::Instant::now();
+            let mut total = 0usize;
+            for _ in 0..PASSES {
+                for id in ids {
+                    total += s.out_edges(id).unwrap().len() + s.in_edges(id).unwrap().len();
+                }
+            }
+            assert_eq!(total, PASSES * (N - 1) * 2);
+            start.elapsed()
+        };
+
+        let plain = store();
+        let ids = build(&plain);
+        let enc = enc_store();
+        build(&enc);
+        let (t_plain, t_enc) = (time_scans(&plain, &ids), time_scans(&enc, &ids));
+        eprintln!(
+            "edge-scan overhead: plaintext {t_plain:?}, sealed {t_enc:?} ({:.1}x)",
+            t_enc.as_secs_f64() / t_plain.as_secs_f64().max(f64::EPSILON)
+        );
+        assert!(
+            t_enc < t_plain * 25 + std::time::Duration::from_millis(500),
+            "sealed edge scans blew the coarse overhead bound: plaintext {t_plain:?} vs sealed {t_enc:?}"
+        );
+    }
+
+    #[test]
     fn shred_forgets_one_tenant_and_rekeys_cleanly() {
         let s = enc_store();
         let n1 = tenant_node("r1", "tenant one memory");
@@ -833,6 +1267,12 @@ mod tests {
         assert_eq!(old_now.status, Status::Superseded);
         let raw = s.kv.kv_get(cf::NODES, old.compute_id().as_bytes()).unwrap().unwrap();
         assert!(shred::parse_envelope(&raw).is_some(), "transitioned node re-sealed, not leaked");
+        // WP-6: the supersedes edge itself is sealed too, in both adjacency CFs.
+        let e = &s.out_edges(&new.compute_id()).unwrap()[0];
+        for (cf_name, key) in [(cf::EDGES_OUT, e.key()), (cf::EDGES_IN, MemoryDagStore::<MemoryNode>::in_key(e))] {
+            let raw = s.kv.kv_get(cf_name, &key).unwrap().unwrap();
+            assert!(shred::parse_envelope(&raw).is_some(), "{cf_name} supersedes edge sealed");
+        }
     }
 
     #[test]

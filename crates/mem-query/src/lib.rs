@@ -1137,4 +1137,33 @@ mod tests {
         assert_eq!(out[0].direction, Direction::Out);
         assert_eq!(out[0].node.as_ref().map(|n| n.title.clone()), Some("sprint".to_string()));
     }
+
+    #[test]
+    fn recall_paths_work_over_a_sealed_store_and_forget_after_shred() {
+        // ENCRYPT-S1 WP-6: the hot query paths (search / storyline / neighbors)
+        // must round-trip unchanged over a store whose nodes AND edges are
+        // sealed at rest — and a crypto-shredded tenant must read as forgotten,
+        // never as an error.
+        let a = node("a", "ghostdag tip selection", 1);
+        let b = node("a", "tip selection follow-up", 2);
+        let s = MemoryDagStore::new_encrypted(Box::new(InMemoryKv::new()));
+        s.commit(
+            &[a.clone(), b.clone()],
+            &[plain_edge(&b, &a, EdgeKind::Implements, false)],
+        )
+        .unwrap();
+
+        let r = Recall::new(&s);
+        let hits = r.search("a", "ghostdag tip selection", 5).unwrap();
+        assert_eq!(hits.items[0].title, "ghostdag tip selection");
+        assert_eq!(r.storyline("a", 5).unwrap().items.len(), 2);
+        let out = r.neighbors(&b.compute_id(), 10).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].node.as_ref().map(|n| n.title.clone()), Some("ghostdag tip selection".into()));
+
+        s.shred_tenant("a").unwrap();
+        assert!(r.search("a", "ghostdag tip selection", 5).unwrap().items.is_empty());
+        assert!(r.storyline("a", 5).unwrap().items.is_empty());
+        assert!(r.neighbors(&b.compute_id(), 10).unwrap().is_empty(), "sealed edges die with their tenant");
+    }
 }

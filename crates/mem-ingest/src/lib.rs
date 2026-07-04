@@ -481,7 +481,7 @@ impl Ingestor {
             ingested_at_ms: now,
         };
         let bytes = serde_json::to_vec(&watermark).map_err(|e| IngestError::Serde(e.to_string()))?;
-        store.put_meta(&watermark_key(&self.repo_name), &bytes)?;
+        store.put_meta(&self.repo_name, &watermark_key(&self.repo_name), &bytes)?;
 
         Ok(IngestReport {
             commits: recs.len(),
@@ -576,7 +576,7 @@ impl Ingestor {
             ingested_at_ms: now,
         };
         let bytes = serde_json::to_vec(&watermark).map_err(|e| IngestError::Serde(e.to_string()))?;
-        store.put_meta(&watermark_key(&self.repo_name), &bytes)?;
+        store.put_meta(&self.repo_name, &watermark_key(&self.repo_name), &bytes)?;
 
         Ok(IngestReport {
             commits: recs.len(),
@@ -773,7 +773,7 @@ mod tests {
         assert!(ing.read_watermark(&store).unwrap().is_none());
         // simulate an ingest's watermark write via the store directly
         let wm = Watermark { repo: "r".into(), head: Some("aaa".into()), head_count: 1, ingested_at_ms: 7 };
-        store.put_meta(&watermark_key("r"), &serde_json::to_vec(&wm).unwrap()).unwrap();
+        store.put_meta("r", &watermark_key("r"), &serde_json::to_vec(&wm).unwrap()).unwrap();
         assert_eq!(ing.read_watermark(&store).unwrap(), Some(wm));
     }
 

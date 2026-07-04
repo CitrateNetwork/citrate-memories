@@ -129,7 +129,7 @@ pub fn anchor_tenant_to_chain(
     let anchor = anchor_tenant(store, repo, now_ms)?;
     let record = ChainAnchorRecord { anchor, checkpoint };
     let bytes = serde_json::to_vec(&record).map_err(|e| SyncError::Serde(e.to_string()))?;
-    store.put_meta(&anchor_chain_key(repo), &bytes)?;
+    store.put_meta(repo, &anchor_chain_key(repo), &bytes)?;
     Ok(record)
 }
 
