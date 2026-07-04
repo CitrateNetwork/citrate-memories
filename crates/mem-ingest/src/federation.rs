@@ -218,7 +218,7 @@ pub fn ingest_federation_meta_str(
         ingested_at_ms: now_ms,
     };
     let bytes = serde_json::to_vec(&watermark).map_err(|e| IngestError::Serde(e.to_string()))?;
-    store.put_meta(&crate::watermark_key(FEDERATION_TENANT), &bytes)?;
+    store.put_meta(FEDERATION_TENANT, &crate::watermark_key(FEDERATION_TENANT), &bytes)?;
 
     Ok(MetaReport { tenants: node_vec.len(), depends_on: edges.len(), skipped_deps: skipped, watermark })
 }

@@ -8,8 +8,11 @@
 //!
 //! Nodes are decoded through the source store (so a partially-encrypted source
 //! also works) and re-put through an encrypted destination store, which mints
-//! each tenant's key on first write. Edges and operational meta (watermarks)
-//! are structural plaintext by design and copy byte-for-byte. The destination
+//! each tenant's key on first write. Edge and meta rows are copied raw and
+//! then sealed in place by the WP-6 `migrate_seal_v2` pass (edges under their
+//! `from`-endpoint's tenant key, meta under its `prefix:{tenant}` key's
+//! tenant) — ENCRYPT-S1 WP-6: crypto-shredding a tenant must forget its
+//! relationships and freshness state, not just its nodes. The destination
 //! must not already exist.
 
 use mem_core::MemoryNode;
@@ -34,11 +37,20 @@ fn main() {
     };
     let dst_kv = RocksKv::open(&dst_path, ALL_CFS).expect("create destination db");
 
-    // Edges + meta: structural plaintext, byte-for-byte (copied on the raw kv
-    // handle before it becomes the encrypted store).
+    // Edges + meta: copy raw first (values may be plaintext or already sealed);
+    // the WP-6 migration below seals whatever arrived plaintext, once the nodes
+    // — which tenant resolution reads — are in place.
     let mut copied = 0usize;
     for cf_name in [cf::EDGES_OUT, cf::EDGES_IN, cf::META] {
         for (k, v) in src_kv.kv_iter_cf(cf_name).expect("iterate source cf") {
+            if mem_store::shred::parse_envelope(&v).is_some() {
+                // Rows sealed under the SOURCE keyring would be unreadable under
+                // the fresh destination keys. A store like this already encrypts
+                // edges/meta in place — just open it (open_rocksdb_auto runs the
+                // WP-6 in-place migration) or copy the whole directory.
+                eprintln!("reencrypt: source {cf_name} already holds sealed rows — nothing to re-encrypt; refusing to re-key");
+                std::process::exit(2);
+            }
             dst_kv.kv_put(cf_name, &k, &v).expect("copy row");
             copied += 1;
         }
@@ -58,6 +70,14 @@ fn main() {
             eprintln!("reencrypt: {}/{total} nodes sealed", i + 1);
         }
     }
+
+    // WP-6: seal the copied edge/meta rows in place, now that the nodes (which
+    // edge tenant resolution reads) are present.
+    let mig = dst.migrate_seal_v2().expect("seal edges + meta");
+    eprintln!(
+        "reencrypt: sealed {} edge rows + {} meta rows ({} skipped, unknown tenant)",
+        mig.edges_sealed, mig.meta_sealed, mig.skipped_unknown_tenant
+    );
 
     // Verify counts line up and the destination really is sealed.
     assert_eq!(dst.node_count().expect("dst node count"), total, "node count mismatch");
