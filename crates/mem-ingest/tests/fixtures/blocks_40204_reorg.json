@@ -1,0 +1,26 @@
+{
+  "comment": "Recorded eth_getBlockByNumber results for the SAME heights 149702-149703 after a re-org: different block hashes, different tx set. Replayed over blocks_40204.json to prove re-orgs are handled by supersession, never mutation (E-4 WP-1 determinism rule).",
+  "results": [
+    {
+      "number": "0x248c6",
+      "hash": "0xe20ae20ae20ae20ae20ae20ae20ae20ae20ae20ae20ae20ae20ae20a00149702",
+      "parentHash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c00149701",
+      "timestamp": "0x686a0019",
+      "transactions": [
+        {
+          "hash": "0xeeee000000000000000000000000000000000000000000000000000000000005",
+          "from": "0x4250675f9015e65fc866f3a373f82bb9dfc000c6",
+          "to": "0xf64636d56ec9e0c406149b34ea9c5c5d80b342c0",
+          "value": "0x38d7ea4c68000"
+        }
+      ]
+    },
+    {
+      "number": "0x248c7",
+      "hash": "0xe30ae30ae30ae30ae30ae30ae30ae30ae30ae30ae30ae30ae30ae30a00149703",
+      "parentHash": "0xe20ae20ae20ae20ae20ae20ae20ae20ae20ae20ae20ae20ae20ae20a00149702",
+      "timestamp": "0x686a0025",
+      "transactions": []
+    }
+  ]
+}

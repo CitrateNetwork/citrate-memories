@@ -31,6 +31,11 @@ pub enum EdgeKind {
     References,
     /// Node -> code span.
     AnchoredTo,
+    /// Chain-state (E-4): checkpoint (block) -> event observed in it. Ingest-
+    /// only, like `TemporalNext` — never proposable over MCP.
+    Emits,
+    /// Chain-state (E-4): event -> the contract node it involved. Ingest-only.
+    Touches,
 }
 
 impl EdgeKind {
@@ -51,6 +56,8 @@ impl EdgeKind {
             EdgeKind::AnalogousTo => 12,
             EdgeKind::References => 13,
             EdgeKind::AnchoredTo => 14,
+            EdgeKind::Emits => 15,
+            EdgeKind::Touches => 16,
         }
     }
 }
@@ -146,5 +153,16 @@ mod tests {
     #[test]
     fn key_length_is_fixed() {
         assert_eq!(edge("a", "b", EdgeKind::TemporalNext).key().len(), 65);
+    }
+
+    #[test]
+    fn chain_edge_tags_are_stable_and_distinct() {
+        // E-4: storage-key tags are append-only — 15/16 are claimed forever.
+        assert_eq!(EdgeKind::Emits.tag(), 15);
+        assert_eq!(EdgeKind::Touches.tag(), 16);
+        assert_ne!(
+            edge("a", "b", EdgeKind::Emits).key(),
+            edge("a", "b", EdgeKind::Touches).key()
+        );
     }
 }

@@ -11,6 +11,10 @@ description = "citrate-memories Derived-plane ingestion: git history + trailers 
 mem-core = { path = "../mem-core" }
 mem-store = { path = "../mem-store" }
 mem-index = { path = "../mem-index" }
+# E-4 WP-3: the LIVE chain-state block source reuses mem-sync's fail-closed
+# JSON-RPC client (read-only, no signer). Optional so the default build — and
+# every test, which replays recorded fixtures — stays network-free.
+mem-sync = { path = "../mem-sync", features = ["chain"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
@@ -22,6 +26,9 @@ default = []
 rocksdb = ["mem-store/rocksdb"]
 # Enables the transformer-embedder (`bge`) backfill path (mem-index/transformer).
 transformer = ["mem-index/transformer"]
+# Live RPC block source for chain-state event ingest (E-4 WP-3). Tests never
+# use it — they replay recorded transcripts in tests/fixtures/.
+chain = ["dep:mem-sync"]
 
 [[example]]
 name = "backfill"
@@ -29,4 +36,8 @@ required-features = ["rocksdb"]
 
 [[example]]
 name = "meta_ingest"
+required-features = ["rocksdb"]
+
+[[example]]
+name = "chain_ingest"
 required-features = ["rocksdb"]

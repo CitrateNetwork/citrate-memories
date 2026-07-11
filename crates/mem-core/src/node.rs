@@ -96,6 +96,19 @@ pub enum NodeKind {
     /// Federation meta-graph: one node per tenant repo (role/tier summary),
     /// living in the reserved `federation` tenant (MEM-S4 WP-4.4).
     Tenant,
+    /// Chain-state tenant (E-4, `PLANSET/08`): the network/genesis parameter
+    /// summary for one chain — one node per chainId.
+    ChainNetwork,
+    /// Chain-state tenant: a deployed contract (or precompile/AA module) at a
+    /// specific address. The address is identity-bearing, so a redeploy is a
+    /// NEW node that supersedes the old one — never a mutation.
+    ChainContract,
+    /// Chain-state tenant: an observed on-chain event (a transaction touching
+    /// a watched address). Identity = tx hash, so re-walking a range dedupes.
+    ChainEvent,
+    /// Chain-state tenant: a witnessed block (number + hash). A re-org mints a
+    /// new checkpoint at the same height that supersedes the orphaned one.
+    ChainCheckpoint,
 }
 
 impl NodeKind {
@@ -124,6 +137,10 @@ impl NodeKind {
             NodeKind::AnalogyHypothesis => "analogy_hypothesis".into(),
             NodeKind::Doc => "doc".into(),
             NodeKind::Tenant => "tenant".into(),
+            NodeKind::ChainNetwork => "chain_network".into(),
+            NodeKind::ChainContract => "chain_contract".into(),
+            NodeKind::ChainEvent => "chain_event".into(),
+            NodeKind::ChainCheckpoint => "chain_checkpoint".into(),
         }
     }
 }
@@ -311,6 +328,16 @@ mod tests {
         let mut n2 = n.clone();
         n2.content = b"different content".to_vec();
         assert_ne!(id0, n2.compute_id());
+    }
+
+    #[test]
+    fn chain_kind_discriminants_are_stable() {
+        // E-4: these strings are identity-bearing — changing them is a schema
+        // migration, exactly like the kinds above them.
+        assert_eq!(NodeKind::ChainNetwork.discriminant(), "chain_network");
+        assert_eq!(NodeKind::ChainContract.discriminant(), "chain_contract");
+        assert_eq!(NodeKind::ChainEvent.discriminant(), "chain_event");
+        assert_eq!(NodeKind::ChainCheckpoint.discriminant(), "chain_checkpoint");
     }
 
     #[test]

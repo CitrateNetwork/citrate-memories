@@ -10,6 +10,7 @@
 //! machines ingest to byte-identical node ids (the core invariant). Nothing here
 //! ever calls a model or writes a non-deterministic edge.
 
+pub mod chain;
 pub mod docs;
 pub mod federation;
 pub mod frontmatter;
@@ -50,6 +51,10 @@ pub enum IngestError {
     Serde(String),
     #[error("embedding error: {0}")]
     Embed(String),
+    /// Chain-state ingest (E-4): malformed catalog/block data or a failed RPC
+    /// round-trip. Always fail-closed — nothing is committed on this error.
+    #[error("chain ingest error: {0}")]
+    Chain(String),
 }
 
 impl From<EmbedError> for IngestError {

@@ -23,6 +23,10 @@ pub fn material_lane(kind: &NodeKind) -> &'static str {
         NodeKind::Audit | NodeKind::Finding | NodeKind::Benchmark | NodeKind::Blocker | NodeKind::TechDebt => "tests",
         NodeKind::Claim(_) | NodeKind::AgentAction | NodeKind::AnalogyHypothesis => "claims",
         NodeKind::Tenant => "tenant",
+        NodeKind::ChainNetwork
+        | NodeKind::ChainContract
+        | NodeKind::ChainEvent
+        | NodeKind::ChainCheckpoint => "chain",
     }
 }
 
@@ -314,5 +318,7 @@ mod tests {
         assert_eq!(material_lane(&NodeKind::Finding), "tests");
         assert_eq!(material_lane(&NodeKind::AgentAction), "claims");
         assert_eq!(material_lane(&NodeKind::Tenant), "tenant");
+        assert_eq!(material_lane(&NodeKind::ChainContract), "chain");
+        assert_eq!(material_lane(&NodeKind::ChainEvent), "chain");
     }
 }
