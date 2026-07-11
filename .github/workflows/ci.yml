@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # mem-ingest git tests read this repo's own full history
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
