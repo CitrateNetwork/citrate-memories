@@ -1,0 +1,60 @@
+{
+  "comment": "Recorded eth_getBlockByNumber(_, true) `result` objects from chain 40204 (staging walk, E-4 WP-3). Trimmed to the fields the ingest parser reads. Tests replay these — no live RPC ever runs in tests.",
+  "results": [
+    {
+      "number": "0x248c4",
+      "hash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c00149700",
+      "parentHash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c001496ff",
+      "timestamp": "0x686a0000",
+      "transactions": [
+        {
+          "hash": "0xaaaa000000000000000000000000000000000000000000000000000000000001",
+          "from": "0x4250675F9015E65fC866F3a373F82bb9DFc000c6",
+          "to": "0xfc514b826daee16c590f86ad83370f4fb8a1d564",
+          "value": "0xde0b6b3a7640000"
+        }
+      ]
+    },
+    {
+      "number": "0x248c5",
+      "hash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c00149701",
+      "parentHash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c00149700",
+      "timestamp": "0x686a000c",
+      "transactions": [
+        {
+          "hash": "0xbbbb000000000000000000000000000000000000000000000000000000000002",
+          "from": "0x1111111111111111111111111111111111111111",
+          "to": "0x2222222222222222222222222222222222222222",
+          "value": "0x0"
+        },
+        {
+          "hash": "0xcccc000000000000000000000000000000000000000000000000000000000003",
+          "from": "0x3333333333333333333333333333333333333333",
+          "to": "0x4250675f9015e65fc866f3a373f82bb9dfc000c6",
+          "value": "0x2386f26fc10000"
+        }
+      ]
+    },
+    {
+      "number": "0x248c6",
+      "hash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c00149702",
+      "parentHash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c00149701",
+      "timestamp": "0x686a0018",
+      "transactions": [
+        {
+          "hash": "0xdddd000000000000000000000000000000000000000000000000000000000004",
+          "from": "0x4250675f9015e65fc866f3a373f82bb9dfc000c6",
+          "to": null,
+          "value": "0x0"
+        }
+      ]
+    },
+    {
+      "number": "0x248c7",
+      "hash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c00149703",
+      "parentHash": "0xb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10cb10c00149702",
+      "timestamp": "0x686a0024",
+      "transactions": []
+    }
+  ]
+}

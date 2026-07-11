@@ -333,7 +333,7 @@ fn fwa_c10_02_unsigned_derived_supersedes_rejected_without_grant() {
     let target_id = target.compute_id();
     let usurper = node("victim-tenant", "do NOT ship; halt the release", vec![BelnapValue::True]);
     let usurper_id = usurper.compute_id();
-    victim.commit(&[target.clone()], &[]).unwrap();
+    victim.commit(std::slice::from_ref(&target), &[]).unwrap();
 
     let edge = Edge {
         from: usurper_id,
@@ -452,7 +452,7 @@ fn fwa_c10_edge_endpoint_repo_is_authorized() {
     let dst = store();
     // Far endpoint already in the store, owned by an unauthorized repo.
     let far = node("victim-tenant", "victim node", vec![BelnapValue::True]);
-    dst.commit(&[far.clone()], &[]).unwrap();
+    dst.commit(std::slice::from_ref(&far), &[]).unwrap();
 
     let near = node("citrate-chain", "attacker node", vec![BelnapValue::True]);
     let edge = Edge {

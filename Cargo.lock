@@ -1769,6 +1769,7 @@ dependencies = [
  "mem-core",
  "mem-index",
  "mem-store",
+ "mem-sync",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

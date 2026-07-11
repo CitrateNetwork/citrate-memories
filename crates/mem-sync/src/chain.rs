@@ -52,7 +52,11 @@ fn anchor_chain_key(repo: &str) -> Vec<u8> {
 }
 
 /// One JSON-RPC round-trip. Kept tiny + dependency-light (ureq, blocking).
-fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, SyncError> {
+///
+/// Public so other read-only consumers (e.g. `mem-ingest`'s chain-state event
+/// walk, E-4 WP-3) reuse the SAME fail-closed client instead of growing a
+/// second HTTP stack. Still feature-gated behind `chain`; still read-only.
+pub fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, SyncError> {
     let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let resp: serde_json::Value = ureq::post(rpc_url)
         .timeout(std::time::Duration::from_secs(15))
