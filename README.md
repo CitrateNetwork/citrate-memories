@@ -22,7 +22,9 @@ The complete design lives in [`PLANSET/`](PLANSET/):
 
 ## Webapp (Memrizz)
 The on-brand design landed; see [`webapp/`](webapp/) — the design prototype
-(1:1 source of truth) plus the Next.js 16 foundation. Built per `PLANSET/07`.
+(1:1 source of truth) plus a Next.js 16 app with auth and API routes wired to the
+gateway. Built per `PLANSET/07`. Note: this is not a paid/billed product; there
+is no billing surface.
 
 ## The core invariant
 > **Derived = deterministic & rebuildable. Asserted = nondeterministic but signed &
@@ -31,11 +33,19 @@ The on-brand design landed; see [`webapp/`](webapp/) — the design prototype
 ## Workspace (current)
 ```
 crates/
-├─ mem-core    # ontology, content-only identity, bitemporal nodes, Belnap confidence
-└─ mem-store   # generic content-addressed DAG over a KvStore backend (in-memory; RocksDB next)
+├─ mem-core     # ontology, content-only identity, bitemporal nodes, Belnap confidence
+├─ mem-store    # content-addressed DAG over a KvStore backend (RocksDB) with per-tenant
+│               #   XChaCha20-Poly1305 crypto-shredding at rest
+├─ mem-ingest   # git/docs/frontmatter/chain-state ingestion into the Derived plane
+├─ mem-index    # HNSW vector index + local embedding model
+├─ mem-query     # query surface over the DAG
+├─ mem-assert   # signed, append-only Asserted-plane records
+├─ mem-authz    # capability grants + audit chain
+├─ mem-sync     # federation merge + chain anchoring
+├─ mem-mcp      # MCP-accessible surface
+└─ mem-gateway  # HTTP control-plane: OIDC/JWKS auth, ed25519-signed writes, org/registry, webhooks
 ```
-More crates (`mem-ingest`, `mem-query`, `mem-mcp`, `mem-authz`, `mem-fed`, `mem-ml`, …)
-land per `PLANSET/05`.
+Further work lands per `PLANSET/05`.
 
 ## Build
 ```bash
@@ -44,8 +54,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Agentile
-This repo follows the [Agentile methodology](../AGENTILE.md). Active sprint:
-`MEM-S0` (Foundations) — see `citrate-federation/repos/citrate-memories/sprints/`.
+This repo follows the [Agentile methodology](../AGENTILE.md). Implementation has
+shipped well past the MEM-S0 foundations: ingestion, indexing, the gateway
+control-plane (OIDC/JWKS, signed writes), encryption-at-rest, and federation
+chain-anchoring are all in tree. The repo received its first security audit in
+2026-06 (see `.agentile/AUDIT_REF.md`); the HIGH findings were remediated on
+merged branches. Sprints live under
+`citrate-federation/repos/citrate-memories/sprints/`.
 
 ---
 © 2026 Citrate Inc.. Licensed under Apache-2.0.
