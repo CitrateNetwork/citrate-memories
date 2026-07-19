@@ -76,7 +76,11 @@ pub fn read_commits_range(
         return Err(IngestError::Git(format!("git log failed: {}", stderr.trim())));
     }
 
-    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_commit_log(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parse the separator-delimited `git log` output into records (oldest first).
+fn parse_commit_log(text: &str) -> Vec<CommitRecord> {
     let mut records = Vec::new();
     for raw in text.split(RS) {
         let raw = raw.trim_start_matches('\n');
@@ -101,7 +105,108 @@ pub fn read_commits_range(
             body: fields[5].to_string(),
         });
     }
-    Ok(records)
+    records
+}
+
+/// The pretty format shared by all commit reads.
+fn commit_pretty() -> String {
+    format!("--pretty=tformat:%H{US}%P{US}%an{US}%at{US}%s{US}%b{RS}")
+}
+
+/// Read commits in the range `exclude..include` (reachable from `include` but not
+/// from `exclude`), oldest first. This is the in-flight branch primitive
+/// (ADR-09 B.2): the commits unique to a branch are `default..branch`. Refs must be
+/// already-known-good (the caller resolves them); an unknown ref makes git fail.
+pub fn read_commits_between(
+    repo: &Path,
+    exclude: &str,
+    include: &str,
+) -> Result<Vec<CommitRecord>, IngestError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "--reverse", "--no-color"])
+        .arg(commit_pretty())
+        .arg(format!("{exclude}..{include}"))
+        .output()
+        .map_err(|e| IngestError::Git(format!("failed to run git: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(IngestError::Git(format!("git log range failed: {}", stderr.trim())));
+    }
+    Ok(parse_commit_log(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The default branch's remote-tracking ref (e.g. `origin/main`), resolved from
+/// `origin/HEAD`. Falls back to `origin/main` then `origin/master` when a mirror
+/// has no `origin/HEAD` set. This is the canonical spine the in-flight layer is
+/// measured against.
+pub fn default_branch_ref(repo: &Path) -> Result<String, IngestError> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--abbrev-ref", "origin/HEAD"])
+        .output()
+        .map_err(|e| IngestError::Git(format!("failed to run git: {e}")))?;
+    if out.status.success() {
+        let r = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !r.is_empty() && r != "origin/HEAD" {
+            return Ok(r);
+        }
+    }
+    for cand in ["origin/main", "origin/master"] {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--verify", "--quiet", cand])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Ok(cand.to_string());
+        }
+    }
+    Err(IngestError::Git("could not resolve default branch (origin/HEAD)".into()))
+}
+
+/// A non-default remote branch and its tip sha (ADR-09 B.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRef {
+    /// Bare branch name (e.g. `feat/foo`), with the `origin/` prefix stripped.
+    pub name: String,
+    pub tip: String,
+}
+
+/// Every remote branch except the default and `origin/HEAD`, with its tip. Used by
+/// the in-flight layer to enumerate parallel work. `default_ref` is `origin/<name>`.
+pub fn list_branches(repo: &Path, default_ref: &str) -> Result<Vec<BranchRef>, IngestError> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["for-each-ref", &format!("--format=%(refname:short){US}%(objectname)"), "refs/remotes/origin/"])
+        .output()
+        .map_err(|e| IngestError::Git(format!("failed to run git: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(IngestError::Git(format!("for-each-ref failed: {}", stderr.trim())));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut branches = Vec::new();
+    for line in text.lines() {
+        let (short, tip) = match line.split_once(US) {
+            Some(p) => p,
+            None => continue,
+        };
+        if short == "origin/HEAD" || short == default_ref {
+            continue;
+        }
+        let name = short.strip_prefix("origin/").unwrap_or(short).to_string();
+        if name.is_empty() {
+            continue;
+        }
+        branches.push(BranchRef { name, tip: tip.trim().to_string() });
+    }
+    Ok(branches)
 }
 
 /// Current HEAD sha (full, 40-hex). Used to stamp the watermark on incremental

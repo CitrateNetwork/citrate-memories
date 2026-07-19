@@ -13,7 +13,7 @@
 //! v1 scans the tenant on each call (linear over `all_nodes`). Fast enough at the
 //! current scale (~8k nodes); a per-tenant index/CF is a later refinement.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -313,14 +313,40 @@ impl<'a> Recall<'a> {
         self
     }
 
-    /// All non-reference nodes for a tenant repo.
+    /// All canonical (default-branch) non-reference nodes for a tenant repo. The
+    /// in-flight branch layer (ADR-09) is excluded: `Branch` meta-nodes and any
+    /// commit held by an Active branch's `BranchContains` edge are work-in-progress,
+    /// not canonical truth. (`include_in_flight`, B.4, will surface them on request.)
     fn tenant_nodes(&self, repo: &str) -> Result<Vec<MemoryNode>, StoreError> {
-        Ok(self
-            .store
-            .all_nodes()?
+        let all = self.store.all_nodes()?;
+        let in_flight = self.in_flight_commit_ids(&all)?;
+        Ok(all
             .into_iter()
-            .filter(|n| n.repo == repo && !is_reference(n))
+            .filter(|n| {
+                n.repo == repo
+                    && !is_reference(n)
+                    && n.kind != NodeKind::Branch
+                    && !in_flight.contains(&n.compute_id())
+            })
             .collect())
+    }
+
+    /// Commit ids "contained" by an Active `Branch` node (ADR-09): reachable only
+    /// from a feature branch, so in-flight, not canonical. A commit that later merges
+    /// becomes reachable from the default tip and its branch is archived (B.3), so it
+    /// drops out of this set — merge-promotion needs no per-commit rewrite.
+    fn in_flight_commit_ids(&self, all: &[MemoryNode]) -> Result<HashSet<ContentHash>, StoreError> {
+        let mut set = HashSet::new();
+        for n in all {
+            if n.kind == NodeKind::Branch && n.status == Status::Active {
+                for e in self.store.out_edges(&n.compute_id())? {
+                    if e.kind == mem_core::EdgeKind::BranchContains {
+                        set.insert(e.to);
+                    }
+                }
+            }
+        }
+        Ok(set)
     }
 
     fn watermark(&self, repo: &str) -> Option<Watermark> {
@@ -770,6 +796,48 @@ mod tests {
             quarantined: false,
             signature: None,
         }
+    }
+
+    // ---- ADR-09 in-flight branch layer: canonical purity ----
+
+    #[test]
+    fn canonical_recall_excludes_in_flight_branch_layer() {
+        // A canonical (merged) commit, a Branch meta-node, and an in-flight commit
+        // the branch "contains". Canonical recall must show ONLY the merged commit.
+        let canonical = node("r", "merged work", 100);
+        let inflight = node("r", "wip on a branch", 200);
+        let mut branch = node("r", "feat/x@tip", 150);
+        branch.kind = NodeKind::Branch;
+        branch.source_ref = SourceRef::DagNative { key: "branch:feat/x".into() };
+        branch.embedding = None;
+
+        let bc = Edge {
+            from: branch.compute_id(),
+            to: inflight.compute_id(),
+            kind: EdgeKind::BranchContains,
+            plane: Plane::Derived,
+            trust_tier: TrustTier::DerivedDeterministic,
+            provenance: EdgeProvenance { method: EdgeMethod::Ingest, asserter: "ingest".into(), at: 0, evidence: None },
+            confidence: vec![],
+            quarantined: false,
+            signature: None,
+        };
+
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        s.commit(&[canonical, inflight, branch], &[bc]).unwrap();
+
+        let titles: Vec<_> = Recall::new(&s)
+            .storyline("r", 10)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|i| i.title)
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["merged work".to_string()],
+            "canonical recall must exclude both the Branch node and its in-flight commit"
+        );
     }
 
     // ---- WP-3.4 as_of / decision-replay ----

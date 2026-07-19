@@ -41,6 +41,12 @@ fn watermark_key(repo: &str) -> Vec<u8> {
     format!("derived_watermark:{repo}").into_bytes()
 }
 
+/// Per-branch watermark key (ADR-09 B.2): last-ingested tip of one non-default
+/// branch, so branch ingest is incremental and drift is a cheap HEAD compare.
+fn branch_watermark_key(repo: &str, branch: &str) -> Vec<u8> {
+    format!("derived_branch_watermark:{repo}:{branch}").into_bytes()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error("git error: {0}")]
@@ -85,6 +91,17 @@ pub struct IngestReport {
     /// deterministic outcome of bad source directives, counted, never fatal.
     pub supersessions_rejected: usize,
     pub watermark: Watermark,
+}
+
+/// Outcome of an in-flight branch ingest pass (ADR-09 B.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchIngestReport {
+    /// Branches whose tip changed and were (re)ingested this pass.
+    pub branches_ingested: usize,
+    /// In-flight commit nodes added across those branches.
+    pub in_flight_commits: usize,
+    /// Branches skipped because their tip matched the stored per-branch watermark.
+    pub unchanged: usize,
 }
 
 fn now_millis() -> u64 {
@@ -295,6 +312,74 @@ pub fn build_graph_gated(
                 ));
             }
         }
+    }
+
+    Ok((nodes, edges))
+}
+
+/// A `Branch` meta-node (ADR-09 B.2): content carries the tip, so a moving branch
+/// mints a new node per observed tip (like a chain checkpoint) and re-ingesting the
+/// same tip is idempotent. Not embedded (it is a marker, not searchable content).
+fn branch_node(repo: &str, name: &str, tip: &str, now_ms: u64) -> MemoryNode {
+    MemoryNode {
+        schema_version: SCHEMA_VERSION,
+        plane: Plane::Derived,
+        kind: NodeKind::Branch,
+        repo: repo.to_string(),
+        author: "ingest".to_string(),
+        source_ref: SourceRef::DagNative { key: format!("branch:{name}") },
+        content: format!("{name}@{tip}").into_bytes(),
+        valid_from: now_ms,
+        valid_to: None,
+        observed_at: now_ms,
+        trust_tier: TrustTier::DerivedDeterministic,
+        signature: None,
+        embedding: None,
+        confidence: vec![BelnapValue::True],
+        anchors: vec![],
+        status: Status::Active,
+    }
+}
+
+/// Build the in-flight subgraph for one branch (ADR-09 B.2): commit nodes for the
+/// commits UNIQUE to the branch (`default..branch`), their intra-branch spine/merge
+/// edges, a `Branch` meta-node, and a `BranchContains` edge from it to each unique
+/// commit. Deliberately does NOT parse trailers: unmerged work must not retract or
+/// contradict canonical memory — that authorial act waits for merge.
+fn build_branch_graph(
+    repo: &str,
+    branch_name: &str,
+    tip: &str,
+    recs: &[CommitRecord],
+    now_ms: u64,
+    embedder: &dyn Embedder,
+) -> Result<(Vec<MemoryNode>, Vec<Edge>), IngestError> {
+    let mut sha_to_id: HashMap<String, ContentHash> = HashMap::new();
+    let mut nodes: Vec<MemoryNode> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::new();
+
+    let branch = branch_node(repo, branch_name, tip, now_ms);
+    let bid = branch.compute_id();
+    nodes.push(branch);
+
+    for rec in recs {
+        let node = commit_node(repo, rec, now_ms, embedder)?;
+        let id = node.compute_id();
+        sha_to_id.insert(rec.sha.clone(), id);
+        nodes.push(node);
+
+        // Intra-branch spine (first parent) + merges — only where the parent is
+        // itself in this unique set (the base is canonical and already ingested).
+        for (i, parent) in rec.parents.iter().enumerate() {
+            if let Some(pid) = sha_to_id.get(parent).copied() {
+                let kind = if i == 0 { EdgeKind::TemporalNext } else { EdgeKind::MergeParent };
+                edges.push(make_edge(id, pid, kind, EdgeMethod::Ingest, now_ms, Some(parent.clone())));
+            }
+        }
+
+        // The Branch node "contains" every commit unique to it (the in-flight marker
+        // canonical recall keys off).
+        edges.push(make_edge(bid, id, EdgeKind::BranchContains, EdgeMethod::Ingest, now_ms, Some(branch_name.to_string())));
     }
 
     Ok((nodes, edges))
@@ -593,6 +678,64 @@ impl Ingestor {
             watermark,
         })
     }
+
+    /// Ingest the in-flight branch layer (ADR-09 B.2): for every non-default branch,
+    /// emit its unique commits (`default..branch`) plus a `Branch` node and
+    /// `BranchContains` edges, tracked by a per-branch watermark so it is incremental
+    /// and idempotent. Canonical (default-branch) recall excludes these until they
+    /// merge; `include_in_flight` (B.4) surfaces them, clearly labeled.
+    ///
+    /// Requires a mirror with remote-tracking refs fetched (`refs/remotes/origin/*`),
+    /// which the ingest worker's `ensure_mirror` provides.
+    pub fn ingest_branches(
+        &self,
+        repo_path: &Path,
+        store: &MemoryDagStore<MemoryNode>,
+    ) -> Result<BranchIngestReport, IngestError> {
+        let root = git::repo_root(repo_path)?;
+        let default_ref = git::default_branch_ref(&root)?;
+        let branches = git::list_branches(&root, &default_ref)?;
+        let now = now_millis();
+        let mut report = BranchIngestReport::default();
+
+        for br in branches {
+            // Idempotent skip: tip unchanged since the last branch ingest.
+            let wkey = branch_watermark_key(&self.repo_name, &br.name);
+            if let Some(bytes) = store.get_meta(&wkey)? {
+                if let Ok(wm) = serde_json::from_slice::<Watermark>(&bytes) {
+                    if wm.head.as_deref() == Some(br.tip.as_str()) {
+                        report.unchanged += 1;
+                        continue;
+                    }
+                }
+            }
+
+            let recs = git::read_commits_between(&root, &default_ref, &br.tip)?;
+            let (nodes, edges) = build_branch_graph(
+                &self.repo_name,
+                &br.name,
+                &br.tip,
+                &recs,
+                now,
+                self.embedder.as_ref(),
+            )?;
+            // No trailers in the branch subgraph → no Supersedes edges → a plain commit.
+            store.commit(&nodes, &edges)?;
+
+            let wm = Watermark {
+                repo: self.repo_name.clone(),
+                head: Some(br.tip.clone()),
+                head_count: recs.len(),
+                ingested_at_ms: now,
+            };
+            let bytes = serde_json::to_vec(&wm).map_err(|e| IngestError::Serde(e.to_string()))?;
+            store.put_meta(&self.repo_name, &wkey, &bytes)?;
+
+            report.branches_ingested += 1;
+            report.in_flight_commits += recs.len();
+        }
+        Ok(report)
+    }
 }
 
 /// Apply a batch of ingest-derived supersedes edges (targets must already be
@@ -633,6 +776,74 @@ mod tests {
 
     fn embedder() -> HashingEmbedder {
         HashingEmbedder::new(EMBED_DIM)
+    }
+
+    #[test]
+    fn build_branch_graph_marks_in_flight_and_ignores_trailers() {
+        // Two commits unique to a branch; the second carries a Supersedes trailer
+        // that MUST NOT become an edge (unmerged work can't retract canonical memory).
+        let recs = vec![
+            rec("f1", &["base"], "wip one", ""),
+            rec("f2", &["f1"], "wip two", "Supersedes: ADR-01"),
+        ];
+        let (nodes, edges) = build_branch_graph("r", "feat/x", "f2", &recs, 1, &embedder()).unwrap();
+
+        assert_eq!(nodes.iter().filter(|n| n.kind == NodeKind::Branch).count(), 1, "one branch node");
+        assert_eq!(nodes.iter().filter(|n| n.kind == NodeKind::Commit).count(), 2, "two in-flight commits");
+        assert_eq!(
+            edges.iter().filter(|e| e.kind == EdgeKind::BranchContains).count(),
+            2,
+            "a BranchContains edge per unique commit"
+        );
+        assert!(!edges.iter().any(|e| e.kind == EdgeKind::Supersedes), "no trailer-derived edges from in-flight work");
+        // f2's parent f1 is in the set → one intra-branch spine edge; f1's parent
+        // `base` is canonical (not in set) → no edge.
+        assert_eq!(edges.iter().filter(|e| e.kind == EdgeKind::TemporalNext).count(), 1);
+    }
+
+    #[test]
+    fn ingest_branches_end_to_end_and_idempotent() {
+        use std::process::Command;
+        fn git(args: &[&str]) {
+            assert!(Command::new("git").args(args).status().unwrap().success(), "git {args:?}");
+        }
+        let root = std::env::temp_dir().join(format!("mem-branch-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let s = src.to_string_lossy().to_string();
+        git(&["-C", &s, "init", "-q", "-b", "main"]);
+        git(&["-C", &s, "config", "user.email", "t@t.t"]);
+        git(&["-C", &s, "config", "user.name", "t"]);
+        git(&["-C", &s, "config", "commit.gpgsign", "false"]);
+        std::fs::write(src.join("a.txt"), "1").unwrap();
+        git(&["-C", &s, "add", "."]);
+        git(&["-C", &s, "commit", "-q", "-m", "base on main"]);
+        // A feature branch with one extra commit.
+        git(&["-C", &s, "checkout", "-q", "-b", "feat/x"]);
+        std::fs::write(src.join("b.txt"), "2").unwrap();
+        git(&["-C", &s, "add", "."]);
+        git(&["-C", &s, "commit", "-q", "-m", "wip on feat/x"]);
+        git(&["-C", &s, "checkout", "-q", "main"]);
+
+        // Clone → mirror with refs/remotes/origin/* and origin/HEAD (like ensure_mirror).
+        let mirror = root.join("mirror");
+        git(&["clone", "-q", &s, &mirror.to_string_lossy()]);
+
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        let ing = Ingestor::new("repo");
+        ing.ingest(&mirror, &store).expect("canonical ingest");
+
+        let rep = ing.ingest_branches(&mirror, &store).expect("branch ingest");
+        assert_eq!(rep.branches_ingested, 1, "feat/x ingested");
+        assert_eq!(rep.in_flight_commits, 1, "one commit unique to feat/x");
+
+        // Idempotent: same tip → unchanged, nothing new.
+        let rep2 = ing.ingest_branches(&mirror, &store).expect("re-ingest");
+        assert_eq!(rep2.branches_ingested, 0);
+        assert_eq!(rep2.unchanged, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

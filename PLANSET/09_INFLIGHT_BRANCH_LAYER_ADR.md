@@ -69,6 +69,12 @@ opts in to the in-flight layer explicitly.
 
 ## Work packages
 
+**Status (2026-07-19):** B.1 done (`d5b3dc5`). B.2 done — branch ingest
+(`ingest_branches`, `build_branch_graph`, per-branch watermarks, git primitives) +
+the canonical-purity read filter (`tenant_nodes` excludes `Branch` nodes and Active
+`BranchContains` targets). 3 tests incl. real-git end-to-end + the purity invariant.
+Remaining: B.3, B.4, B.5.
+
 | WP | Title | Deliverable |
 |---|---|---|
 | B.1 | `NodeKind::Branch` + `EdgeKind::BranchContains` in mem-core (additive variants, **no `SCHEMA_VERSION` bump** — see warning) + tests | in-flight vocabulary |
