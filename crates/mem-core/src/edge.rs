@@ -36,6 +36,10 @@ pub enum EdgeKind {
     Emits,
     /// Chain-state (E-4): event -> the contract node it involved. Ingest-only.
     Touches,
+    /// In-flight branch layer (ADR-09): a `Branch` node -> a commit unique to that
+    /// branch (not yet reachable from the default tip). Ingest-only, Derived; never
+    /// proposable over MCP.
+    BranchContains,
 }
 
 impl EdgeKind {
@@ -58,6 +62,7 @@ impl EdgeKind {
             EdgeKind::AnchoredTo => 14,
             EdgeKind::Emits => 15,
             EdgeKind::Touches => 16,
+            EdgeKind::BranchContains => 17,
         }
     }
 }
@@ -162,6 +167,16 @@ mod tests {
         assert_eq!(EdgeKind::Touches.tag(), 16);
         assert_ne!(
             edge("a", "b", EdgeKind::Emits).key(),
+            edge("a", "b", EdgeKind::Touches).key()
+        );
+    }
+
+    #[test]
+    fn branch_contains_tag_is_stable_and_distinct() {
+        // ADR-09: append-only tag 17, distinct from every prior edge kind.
+        assert_eq!(EdgeKind::BranchContains.tag(), 17);
+        assert_ne!(
+            edge("a", "b", EdgeKind::BranchContains).key(),
             edge("a", "b", EdgeKind::Touches).key()
         );
     }

@@ -109,6 +109,12 @@ pub enum NodeKind {
     /// Chain-state tenant: a witnessed block (number + hash). A re-org mints a
     /// new checkpoint at the same height that supersedes the orphaned one.
     ChainCheckpoint,
+    /// In-flight branch layer (ADR-09): one node per non-default branch of a repo,
+    /// carrying the branch tip. Its `BranchContains` edges point at the commits
+    /// unique to the branch (`git rev-list default..branch`), so recall can surface
+    /// work-in-progress separately from canonical (default-branch) truth. Archived
+    /// when the branch merges (its commits become reachable from the default tip).
+    Branch,
 }
 
 impl NodeKind {
@@ -141,6 +147,7 @@ impl NodeKind {
             NodeKind::ChainContract => "chain_contract".into(),
             NodeKind::ChainEvent => "chain_event".into(),
             NodeKind::ChainCheckpoint => "chain_checkpoint".into(),
+            NodeKind::Branch => "branch".into(),
         }
     }
 }
