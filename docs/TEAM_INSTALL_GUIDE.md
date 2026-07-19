@@ -47,16 +47,38 @@ two values in once, and after that you just talk to your agent normally.
    long secret string. Treat it like a password. Do not paste it into chats or
    share it.
 2. **The gateway address:** `https://mem-gateway.citrate.ai`.
+3. **Your user id** — shown in your Memrizz profile (hover your avatar). You'll
+   paste this as `MEM_USER_SUB`.
+4. **Python 3** — already on macOS and Linux. Check with `python3 --version`; on a
+   fresh Mac, `xcode-select --install` provides it. That's the only prerequisite;
+   the connector uses the Python standard library, so there is nothing to
+   `pip install`.
+
+### Get the connector helper
+
+The connector is a tiny script the gateway serves for you. Download it once to a
+stable location (no repo checkout or GitHub access needed):
+
+```bash
+mkdir -p ~/.citrate
+curl -fsSL https://mem-gateway.citrate.ai/connector.py -o ~/.citrate/mcp-connector.py
+chmod +x ~/.citrate/mcp-connector.py
+```
+
+That endpoint is public and holds no secrets — your token is supplied separately
+at runtime (below). If you have a `citrate-memories` checkout, the same file is at
+`scripts/mcp-connector.py`.
 
 ### Install it by asking your agent
 
 You can literally ask your agent to set this up. Paste this to it (fill in your
-token where shown):
+token and user id where shown):
 
-> "Please add the Citrate Memories MCP server to my configuration. It runs at
-> `https://mem-gateway.citrate.ai`, my connect token is `PASTE_YOUR_TOKEN_HERE`,
-> and my user id is the one shown in my Memrizz profile. Use the citrate-memories
-> connector helper. After adding it, confirm you can call `memory.search`."
+> "Please add the Citrate Memories MCP server to my configuration as a **stdio**
+> server. Command: `python3`, arg: `~/.citrate/mcp-connector.py`. Set these env
+> vars on it: `MEM_GATEWAY_ORIGIN=https://mem-gateway.citrate.ai`,
+> `MEM_CONNECT_TOKEN=PASTE_YOUR_TOKEN_HERE`, `MEM_USER_SUB=PASTE_YOUR_USER_ID`.
+> After adding it, confirm you can call `memory.search`."
 
 Your agent will add an entry to its MCP settings and confirm the connection. From
 then on, you can ask things like:
@@ -77,20 +99,29 @@ project, or the global MCP settings). Replace the two placeholder values:
 {
   "mcpServers": {
     "citrate-memories": {
-      "type": "http",
-      "url": "https://mem-gateway.citrate.ai/mcp/u/YOUR_USER_ID",
-      "headers": { "Authorization": "Bearer YOUR_CONNECT_TOKEN" }
+      "command": "python3",
+      "args": ["/Users/you/.citrate/mcp-connector.py"],
+      "env": {
+        "MEM_GATEWAY_ORIGIN": "https://mem-gateway.citrate.ai",
+        "MEM_CONNECT_TOKEN": "YOUR_CONNECT_TOKEN",
+        "MEM_USER_SUB": "YOUR_USER_ID"
+      }
     }
   }
 }
 ```
 
-> Status note (2026-07-19): the direct `http` transport above depends on the
-> gateway exposing the standard MCP Streamable HTTP transport, which is part of
-> the P2 spec-alignment work. Until that ships, teammates who want the in-agent
-> path use a tiny connector helper we provide (a one-line install that speaks to
-> your agent locally and forwards to the gateway with your token). Ask the team
-> for the current connector command. Option A (browser) works today.
+Use the **absolute** path to where you saved the connector (`~` is not expanded
+inside `args`). Keeping the token in `env` (not in `args`) keeps it out of your
+process list.
+
+> Why a helper and not a plain `url`? The gateway speaks newline-delimited
+> JSON-RPC on `POST /mcp/u/:sub`, not the MCP Streamable-HTTP transport a raw
+> `"type": "http"` server entry expects. The connector bridges your agent's stdio
+> to that endpoint — stateless, ~150 lines of standard-library Python, no
+> dependencies. When the gateway later exposes Streamable HTTP directly, a plain
+> `http` entry will work and the helper becomes optional. Option A (browser) works
+> today regardless.
 
 ---
 

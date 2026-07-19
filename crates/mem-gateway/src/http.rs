@@ -78,6 +78,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/connector.py", get(connector_script))
         .route("/api/orgs/:org/layout", get(layout))
         .route("/api/orgs/:org/recall", get(recall))
         .route("/api/orgs/:org/search", get(search))
@@ -320,6 +321,29 @@ fn parse_kind(s: &str) -> NodeKind {
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "mem-gateway" }))
+}
+
+/// Serve the BYOM stdio<->HTTP connector shim so a teammate can install it with a
+/// single `curl` (see `docs/TEAM_INSTALL_GUIDE.md`, Option B). Embedded at compile
+/// time so it can never drift from the shipped `scripts/mcp-connector.py`.
+///
+/// Public + unauthenticated by design: the script holds NO secrets (the connect
+/// token is supplied by the user at runtime via env), and it must be fetchable
+/// before the user has configured anything.
+async fn connector_script() -> Response {
+    const SCRIPT: &str = include_str!("../../../scripts/mcp-connector.py");
+    (
+        [
+            (header::CONTENT_TYPE, "text/x-python; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "inline; filename=\"mcp-connector.py\"",
+            ),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        SCRIPT,
+    )
+        .into_response()
 }
 
 /// MEM-S7 WP-7.2 — GitHub push webhook. Authenticity FIRST (HMAC over the raw
