@@ -30,6 +30,19 @@ fn now_ms() -> u64 {
 }
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+/// The 2026-07-28 stateless profile. Advertised alongside the legacy version and
+/// negotiated only when the client asks for it in `initialize` — old clients keep
+/// `2024-11-05` untouched (the 12-month deprecation window).
+const PROTOCOL_VERSION_2026: &str = "2026-07-28";
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = [PROTOCOL_VERSION_2026, PROTOCOL_VERSION];
+/// Reverse-DNS `_meta` key carrying a per-request signed [`CapabilityGrant`].
+/// This is what makes the server statelessly reusable: authorization travels with
+/// the request (2026-07-28 stateless core) instead of being pinned to a session.
+const GRANT_META_KEY: &str = "ai.citrate/grant";
+/// JSON-RPC server error for a presented `_meta` grant that fails verification.
+const GRANT_REJECTED: i64 = -32001;
+/// The default schema dialect for tool schemas as of 2026-07-28 (SEP-1613).
+const JSON_SCHEMA_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// An MCP server bound to one DAG store and one capability grant (the session's
 /// authorization). One grant per session models "this agent may touch these
@@ -57,6 +70,10 @@ pub struct MemoryMcpServer<'a> {
     /// every session to ONE persistent chain (`AuditChain::open`) that survives
     /// restart; defaults to a fresh in-memory chain per server.
     audit: Arc<Mutex<AuditChain>>,
+    /// W3C `traceparent` from the current request's `_meta`, if any (2026-07-28
+    /// distributed tracing). Set for the duration of one `handle_line` and folded
+    /// into the audit detail so a call correlates from agent to graph, then cleared.
+    req_trace: Option<String>,
 }
 
 impl<'a> MemoryMcpServer<'a> {
@@ -70,6 +87,7 @@ impl<'a> MemoryMcpServer<'a> {
             index_cache: None,
             write_gate: None,
             audit: Arc::new(Mutex::new(AuditChain::new())),
+            req_trace: None,
         }
     }
 
@@ -87,6 +105,7 @@ impl<'a> MemoryMcpServer<'a> {
             index_cache: None,
             write_gate: None,
             audit: Arc::new(Mutex::new(AuditChain::new())),
+            req_trace: None,
         }
     }
 
@@ -146,9 +165,46 @@ impl<'a> MemoryMcpServer<'a> {
             Err(e) => return Some(err_response(Value::Null, -32700, &format!("parse error: {e}"))),
         };
         let id = req.get("id").cloned();
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
-        let outcome = self.dispatch(method, params);
+
+        // --- 2026-07-28 stateless profile ---
+        // Per-request context lives in `_meta`, not in a session: (a) a W3C
+        // `traceparent` for correlation, and (b) an optional signed capability
+        // grant to authorize *this* call under. Both are scoped to one request so
+        // one server instance can serve many principals behind a load balancer.
+        let meta = params.get("_meta");
+        self.req_trace = meta
+            .and_then(|m| m.get("traceparent"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let restore_grant = match meta.and_then(|m| m.get(GRANT_META_KEY)) {
+            None => None,
+            Some(raw) => match serde_json::from_value::<CapabilityGrant>(raw.clone()) {
+                Err(e) => {
+                    self.req_trace = None;
+                    return id.map(|id| err_response(id, -32602, &format!("invalid _meta grant: {e}")));
+                }
+                // Fail closed: a grant that does not verify never authorizes a call.
+                Ok(grant) => match grant.verify_signature() {
+                    Err(e) => {
+                        self.req_trace = None;
+                        return id.map(|id| err_response(id, GRANT_REJECTED, &format!("grant rejected: {e}")));
+                    }
+                    Ok(()) => Some(std::mem::replace(&mut self.grant, grant)),
+                },
+            },
+        };
+
+        let outcome = self.dispatch(&method, params);
+
+        // Restore the connection-bound grant so a per-request override never leaks
+        // into the next call — the property that makes this instance reusable.
+        if let Some(prev) = restore_grant {
+            self.grant = prev;
+        }
+        self.req_trace = None;
+
         // Notifications (no id) get no response.
         id.map(|id| match outcome {
             Ok(result) => ok_response(id, result),
@@ -156,13 +212,34 @@ impl<'a> MemoryMcpServer<'a> {
         })
     }
 
+    /// `initialize` with protocol-version negotiation. A client that asks for
+    /// `2026-07-28` gets it; anything else (including no version) gets the legacy
+    /// `2024-11-05`, so nothing old breaks. Either way we advertise the
+    /// stateless-grant capability so a caller knows it can authorize per request
+    /// via `_meta[GRANT_META_KEY]`.
+    fn initialize(&self, params: &Value) -> Value {
+        let negotiated = match params.get("protocolVersion").and_then(|v| v.as_str()) {
+            Some(v) if v == PROTOCOL_VERSION_2026 => PROTOCOL_VERSION_2026,
+            _ => PROTOCOL_VERSION,
+        };
+        json!({
+            "protocolVersion": negotiated,
+            "capabilities": {
+                "tools": {},
+                "experimental": {
+                    "ai.citrate/statelessGrant": {
+                        "metaKey": GRANT_META_KEY,
+                        "supportedProtocolVersions": SUPPORTED_PROTOCOL_VERSIONS,
+                    }
+                }
+            },
+            "serverInfo": { "name": "citrate-memories", "version": env!("CARGO_PKG_VERSION") }
+        })
+    }
+
     fn dispatch(&mut self, method: &str, params: Value) -> Result<Value, (i64, String)> {
         match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "citrate-memories", "version": env!("CARGO_PKG_VERSION") }
-            })),
+            "initialize" => Ok(self.initialize(&params)),
             "tools/list" => Ok(tools_list()),
             "tools/call" => self.tools_call(params),
             "ping" => Ok(json!({})),
@@ -198,6 +275,13 @@ impl<'a> MemoryMcpServer<'a> {
     fn authorize(&mut self, op: Op, repo: &str, detail: &str) -> Result<(), Value> {
         let resource = format!("repo:{repo}/memory");
         let now = now_ms();
+        // 2026-07-28 tracing: fold the request's `traceparent` (if any) into the
+        // audit detail so the tamper-evident log correlates with the caller's
+        // distributed trace, from agent through the graph.
+        let detail = match &self.req_trace {
+            Some(t) => format!("{detail} [trace={t}]"),
+            None => detail.to_string(),
+        };
         // Fail closed: an operation that cannot be audited does not run.
         let mut audit = match self.audit.lock() {
             Ok(g) => g,
@@ -783,7 +867,7 @@ fn store_err(e: mem_store::StoreError) -> (i64, String) {
 }
 
 fn tools_list() -> Value {
-    json!({ "tools": [
+    let mut doc = json!({ "tools": [
         {
             "name": "memory.recall",
             "description": "Budget-shaped storyline (most recent N memory nodes) for a repo tenant. Carries provenance + freshness.",
@@ -924,7 +1008,23 @@ fn tools_list() -> Value {
                 "required": ["diff"]
             }
         }
-    ]})
+    ]});
+    inject_schema_dialect(&mut doc);
+    doc
+}
+
+/// Stamp every tool's `inputSchema` with the JSON Schema 2020-12 dialect and close
+/// it to unknown properties — the default schema dialect as of 2026-07-28 (SEP-1613).
+fn inject_schema_dialect(doc: &mut Value) {
+    let Some(tools) = doc.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return;
+    };
+    for tool in tools {
+        if let Some(schema) = tool.get_mut("inputSchema").and_then(|s| s.as_object_mut()) {
+            schema.insert("$schema".into(), json!(JSON_SCHEMA_2020_12));
+            schema.entry("additionalProperties").or_insert(json!(false));
+        }
+    }
 }
 
 fn render_result(r: &RecallResult) -> String {
@@ -1039,6 +1139,132 @@ mod tests {
         };
         g.sign_with(&SigningKey::from_bytes(&[3u8; 32]));
         g
+    }
+
+    /// A signed read-only grant for an arbitrary `repo` (for the stateless
+    /// per-request `_meta` grant tests).
+    fn grant_read(repo: &str) -> CapabilityGrant {
+        let mut g = CapabilityGrant {
+            id: format!("g-{repo}"),
+            issuer: "did:human".into(),
+            recipient: format!("agent:{repo}"),
+            allowed_resources: vec![ResourceScope {
+                resource_id: format!("repo:{repo}/memory"),
+                can_read: true,
+                can_write: false,
+            }],
+            policy: PolicyProfile::ReadOnly,
+            expires_at_ms: u64::MAX,
+            revoked: false,
+            delegation_chain: vec![],
+            issuer_pubkey: vec![],
+            signature: vec![],
+        };
+        g.sign_with(&SigningKey::from_bytes(&[7u8; 32]));
+        g
+    }
+
+    #[test]
+    fn initialize_negotiates_protocol_version() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        // Legacy client (no version) keeps the legacy protocol untouched.
+        let v: Value = serde_json::from_str(
+            &srv.handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+        // A client that asks for 2026-07-28 gets it, plus the stateless-grant cap.
+        let v: Value = serde_json::from_str(
+            &srv.handle_line(
+                r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["result"]["protocolVersion"], "2026-07-28");
+        assert_eq!(
+            v["result"]["capabilities"]["experimental"]["ai.citrate/statelessGrant"]["metaKey"],
+            "ai.citrate/grant"
+        );
+    }
+
+    #[test]
+    fn tools_list_declares_json_schema_2020_12() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let v: Value = serde_json::from_str(
+            &srv.handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap(),
+        )
+        .unwrap();
+        for tool in v["result"]["tools"].as_array().unwrap() {
+            assert_eq!(
+                tool["inputSchema"]["$schema"], "https://json-schema.org/draft/2020-12/schema",
+                "tool {} must declare the 2020-12 dialect",
+                tool["name"]
+            );
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn stateless_per_request_grant_from_meta() {
+        let s = store();
+        // Connection-bound grant reads citrate-chain only.
+        let mut srv = MemoryMcpServer::new(&s, grant());
+
+        // Under the connection grant, citrate-identity is denied.
+        let denied: Value = serde_json::from_str(
+            &srv.handle_line(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(denied["result"]["isError"], true, "citrate-identity denied under connection grant");
+
+        // Same instance, a signed grant for citrate-identity in `_meta` → allowed.
+        let call = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "memory.recall",
+                "arguments": { "repo": "citrate-identity" },
+                "_meta": { "ai.citrate/grant": grant_read("citrate-identity") }
+            }
+        })
+        .to_string();
+        let ok: Value = serde_json::from_str(&srv.handle_line(&call).unwrap()).unwrap();
+        assert_eq!(ok["result"]["isError"], false, "citrate-identity allowed under the _meta grant");
+
+        // The per-request override did not leak: the connection grant is restored.
+        let again: Value = serde_json::from_str(
+            &srv.handle_line(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again["result"]["isError"], true, "connection grant restored after override");
+    }
+
+    #[test]
+    fn meta_grant_with_bad_signature_is_rejected() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let mut g = grant_read("citrate-identity");
+        // Corrupt the signature: a presented grant must fail closed.
+        g.signature = vec![0u8; g.signature.len().max(1)];
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "memory.recall",
+                "arguments": { "repo": "citrate-identity" },
+                "_meta": { "ai.citrate/grant": g }
+            }
+        })
+        .to_string();
+        let v: Value = serde_json::from_str(&srv.handle_line(&call).unwrap()).unwrap();
+        assert_eq!(v["error"]["code"], -32001, "a bad _meta grant fails closed with a JSON-RPC error");
     }
 
     #[test]
