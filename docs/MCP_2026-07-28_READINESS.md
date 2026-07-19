@@ -222,7 +222,11 @@ clients read a snapshot, the gateway owns the live store.
 - **P1 (this doc):** analysis and migration checklist.
 - **P2 (done, 2026-07-19):** mem-mcp carries the stateless profile behind a compat
   flag. See below.
-- **P3:** continuous auto-ingest (MEM-S7).
+- **P3 (code-complete 2026-07-19):** continuous auto-ingest (MEM-S7). Webhook path
+  (WP-7.2/7.3) was already wired; the WP-7.4 reconciler now sweeps every federation
+  repo (`ls-remote` HEAD vs watermark) on startup + interval, so completeness no
+  longer depends on webhook delivery. Deployment (env + org webhooks) is the
+  remaining step; branch-scope decision open (see handoff).
 - **P4:** deploy gateway, wire both entry points, ship the non-engineer guide.
 
 ### P2 as shipped (mem-mcp)
