@@ -56,17 +56,18 @@ two values in once, and after that you just talk to your agent normally.
 
 ### Get the connector helper
 
-The connector is a tiny script, `scripts/mcp-connector.py`. Put a copy somewhere
-stable so your config doesn't depend on a repo checkout:
+The connector is a tiny script the gateway serves for you. Download it once to a
+stable location (no repo checkout or GitHub access needed):
 
 ```bash
 mkdir -p ~/.citrate
-# from a citrate-memories checkout:
-cp scripts/mcp-connector.py ~/.citrate/mcp-connector.py
-# no checkout? ask the team for the file, or download it from the Memrizz
-# webapp's "Connect an agent" page, and save it to ~/.citrate/mcp-connector.py
+curl -fsSL https://mem-gateway.citrate.ai/connector.py -o ~/.citrate/mcp-connector.py
 chmod +x ~/.citrate/mcp-connector.py
 ```
+
+That endpoint is public and holds no secrets — your token is supplied separately
+at runtime (below). If you have a `citrate-memories` checkout, the same file is at
+`scripts/mcp-connector.py`.
 
 ### Install it by asking your agent
 
