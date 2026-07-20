@@ -840,6 +840,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn merged_branch_promotes_from_in_flight_to_canonical() {
+        use std::process::Command;
+        fn git(args: &[&str]) {
+            assert!(Command::new("git").args(args).status().unwrap().success(), "git {args:?}");
+        }
+        let root = std::env::temp_dir().join(format!("mem-promote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let s = src.to_string_lossy().to_string();
+        git(&["-C", &s, "init", "-q", "-b", "main"]);
+        git(&["-C", &s, "config", "user.email", "t@t.t"]);
+        git(&["-C", &s, "config", "user.name", "t"]);
+        git(&["-C", &s, "config", "commit.gpgsign", "false"]);
+        std::fs::write(src.join("a.txt"), "1").unwrap();
+        git(&["-C", &s, "add", "."]);
+        git(&["-C", &s, "commit", "-q", "-m", "base"]);
+        git(&["-C", &s, "checkout", "-q", "-b", "feat/x"]);
+        std::fs::write(src.join("b.txt"), "2").unwrap();
+        git(&["-C", &s, "add", "."]);
+        git(&["-C", &s, "commit", "-q", "-m", "feature work xyz"]);
+        git(&["-C", &s, "checkout", "-q", "main"]);
+
+        let mirror = root.join("mirror");
+        let m = mirror.to_string_lossy().to_string();
+        git(&["clone", "-q", &s, &m]);
+
+        let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let ing = Ingestor::new("repo");
+        ing.ingest(&mirror, &store).unwrap();
+        ing.ingest_branches(&mirror, &store).unwrap();
+
+        let titles = |store: &MemoryDagStore<MemoryNode>| -> Vec<String> {
+            Recall::new(store).storyline("repo", 20).unwrap().items.into_iter().map(|i| i.title).collect()
+        };
+
+        // Pre-merge: the feature work is in-flight, excluded from canonical recall.
+        assert!(
+            !titles(&store).iter().any(|t| t.contains("feature work")),
+            "in-flight work must be excluded from canonical recall before merge"
+        );
+
+        // Merge feat/x into main on the source, refresh the mirror (as ensure_mirror does).
+        git(&["-C", &s, "merge", "-q", "--no-ff", "feat/x", "-m", "merge feat/x"]);
+        git(&["-C", &m, "fetch", "origin", "--prune", "-q"]);
+        git(&["-C", &m, "reset", "--hard", "-q", "origin/HEAD"]);
+
+        // Drain: canonical incremental + reap the merged branch.
+        ing.ingest_incremental(&mirror, &store).unwrap();
+        assert!(ing.reap_branches(&mirror, &store).unwrap().merged >= 1, "feat/x reaped as merged");
+
+        // Post-merge: the same commit is now canonical (promotion, no rewrite).
+        assert!(
+            titles(&store).iter().any(|t| t.contains("feature work")),
+            "merged work must be promoted into canonical recall"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ---- WP-3.4 as_of / decision-replay ----
 
     #[test]
