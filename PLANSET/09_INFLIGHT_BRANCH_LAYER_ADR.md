@@ -2,7 +2,7 @@
 created: 2026-07-19T12:20:00Z
 branch: main
 author: Saul Loveman + Claude Opus 4.8
-status: proposed
+status: accepted
 sprint: MEM-S7-auto-ingest (extension)
 ---
 
@@ -82,7 +82,14 @@ reap idempotency, reconciler branch-drift detection. B.4 done — the read path:
 path when opted in so the HNSW cache never mixes node sets); mem-mcp
 `memory.recall`/`memory.search` gain an `include_in_flight` arg + schema and render
 `[in-flight: <branch>]`; gateway routes take `?include_in_flight=true` + emit
-`in_flight_branch`. Remaining: B.5 (adversarial/idempotency proof).
+`in_flight_branch`. B.5 done — ADR-09 COMPLETE. Canonical purity was hardened to a
+**reachability** definition (in-flight = a `BranchContains` target NOT reachable from
+the default watermark head via the commit spine), so branch-node status is irrelevant
+to purity and a force-push orphan can never leak into canonical (added
+`store.all_edges` for the reachability walk). Adversarial suite
+(`crates/mem-query/tests/branch_layer_adversarial.rs`): repeated-drain idempotency,
+trigger-order convergence, force-push-orphan purity, and merge-promotes/delete-archives
+purity — 4/4 green, plus full mem-* suites and clippy clean.
 
 | WP | Title | Deliverable |
 |---|---|---|

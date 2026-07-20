@@ -524,6 +524,13 @@ where
         Ok(out)
     }
 
+    /// Every edge in the store (one scan of the out-edge CF). For readers that need
+    /// global graph structure — e.g. reachability of a commit from a branch tip
+    /// (ADR-09 in-flight layer). O(edges).
+    pub fn all_edges(&self) -> Result<Vec<Edge>, StoreError> {
+        self.scan_prefix(cf::EDGES_OUT, &[])
+    }
+
     // ---- operational meta (cursor, freshness watermark) ----
 
     /// Store a small operational value (not part of the graph) owned by

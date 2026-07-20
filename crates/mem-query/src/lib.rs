@@ -13,7 +13,7 @@
 //! v1 scans the tenant on each call (linear over `all_nodes`). Fast enough at the
 //! current scale (~8k nodes); a per-tenant index/CF is a later refinement.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -342,7 +342,7 @@ impl<'a> Recall<'a> {
         repo: &str,
     ) -> Result<(Vec<MemoryNode>, HashMap<ContentHash, String>), StoreError> {
         let all = self.store.all_nodes()?;
-        let in_flight = self.in_flight_map(&all)?;
+        let in_flight = self.in_flight_map(repo, &all)?;
         let nodes = all
             .into_iter()
             .filter(|n| {
@@ -359,26 +359,79 @@ impl<'a> Recall<'a> {
         Ok(self.tenant_scan(repo)?.0)
     }
 
-    /// Map of in-flight commit id → the branch that contains it (ADR-09). A commit
-    /// held by an Active `Branch` node's `BranchContains` edge is reachable only from
-    /// that feature branch. On merge the branch archives (B.3), so it leaves this map
-    /// — merge-promotion needs no per-commit rewrite.
-    fn in_flight_map(&self, all: &[MemoryNode]) -> Result<HashMap<ContentHash, String>, StoreError> {
+    /// Map of in-flight commit id → the branch that contains it (ADR-09). In-flight is
+    /// defined by **reachability**: a commit that a `BranchContains` edge points at but
+    /// that is NOT reachable from the default watermark head (the canonical spine). This
+    /// is robust to every trigger order and to force-push orphans — only genuinely
+    /// merged commits (reachable from the default head) ever count as canonical, so a
+    /// branch node's status is irrelevant to purity (reap is pure housekeeping).
+    fn in_flight_map(
+        &self,
+        repo: &str,
+        all: &[MemoryNode],
+    ) -> Result<HashMap<ContentHash, String>, StoreError> {
+        let reachable = self.canonical_reachable(repo, all)?;
         let mut map = HashMap::new();
-        for n in all {
-            if n.kind == NodeKind::Branch && n.status == Status::Active {
-                let branch = String::from_utf8_lossy(&n.content)
-                    .rsplit_once('@')
-                    .map(|(name, _)| name.to_string())
-                    .unwrap_or_default();
-                for e in self.store.out_edges(&n.compute_id())? {
-                    if e.kind == mem_core::EdgeKind::BranchContains {
-                        map.entry(e.to).or_insert_with(|| branch.clone());
+        // Active branches first so a live branch's name wins the label over an archived
+        // one when both point at the same still-unmerged commit.
+        for want_active in [true, false] {
+            for n in all {
+                if n.repo == repo && n.kind == NodeKind::Branch && (n.status == Status::Active) == want_active {
+                    let branch = String::from_utf8_lossy(&n.content)
+                        .rsplit_once('@')
+                        .map(|(name, _)| name.to_string())
+                        .unwrap_or_default();
+                    for e in self.store.out_edges(&n.compute_id())? {
+                        if e.kind == mem_core::EdgeKind::BranchContains && !reachable.contains(&e.to) {
+                            map.entry(e.to).or_insert_with(|| branch.clone());
+                        }
                     }
                 }
             }
         }
         Ok(map)
+    }
+
+    /// The set of commit ids reachable from the tenant's default watermark head via
+    /// the commit spine (`TemporalNext`/`MergeParent`) — i.e. the canonical (merged)
+    /// history. Empty when the tenant has no watermark yet.
+    fn canonical_reachable(
+        &self,
+        repo: &str,
+        all: &[MemoryNode],
+    ) -> Result<HashSet<ContentHash>, StoreError> {
+        let head_sha = match self.watermark(repo).and_then(|w| w.head) {
+            Some(h) => h,
+            None => return Ok(HashSet::new()),
+        };
+        let mut sha_to_id: HashMap<&str, ContentHash> = HashMap::new();
+        for n in all {
+            if n.repo == repo && n.kind == NodeKind::Commit {
+                if let SourceRef::GitCommit { sha, .. } = &n.source_ref {
+                    sha_to_id.insert(sha.as_str(), n.compute_id());
+                }
+            }
+        }
+        let head_id = match sha_to_id.get(head_sha.as_str()) {
+            Some(id) => *id,
+            None => return Ok(HashSet::new()),
+        };
+        let mut parents: HashMap<ContentHash, Vec<ContentHash>> = HashMap::new();
+        for e in self.store.all_edges()? {
+            if matches!(e.kind, mem_core::EdgeKind::TemporalNext | mem_core::EdgeKind::MergeParent) {
+                parents.entry(e.from).or_default().push(e.to);
+            }
+        }
+        let mut reachable = HashSet::new();
+        let mut stack = vec![head_id];
+        while let Some(id) = stack.pop() {
+            if reachable.insert(id) {
+                if let Some(ps) = parents.get(&id) {
+                    stack.extend(ps.iter().copied());
+                }
+            }
+        }
+        Ok(reachable)
     }
 
     fn watermark(&self, repo: &str) -> Option<Watermark> {
