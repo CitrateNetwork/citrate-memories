@@ -104,6 +104,20 @@ pub struct BranchIngestReport {
     pub unchanged: usize,
 }
 
+/// Outcome of a branch-reap pass (ADR-09 B.3): archiving `Branch` nodes that no
+/// longer represent live in-flight work. An archived branch's commits drop out of
+/// the canonical-recall exclusion set — merge-promotion with no per-commit rewrite.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReapReport {
+    pub archived: usize,
+    /// Tip is now reachable from the default branch (the work landed).
+    pub merged: usize,
+    /// The branch no longer exists on the remote.
+    pub deleted: usize,
+    /// A newer tip superseded this node's tip (stale observation).
+    pub advanced: usize,
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -711,6 +725,21 @@ impl Ingestor {
             }
 
             let recs = git::read_commits_between(&root, &default_ref, &br.tip)?;
+            if recs.is_empty() {
+                // Nothing unique to this branch (it points at, or is fully merged
+                // into, the default). Record the tip so we don't re-check, but create
+                // no Branch node — there is no in-flight work to surface.
+                let wm = Watermark {
+                    repo: self.repo_name.clone(),
+                    head: Some(br.tip.clone()),
+                    head_count: 0,
+                    ingested_at_ms: now,
+                };
+                let bytes = serde_json::to_vec(&wm).map_err(|e| IngestError::Serde(e.to_string()))?;
+                store.put_meta(&self.repo_name, &wkey, &bytes)?;
+                report.unchanged += 1;
+                continue;
+            }
             let (nodes, edges) = build_branch_graph(
                 &self.repo_name,
                 &br.name,
@@ -733,6 +762,82 @@ impl Ingestor {
 
             report.branches_ingested += 1;
             report.in_flight_commits += recs.len();
+        }
+        Ok(report)
+    }
+
+    /// Read back one branch's watermark (None if never ingested). Public so the
+    /// reconciler (mem-gateway) can detect branch drift without re-ingesting.
+    pub fn read_branch_watermark(
+        &self,
+        store: &MemoryDagStore<MemoryNode>,
+        branch: &str,
+    ) -> Result<Option<Watermark>, IngestError> {
+        match store.get_meta(&branch_watermark_key(&self.repo_name, branch))? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| IngestError::Serde(e.to_string()))?,
+            )),
+        }
+    }
+
+    /// Archive `Branch` nodes that no longer represent live in-flight work (ADR-09
+    /// B.3): a branch that MERGED (tip is now an ancestor of the default tip), was
+    /// DELETED on the remote, or was superseded by a newer tip (ADVANCED). Archiving
+    /// flips the node's status so its `BranchContains` commits leave the canonical
+    /// exclusion set — merge-promotion needs no per-commit rewrite. Idempotent:
+    /// already-Archived nodes are skipped.
+    ///
+    /// Requires the same fetched mirror `ingest_branches` uses (remote-tracking refs
+    /// + `HEAD` at the default tip).
+    pub fn reap_branches(
+        &self,
+        repo_path: &Path,
+        store: &MemoryDagStore<MemoryNode>,
+    ) -> Result<ReapReport, IngestError> {
+        let root = git::repo_root(repo_path)?;
+        let default_ref = git::default_branch_ref(&root)?;
+        let live: HashMap<String, String> = git::list_branches(&root, &default_ref)?
+            .into_iter()
+            .map(|b| (b.name, b.tip))
+            .collect();
+        let now = now_millis();
+        let mut report = ReapReport::default();
+
+        for node in store.all_nodes()? {
+            if node.kind != NodeKind::Branch
+                || node.repo != self.repo_name
+                || node.status != Status::Active
+            {
+                continue;
+            }
+            // Branch node content is `name@tip`; sha has no '@', so split on the last.
+            let content = String::from_utf8_lossy(&node.content);
+            let (name, tip) = match content.rsplit_once('@') {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let reason = if !live.contains_key(name) {
+                Some("deleted")
+            } else if live.get(name).map(String::as_str) != Some(tip) {
+                Some("advanced") // a newer Branch node already covers the current tip
+            } else if git::is_ancestor(&root, tip).unwrap_or(false) {
+                Some("merged") // tip reachable from the default HEAD → the work landed
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
+                if store.set_node_status(&node.compute_id(), Status::Archived, Some(now))? {
+                    report.archived += 1;
+                    match reason {
+                        "merged" => report.merged += 1,
+                        "deleted" => report.deleted += 1,
+                        _ => report.advanced += 1,
+                    }
+                }
+            }
         }
         Ok(report)
     }
@@ -842,6 +947,52 @@ mod tests {
         let rep2 = ing.ingest_branches(&mirror, &store).expect("re-ingest");
         assert_eq!(rep2.branches_ingested, 0);
         assert_eq!(rep2.unchanged, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reap_branches_archives_deleted_branch_idempotently() {
+        use std::process::Command;
+        fn git(args: &[&str]) {
+            assert!(Command::new("git").args(args).status().unwrap().success(), "git {args:?}");
+        }
+        let root = std::env::temp_dir().join(format!("mem-reap-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let s = src.to_string_lossy().to_string();
+        git(&["-C", &s, "init", "-q", "-b", "main"]);
+        git(&["-C", &s, "config", "user.email", "t@t.t"]);
+        git(&["-C", &s, "config", "user.name", "t"]);
+        git(&["-C", &s, "config", "commit.gpgsign", "false"]);
+        std::fs::write(src.join("a.txt"), "1").unwrap();
+        git(&["-C", &s, "add", "."]);
+        git(&["-C", &s, "commit", "-q", "-m", "base"]);
+        git(&["-C", &s, "checkout", "-q", "-b", "feat/x"]);
+        std::fs::write(src.join("b.txt"), "2").unwrap();
+        git(&["-C", &s, "add", "."]);
+        git(&["-C", &s, "commit", "-q", "-m", "wip"]);
+        git(&["-C", &s, "checkout", "-q", "main"]);
+
+        let mirror = root.join("mirror");
+        let m = mirror.to_string_lossy().to_string();
+        git(&["clone", "-q", &s, &m]);
+
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        let ing = Ingestor::new("repo");
+        ing.ingest(&mirror, &store).unwrap();
+        ing.ingest_branches(&mirror, &store).unwrap();
+
+        // Delete the feature branch on the remote, prune the mirror.
+        git(&["-C", &s, "branch", "-D", "feat/x"]);
+        git(&["-C", &m, "fetch", "origin", "--prune", "-q"]);
+
+        let reap = ing.reap_branches(&mirror, &store).unwrap();
+        assert_eq!(reap.deleted, 1, "deleted branch archived");
+        assert_eq!(reap.archived, 1);
+        // Idempotent: an already-archived branch is not re-archived.
+        assert_eq!(ing.reap_branches(&mirror, &store).unwrap().archived, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }

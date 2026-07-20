@@ -750,6 +750,35 @@ impl MemoryDagStore<MemoryNode> {
         self.kv.kv_write_batch(&ops).map_err(StoreError::Backend)?;
         Ok(SupersessionReport { transitioned })
     }
+
+    /// Overwrite a node's advisory `status` (and optionally `valid_to`) in place.
+    /// `status`/`valid_to` are outside `compute_id`, so the node id is preserved —
+    /// this is an advisory update, not a new node. Returns `true` if the node
+    /// existed and its status actually changed. Used by the in-flight branch layer
+    /// (ADR-09 B.3) to archive merged/deleted branch nodes.
+    pub fn set_node_status(
+        &self,
+        id: &ContentHash,
+        status: mem_core::Status,
+        valid_to: Option<mem_core::Timestamp>,
+    ) -> Result<bool, StoreError> {
+        let mut node = match self.get_node(id)? {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+        if node.status == status {
+            return Ok(false);
+        }
+        node.status = status;
+        if valid_to.is_some() {
+            node.valid_to = valid_to;
+        }
+        let node_bytes = self.encode_node(&node)?;
+        self.kv
+            .kv_write_batch(&[KvOp::Put { cf: cf::NODES.into(), key: id.as_bytes().to_vec(), value: node_bytes }])
+            .map_err(StoreError::Backend)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

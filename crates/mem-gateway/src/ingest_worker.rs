@@ -25,7 +25,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mem_core::{MemoryNode, VersionedVector};
+use mem_core::{MemoryNode, NodeKind, Status, VersionedVector};
 use mem_index::{EmbedError, Embedder};
 use mem_ingest::Ingestor;
 use mem_store::MemoryDagStore;
@@ -169,6 +169,31 @@ pub fn drain_once(state: &AppState, base: &Path) -> usize {
             }
             Err(e) => tracing::error!("mem-ingest: ingest {repo} failed: {e}"),
         }
+
+        // ADR-09 B.3: in-flight branch layer, under the same write gate. Ingest
+        // non-default branches, then reap merged/deleted/advanced Branch nodes so
+        // canonical recall promotes merged work automatically. Best-effort: a branch
+        // failure never blocks the canonical ingest above.
+        match ingestor.ingest_branches(&path, &state.store) {
+            Ok(r) if r.branches_ingested > 0 => tracing::info!(
+                "mem-ingest: {repo} in-flight +{} branch(es) (+{} commits)",
+                r.branches_ingested,
+                r.in_flight_commits
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("mem-ingest: branch ingest {repo} failed: {e}"),
+        }
+        match ingestor.reap_branches(&path, &state.store) {
+            Ok(r) if r.archived > 0 => tracing::info!(
+                "mem-ingest: {repo} reaped {} branch(es) (merged {} / deleted {} / advanced {})",
+                r.archived,
+                r.merged,
+                r.deleted,
+                r.advanced
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("mem-ingest: branch reap {repo} failed: {e}"),
+        }
     }
     ingested
 }
@@ -229,10 +254,69 @@ fn is_drifted(watermark_head: Option<&str>, remote_head: &str) -> bool {
     }
 }
 
-/// The testable core of WP-7.4: for every federation repo, compare remote HEAD to
-/// the stored watermark and enqueue the drifted ones (skipping repos already queued
-/// by a webhook or an earlier sweep). Returns how many it enqueued. Does not ingest
-/// — the single-writer drain loop does that, so reconcile stays lock-light.
+/// The default branch name and every branch tip from the remote, via `ls-remote`
+/// (no fetch): `(default_name, [(name, tip)])`. Lets the reconciler catch
+/// branch-only drift — a push to a feature branch that never touches the default.
+fn remote_branches(repo: &str) -> Result<(String, Vec<(String, String)>), String> {
+    let url = format!("{}/{}.git", git_base(), repo);
+    let sym = git_stdout(&["ls-remote", "--symref", &url, "HEAD"])?;
+    let default = sym
+        .lines()
+        .find_map(|l| l.strip_prefix("ref:").and_then(|r| r.split_whitespace().next()))
+        .and_then(|r| r.strip_prefix("refs/heads/"))
+        .unwrap_or("")
+        .to_string();
+    let heads = git_stdout(&["ls-remote", "--heads", &url])?;
+    let mut out = Vec::new();
+    for line in heads.lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(sha), Some(refname)) = (it.next(), it.next()) {
+            if let Some(name) = refname.strip_prefix("refs/heads/") {
+                out.push((name.to_string(), sha.to_string()));
+            }
+        }
+    }
+    Ok((default, out))
+}
+
+/// True if any non-default branch has moved relative to its stored watermark (new
+/// or advanced), or an Active `Branch` node's branch has vanished from the remote
+/// (deleted/merged). Either way the repo needs a drain, which ingests + reaps.
+fn branch_drifted(repo: &str, store: &MemoryDagStore<MemoryNode>, all: &[MemoryNode]) -> bool {
+    let (default, branches) = match remote_branches(repo) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("reconcile: ls-remote --heads {repo} failed: {e}");
+            return false;
+        }
+    };
+    let ing = Ingestor::new(repo.to_string());
+    for (name, tip) in &branches {
+        if *name == default {
+            continue;
+        }
+        let seen = ing.read_branch_watermark(store, name).ok().flatten().and_then(|w| w.head);
+        if seen.as_deref() != Some(tip.as_str()) {
+            return true; // new or advanced feature branch
+        }
+    }
+    let live: HashSet<&str> = branches.iter().map(|(n, _)| n.as_str()).collect();
+    all.iter().any(|n| {
+        n.kind == NodeKind::Branch
+            && n.repo == repo
+            && n.status == Status::Active
+            && String::from_utf8_lossy(&n.content)
+                .rsplit_once('@')
+                .map(|(name, _)| !live.contains(name))
+                .unwrap_or(false)
+    })
+}
+
+/// The testable core of WP-7.4 (+ ADR-09 B.3): for every federation repo, enqueue
+/// it if its default HEAD drifted from the watermark OR any feature branch drifted
+/// (new/advanced/deleted). Skips repos already queued by a webhook or an earlier
+/// sweep. Does not ingest — the single-writer drain loop does that, so reconcile
+/// stays lock-light.
 pub fn reconcile_into_queue(
     store: &MemoryDagStore<MemoryNode>,
     queue: &Mutex<VecDeque<PushEvent>>,
@@ -242,6 +326,8 @@ pub fn reconcile_into_queue(
         let q = queue.lock().unwrap_or_else(|p| p.into_inner());
         q.iter().map(|e| e.repo.clone()).collect()
     };
+    // One snapshot for branch-node lookups (deleted-branch detection) this sweep.
+    let all = store.all_nodes().unwrap_or_default();
     let mut enqueued = 0;
     for repo in federation_repos(base) {
         if already.contains(&repo) {
@@ -255,7 +341,8 @@ pub fn reconcile_into_queue(
             }
         };
         let wm = Ingestor::new(repo.clone()).read_watermark(store).ok().flatten();
-        if is_drifted(wm.as_ref().and_then(|w| w.head.as_deref()), &remote) {
+        let default_drift = is_drifted(wm.as_ref().and_then(|w| w.head.as_deref()), &remote);
+        if default_drift || branch_drifted(&repo, store, &all) {
             queue
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -392,6 +479,38 @@ mod tests {
         assert!(is_drifted(None, "abc"), "never-ingested is drifted");
         assert!(is_drifted(Some("abc"), "def"), "moved head is drifted");
         assert!(!is_drifted(Some("abc"), "abc"), "unchanged head is current");
+    }
+
+    #[test]
+    fn branch_drifted_detects_new_feature_branch() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("mem-bdrift-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("remotes").join("citrate-b.git");
+        std::fs::create_dir_all(&src).unwrap();
+        let s = src.to_string_lossy().to_string();
+        run(&["-C", &s, "init", "-q", "-b", "main"]);
+        run(&["-C", &s, "config", "user.email", "t@t.t"]);
+        run(&["-C", &s, "config", "user.name", "t"]);
+        run(&["-C", &s, "config", "commit.gpgsign", "false"]);
+        std::fs::write(src.join("a.txt"), "1").unwrap();
+        run(&["-C", &s, "add", "."]);
+        run(&["-C", &s, "commit", "-q", "-m", "base"]);
+        run(&["-C", &s, "checkout", "-q", "-b", "feat/y"]);
+        std::fs::write(src.join("b.txt"), "2").unwrap();
+        run(&["-C", &s, "add", "."]);
+        run(&["-C", &s, "commit", "-q", "-m", "wip"]);
+        run(&["-C", &s, "checkout", "-q", "main"]); // HEAD back to the default
+
+        std::env::set_var("MEM_INGEST_GIT_BASE", root.join("remotes").to_string_lossy().to_string());
+        let store = MemoryDagStore::new(Box::new(mem_store::kv::InMemoryKv::new()));
+        // A non-default branch with no per-branch watermark is drift → needs a drain.
+        assert!(branch_drifted("citrate-b", &store, &[]), "a new feature branch must register as drift");
+
+        std::env::remove_var("MEM_INGEST_GIT_BASE");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

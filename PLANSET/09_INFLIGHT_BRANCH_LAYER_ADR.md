@@ -69,11 +69,14 @@ opts in to the in-flight layer explicitly.
 
 ## Work packages
 
-**Status (2026-07-19):** B.1 done (`d5b3dc5`). B.2 done — branch ingest
-(`ingest_branches`, `build_branch_graph`, per-branch watermarks, git primitives) +
-the canonical-purity read filter (`tenant_nodes` excludes `Branch` nodes and Active
-`BranchContains` targets). 3 tests incl. real-git end-to-end + the purity invariant.
-Remaining: B.3, B.4, B.5.
+**Status (2026-07-19):** B.1 done (`d5b3dc5`). B.2 done (`0517e05`) — branch ingest +
+canonical-purity read filter. B.3 done — the layer is LIVE: the drain path runs
+`ingest_branches` + `reap_branches` under the write gate, and the reconciler enqueues
+on branch drift (new/advanced/deleted, via `ls-remote --symref/--heads` vs per-branch
+watermarks + Active branch nodes). Archive-on-merge/delete/advance via a new
+`store.set_node_status` (id-preserving advisory update); merged commits promote to
+canonical with no rewrite. Tests: merge-promotion lifecycle end-to-end, deleted-branch
+reap idempotency, reconciler branch-drift detection. Remaining: B.4, B.5.
 
 | WP | Title | Deliverable |
 |---|---|---|
