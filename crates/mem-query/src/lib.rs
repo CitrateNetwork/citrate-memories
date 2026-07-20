@@ -13,7 +13,7 @@
 //! v1 scans the tenant on each call (linear over `all_nodes`). Fast enough at the
 //! current scale (~8k nodes); a per-tenant index/CF is a later refinement.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +39,10 @@ pub struct RecallItem {
     pub status: Status,
     /// Similarity score for `search`; `None` for `storyline`/`neighbors`.
     pub score: Option<f32>,
+    /// ADR-09: when this item is in-flight (reachable only from a feature branch,
+    /// not yet merged), the branch it lives on. `None` = canonical (merged) truth.
+    /// Only ever populated when the caller opts in via `with_in_flight(true)`.
+    pub in_flight_branch: Option<String>,
 }
 
 impl RecallItem {
@@ -54,6 +58,7 @@ impl RecallItem {
             source: n.source_ref.clone(),
             status: n.status,
             score,
+            in_flight_branch: None,
         }
     }
 }
@@ -285,6 +290,9 @@ pub struct Recall<'a> {
     store: &'a MemoryDagStore<MemoryNode>,
     embedder: Box<dyn Embedder>,
     index_cache: Option<Arc<TenantIndexCache>>,
+    /// ADR-09 B.4: surface the in-flight branch layer in `storyline`/`search`.
+    /// Off by default — canonical (default-branch) truth only.
+    include_in_flight: bool,
 }
 
 impl<'a> Recall<'a> {
@@ -297,13 +305,14 @@ impl<'a> Recall<'a> {
             store,
             embedder: Box::new(HashingEmbedder::new(EMBED_DIM)),
             index_cache: None,
+            include_in_flight: false,
         }
     }
 
     /// Recall whose query embedder is explicit — must match the model the tenant's
     /// nodes were embedded with, or `search`'s vector-space guard rejects the query.
     pub fn with_embedder(store: &'a MemoryDagStore<MemoryNode>, embedder: Box<dyn Embedder>) -> Self {
-        Self { store, embedder, index_cache: None }
+        Self { store, embedder, index_cache: None, include_in_flight: false }
     }
 
     /// Serve `search` from a shared [`TenantIndexCache`] (HNSW, built once per
@@ -313,40 +322,63 @@ impl<'a> Recall<'a> {
         self
     }
 
-    /// All canonical (default-branch) non-reference nodes for a tenant repo. The
-    /// in-flight branch layer (ADR-09) is excluded: `Branch` meta-nodes and any
-    /// commit held by an Active branch's `BranchContains` edge are work-in-progress,
-    /// not canonical truth. (`include_in_flight`, B.4, will surface them on request.)
-    fn tenant_nodes(&self, repo: &str) -> Result<Vec<MemoryNode>, StoreError> {
+    /// Surface the in-flight branch layer (ADR-09 B.4) in `storyline`/`search`:
+    /// commits reachable only from a feature branch are included and each carries
+    /// its `in_flight_branch`. Off by default — canonical (default-branch) truth
+    /// only, so the trust guarantee holds unless a caller explicitly opts in.
+    pub fn with_in_flight(mut self, yes: bool) -> Self {
+        self.include_in_flight = yes;
+        self
+    }
+
+    /// Non-reference tenant nodes plus the in-flight commit→branch label map. By
+    /// default (`include_in_flight = false`) the in-flight branch layer (ADR-09) is
+    /// excluded — `Branch` meta-nodes and any commit held by an Active branch's
+    /// `BranchContains` edge — so canonical recall is pure. When opted in, in-flight
+    /// commits are kept (and the map lets the caller label them); `Branch` meta-nodes
+    /// are always excluded from results (they are the mechanism, not content).
+    fn tenant_scan(
+        &self,
+        repo: &str,
+    ) -> Result<(Vec<MemoryNode>, HashMap<ContentHash, String>), StoreError> {
         let all = self.store.all_nodes()?;
-        let in_flight = self.in_flight_commit_ids(&all)?;
-        Ok(all
+        let in_flight = self.in_flight_map(&all)?;
+        let nodes = all
             .into_iter()
             .filter(|n| {
                 n.repo == repo
                     && !is_reference(n)
                     && n.kind != NodeKind::Branch
-                    && !in_flight.contains(&n.compute_id())
+                    && (self.include_in_flight || !in_flight.contains_key(&n.compute_id()))
             })
-            .collect())
+            .collect();
+        Ok((nodes, in_flight))
     }
 
-    /// Commit ids "contained" by an Active `Branch` node (ADR-09): reachable only
-    /// from a feature branch, so in-flight, not canonical. A commit that later merges
-    /// becomes reachable from the default tip and its branch is archived (B.3), so it
-    /// drops out of this set — merge-promotion needs no per-commit rewrite.
-    fn in_flight_commit_ids(&self, all: &[MemoryNode]) -> Result<HashSet<ContentHash>, StoreError> {
-        let mut set = HashSet::new();
+    fn tenant_nodes(&self, repo: &str) -> Result<Vec<MemoryNode>, StoreError> {
+        Ok(self.tenant_scan(repo)?.0)
+    }
+
+    /// Map of in-flight commit id → the branch that contains it (ADR-09). A commit
+    /// held by an Active `Branch` node's `BranchContains` edge is reachable only from
+    /// that feature branch. On merge the branch archives (B.3), so it leaves this map
+    /// — merge-promotion needs no per-commit rewrite.
+    fn in_flight_map(&self, all: &[MemoryNode]) -> Result<HashMap<ContentHash, String>, StoreError> {
+        let mut map = HashMap::new();
         for n in all {
             if n.kind == NodeKind::Branch && n.status == Status::Active {
+                let branch = String::from_utf8_lossy(&n.content)
+                    .rsplit_once('@')
+                    .map(|(name, _)| name.to_string())
+                    .unwrap_or_default();
                 for e in self.store.out_edges(&n.compute_id())? {
                     if e.kind == mem_core::EdgeKind::BranchContains {
-                        set.insert(e.to);
+                        map.entry(e.to).or_insert_with(|| branch.clone());
                     }
                 }
             }
         }
-        Ok(set)
+        Ok(map)
     }
 
     fn watermark(&self, repo: &str) -> Option<Watermark> {
@@ -355,7 +387,7 @@ impl<'a> Recall<'a> {
 
     /// Recency-ordered storyline for a tenant. `budget` caps the item count.
     pub fn storyline(&self, repo: &str, budget: usize) -> Result<RecallResult, StoreError> {
-        let mut nodes = self.tenant_nodes(repo)?;
+        let (mut nodes, in_flight) = self.tenant_scan(repo)?;
         let total = nodes.len();
         // Newest first; ties broken by id for determinism.
         nodes.sort_by(|a, b| {
@@ -363,7 +395,15 @@ impl<'a> Recall<'a> {
                 .cmp(&a.valid_from)
                 .then_with(|| a.compute_id().cmp(&b.compute_id()))
         });
-        let items = nodes.iter().take(budget).map(|n| RecallItem::from_node(n, None)).collect();
+        let items = nodes
+            .iter()
+            .take(budget)
+            .map(|n| {
+                let mut item = RecallItem::from_node(n, None);
+                item.in_flight_branch = in_flight.get(&n.compute_id()).cloned();
+                item
+            })
+            .collect();
         Ok(RecallResult {
             repo: repo.to_string(),
             watermark: self.watermark(repo),
@@ -376,10 +416,14 @@ impl<'a> Recall<'a> {
     /// embedded in the same space as ingest, so the index's model-version guard
     /// lines up.
     pub fn search(&self, repo: &str, query: &str, budget: usize) -> Result<RecallResult, StoreError> {
-        if let Some(cache) = &self.index_cache {
-            return self.search_cached(Arc::clone(cache), repo, query, budget);
+        // The HNSW cache holds the canonical set; an in-flight query takes the brute
+        // path (which labels hits) so the cache never mixes the two node sets.
+        if !self.include_in_flight {
+            if let Some(cache) = &self.index_cache {
+                return self.search_cached(Arc::clone(cache), repo, query, budget);
+            }
         }
-        let nodes = self.tenant_nodes(repo)?;
+        let (nodes, in_flight) = self.tenant_scan(repo)?;
         let total = nodes.len();
 
         let mut index = BruteForceIndex::new();
@@ -397,7 +441,13 @@ impl<'a> Recall<'a> {
         let hits = index.search(&q, budget).unwrap_or_default();
         let items = hits
             .into_iter()
-            .filter_map(|nb| by_id.get(&nb.id).map(|n| RecallItem::from_node(n, Some(nb.score))))
+            .filter_map(|nb| {
+                by_id.get(&nb.id).map(|n| {
+                    let mut item = RecallItem::from_node(n, Some(nb.score));
+                    item.in_flight_branch = in_flight.get(&nb.id).cloned();
+                    item
+                })
+            })
             .collect();
         Ok(RecallResult {
             repo: repo.to_string(),
@@ -796,6 +846,38 @@ mod tests {
             quarantined: false,
             signature: None,
         }
+    }
+
+    // ---- ADR-09 B.4: include_in_flight read path ----
+
+    #[test]
+    fn include_in_flight_surfaces_and_labels_branch() {
+        let canonical = node("r", "merged work", 100);
+        let inflight = node("r", "wip on a branch", 200);
+        let mut branch = node("r", "feat/x@deadbeef", 150);
+        branch.kind = NodeKind::Branch;
+        branch.source_ref = SourceRef::DagNative { key: "branch:feat/x".into() };
+        branch.embedding = None;
+        let bc = Edge {
+            from: branch.compute_id(),
+            to: inflight.compute_id(),
+            kind: EdgeKind::BranchContains,
+            plane: Plane::Derived,
+            trust_tier: TrustTier::DerivedDeterministic,
+            provenance: EdgeProvenance { method: EdgeMethod::Ingest, asserter: "ingest".into(), at: 0, evidence: None },
+            confidence: vec![],
+            quarantined: false,
+            signature: None,
+        };
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        s.commit(&[canonical, inflight, branch], &[bc]).unwrap();
+
+        let r = Recall::new(&s).with_in_flight(true).storyline("r", 10).unwrap();
+        let wip = r.items.iter().find(|i| i.title == "wip on a branch").expect("in-flight commit surfaced when opted in");
+        assert_eq!(wip.in_flight_branch.as_deref(), Some("feat/x"), "in-flight item labeled with its branch");
+        let merged = r.items.iter().find(|i| i.title == "merged work").unwrap();
+        assert_eq!(merged.in_flight_branch, None, "canonical item carries no branch label");
+        assert!(!r.items.iter().any(|i| i.kind == NodeKind::Branch), "Branch meta-nodes are never items");
     }
 
     // ---- ADR-09 in-flight branch layer: canonical purity ----

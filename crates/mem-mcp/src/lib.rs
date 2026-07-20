@@ -322,10 +322,14 @@ impl<'a> MemoryMcpServer<'a> {
     fn call_recall(&mut self, args: &Value) -> Result<Value, (i64, String)> {
         let repo = arg_str(args, "repo")?;
         let budget = arg_usize(args, "budget", 15);
-        if let Err(deny) = self.authorize_read(&repo, &format!("memory.recall budget={budget}")) {
+        let in_flight = arg_bool(args, "include_in_flight", false);
+        if let Err(deny) = self.authorize_read(&repo, &format!("memory.recall budget={budget} in_flight={in_flight}")) {
             return Ok(deny);
         }
-        let result = Recall::new(self.store).storyline(&repo, budget).map_err(store_err)?;
+        let result = Recall::new(self.store)
+            .with_in_flight(in_flight)
+            .storyline(&repo, budget)
+            .map_err(store_err)?;
         Ok(tool_text(render_result(&result)))
     }
 
@@ -333,7 +337,8 @@ impl<'a> MemoryMcpServer<'a> {
         let repo = arg_str(args, "repo")?;
         let query = arg_str(args, "query")?;
         let budget = arg_usize(args, "budget", 10);
-        if let Err(deny) = self.authorize_read(&repo, &format!("memory.search {query:?}")) {
+        let in_flight = arg_bool(args, "include_in_flight", false);
+        if let Err(deny) = self.authorize_read(&repo, &format!("memory.search {query:?} in_flight={in_flight}")) {
             return Ok(deny);
         }
         let mut recall = match &self.query_embedder {
@@ -343,7 +348,7 @@ impl<'a> MemoryMcpServer<'a> {
         if let Some(cache) = &self.index_cache {
             recall = recall.with_index_cache(Arc::clone(cache));
         }
-        let result = recall.search(&repo, &query, budget).map_err(store_err)?;
+        let result = recall.with_in_flight(in_flight).search(&repo, &query, budget).map_err(store_err)?;
         Ok(tool_text(render_result(&result)))
     }
 
@@ -862,6 +867,10 @@ fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
     args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(default)
 }
 
+fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
 fn store_err(e: mem_store::StoreError) -> (i64, String) {
     (-32000, e.to_string())
 }
@@ -875,7 +884,8 @@ fn tools_list() -> Value {
                 "type": "object",
                 "properties": {
                     "repo": { "type": "string", "description": "tenant repo, e.g. citrate-chain" },
-                    "budget": { "type": "integer", "description": "max items", "default": 15 }
+                    "budget": { "type": "integer", "description": "max items", "default": 15 },
+                    "include_in_flight": { "type": "boolean", "description": "also show unmerged feature-branch work, each labeled [in-flight: <branch>]; default off = canonical merged truth only", "default": false }
                 },
                 "required": ["repo"]
             }
@@ -888,7 +898,8 @@ fn tools_list() -> Value {
                 "properties": {
                     "repo": { "type": "string" },
                     "query": { "type": "string" },
-                    "budget": { "type": "integer", "default": 10 }
+                    "budget": { "type": "integer", "default": 10 },
+                    "include_in_flight": { "type": "boolean", "description": "also search unmerged feature-branch work, each hit labeled [in-flight: <branch>]; default off", "default": false }
                 },
                 "required": ["repo", "query"]
             }
@@ -1057,7 +1068,14 @@ fn render_result(r: &RecallResult) -> String {
             mem_core::Status::Superseded => " ⚠SUPERSEDED",
             mem_core::Status::Archived => " (archived)",
         };
-        s.push_str(&format!("  {} {}[{}{}] {}\n", &i.id.to_hex()[..10], score, i.kind.discriminant(), status, title));
+        // ADR-09 B.4: mark work-in-progress so a caller never mistakes an unmerged
+        // feature-branch commit for canonical (merged) truth.
+        let in_flight = i
+            .in_flight_branch
+            .as_ref()
+            .map(|b| format!(" [in-flight: {b}]"))
+            .unwrap_or_default();
+        s.push_str(&format!("  {} {}[{}{}] {}{}\n", &i.id.to_hex()[..10], score, i.kind.discriminant(), status, title, in_flight));
     }
     s
 }
@@ -1204,6 +1222,23 @@ mod tests {
                 tool["name"]
             );
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn recall_and_search_advertise_include_in_flight() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let v: Value = serde_json::from_str(
+            &srv.handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap(),
+        )
+        .unwrap();
+        let tools = v["result"]["tools"].as_array().unwrap();
+        for name in ["memory.recall", "memory.search"] {
+            let t = tools.iter().find(|t| t["name"] == name).unwrap();
+            let prop = &t["inputSchema"]["properties"]["include_in_flight"];
+            assert_eq!(prop["type"], "boolean", "{name} must advertise include_in_flight");
+            assert_eq!(prop["default"], false, "{name} include_in_flight defaults off (canonical)");
         }
     }
 

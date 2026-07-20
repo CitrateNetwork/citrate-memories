@@ -76,7 +76,13 @@ on branch drift (new/advanced/deleted, via `ls-remote --symref/--heads` vs per-b
 watermarks + Active branch nodes). Archive-on-merge/delete/advance via a new
 `store.set_node_status` (id-preserving advisory update); merged commits promote to
 canonical with no rewrite. Tests: merge-promotion lifecycle end-to-end, deleted-branch
-reap idempotency, reconciler branch-drift detection. Remaining: B.4, B.5.
+reap idempotency, reconciler branch-drift detection. B.4 done — the read path:
+`Recall::with_in_flight` (default off) surfaces in-flight commits and labels each with
+`RecallItem.in_flight_branch`; `storyline`/`search` respect it (search takes the brute
+path when opted in so the HNSW cache never mixes node sets); mem-mcp
+`memory.recall`/`memory.search` gain an `include_in_flight` arg + schema and render
+`[in-flight: <branch>]`; gateway routes take `?include_in_flight=true` + emit
+`in_flight_branch`. Remaining: B.5 (adversarial/idempotency proof).
 
 | WP | Title | Deliverable |
 |---|---|---|

@@ -278,6 +278,9 @@ fn item_json(it: &RecallItem) -> Value {
         "trust_tier": format!("{:?}", it.trust_tier),
         "status": format!("{:?}", it.status),
         "score": it.score,
+        // ADR-09 B.4: null for canonical (merged) items; the branch name for
+        // work-in-progress surfaced via include_in_flight.
+        "in_flight_branch": it.in_flight_branch,
     })
 }
 
@@ -410,9 +413,15 @@ async fn recall(
     let repo = qparam(&q, "repo").ok_or_else(|| bad("repo query param required"))?;
     gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "recall")?;
     let r = recaller(&app)
+        .with_in_flight(in_flight_param(&q))
         .storyline(&repo, budget(&q, 15))
         .map_err(ise)?;
     Ok(Json(result_json(&r)))
+}
+
+/// ADR-09 B.4: opt in to the in-flight branch layer via `?include_in_flight=true`.
+fn in_flight_param(q: &HashMap<String, String>) -> bool {
+    q.get("include_in_flight").map(|v| v == "true" || v == "1").unwrap_or(false)
 }
 
 async fn search(
@@ -425,6 +434,7 @@ async fn search(
     let query = qparam(&q, "q").ok_or_else(|| bad("q query param required"))?;
     gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "search")?;
     let r = recaller(&app)
+        .with_in_flight(in_flight_param(&q))
         .search(&repo, &query, budget(&q, 10))
         .map_err(ise)?;
     Ok(Json(result_json(&r)))
@@ -502,6 +512,7 @@ async fn verify(
         source: node.source_ref.clone(),
         status: node.status,
         score: None,
+        in_flight_branch: None,
     };
     Ok(Json(json!({
         "id": item.id.to_hex(),
