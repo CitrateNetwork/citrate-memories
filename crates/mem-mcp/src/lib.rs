@@ -413,11 +413,24 @@ impl<'a> MemoryMcpServer<'a> {
             .and_then(|v| v.as_u64())
             .ok_or((-32602, "missing integer argument 'as_of_ms' (epoch ms)".to_string()))?;
         let budget = arg_usize(args, "budget", 15);
-        if let Err(deny) = self.authorize_read(&repo, &format!("memory.as_of t={as_of_ms} budget={budget}")) {
+        // Off by default: the snapshot is a deterministic replay of the Derived
+        // projection. Opting in answers "what was claimed and still stood at T",
+        // which is the only way to time-filter a signed claim at all.
+        let asserted = arg_bool(args, "include_asserted", false);
+        if let Err(deny) = self.authorize_read(
+            &repo,
+            &format!("memory.as_of t={as_of_ms} budget={budget} asserted={asserted}"),
+        ) {
             return Ok(deny);
         }
-        let result = Recall::new(self.store).as_of(&repo, as_of_ms, budget).map_err(store_err)?;
-        let mut text = format!("as-of {as_of_ms}ms — Derived-plane snapshot:\n");
+        let result = Recall::new(self.store)
+            .with_asserted(asserted)
+            .as_of(&repo, as_of_ms, budget)
+            .map_err(store_err)?;
+        // Name the scope in the output: a reader must never mistake a widened
+        // snapshot for a reproducible one.
+        let scope = if asserted { "Derived + Asserted" } else { "Derived-plane" };
+        let mut text = format!("as-of {as_of_ms}ms — {scope} snapshot:\n");
         text.push_str(&render_result(&result));
         Ok(tool_text(text))
     }
@@ -981,13 +994,14 @@ fn tools_list() -> Value {
         },
         {
             "name": "memory.as_of",
-            "description": "Decision-replay: the Derived-plane snapshot of a repo tenant as it stood at a point in time (epoch ms). Shows only nodes that were already valid and not yet retired at that instant.",
+            "description": "Decision-replay: the Derived-plane snapshot of a repo tenant as it stood at a point in time (epoch ms). Shows only nodes that were already valid and not yet retired at that instant. Set include_asserted to also ask what was CLAIMED and still stood at that instant.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo": { "type": "string" },
                     "as_of_ms": { "type": "integer", "description": "epoch milliseconds — the replay instant" },
-                    "budget": { "type": "integer", "default": 15 }
+                    "budget": { "type": "integer", "default": 15 },
+                    "include_asserted": { "type": "boolean", "default": false, "description": "widen to the Asserted plane: signed claims valid at that instant and not since superseded. Off by default because signed claims are not a deterministic projection, so the snapshot stops being a reproducible replay." }
                 },
                 "required": ["repo", "as_of_ms"]
             }
@@ -1579,6 +1593,47 @@ mod tests {
         assert_eq!(v["result"]["isError"], true);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("signing identity"));
+    }
+
+    /// The MCP surface must expose the opt-in, or a signed claim can never be
+    /// time-filtered through the tool layer no matter what `Recall` supports.
+    #[test]
+    fn as_of_exposes_the_asserted_opt_in() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        call_json(
+            &mut srv,
+            "memory.assert",
+            json!({ "repo": "citrate-chain", "kind": "claim", "content": "a signed claim", "valid_from": 100 }),
+        );
+
+        // Default: deterministic replay, so the claim is absent and the output
+        // says which scope it is reporting.
+        let derived = text_of(&call_json(
+            &mut srv,
+            "memory.as_of",
+            json!({ "repo": "citrate-chain", "as_of_ms": 200, "budget": 10 }),
+        ));
+        assert!(derived.contains("Derived-plane snapshot"), "default scope must be named: {derived}");
+        assert!(!derived.contains("a signed claim"), "default must not surface Asserted nodes");
+
+        // Opt in: the claim appears, and the header changes so a reader cannot
+        // mistake a widened snapshot for a reproducible one.
+        let widened = text_of(&call_json(
+            &mut srv,
+            "memory.as_of",
+            json!({ "repo": "citrate-chain", "as_of_ms": 200, "budget": 10, "include_asserted": true }),
+        ));
+        assert!(widened.contains("Derived + Asserted snapshot"), "widened scope must be named: {widened}");
+        assert!(widened.contains("a signed claim"), "opt-in must surface the claim: {widened}");
+
+        // Before it was claimed, it is still not visible.
+        let early = text_of(&call_json(
+            &mut srv,
+            "memory.as_of",
+            json!({ "repo": "citrate-chain", "as_of_ms": 50, "budget": 10, "include_asserted": true }),
+        ));
+        assert!(!early.contains("a signed claim"), "valid_from is honoured on the Asserted plane too");
     }
 
     /// The one node in `repo` whose content matches `needle`, or panic.
