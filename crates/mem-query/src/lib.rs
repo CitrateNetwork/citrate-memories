@@ -298,6 +298,10 @@ pub struct Recall<'a> {
     /// ADR-09 B.4: surface the in-flight branch layer in `storyline`/`search`.
     /// Off by default — canonical (default-branch) truth only.
     include_in_flight: bool,
+    /// Widen `as_of` to the Asserted plane. Off by default — an as-of snapshot is
+    /// a deterministic replay, and signed claims are not a deterministic
+    /// projection. See [`with_asserted`](Recall::with_asserted).
+    include_asserted: bool,
 }
 
 impl<'a> Recall<'a> {
@@ -311,13 +315,14 @@ impl<'a> Recall<'a> {
             embedder: Box::new(HashingEmbedder::new(EMBED_DIM)),
             index_cache: None,
             include_in_flight: false,
+            include_asserted: false,
         }
     }
 
     /// Recall whose query embedder is explicit — must match the model the tenant's
     /// nodes were embedded with, or `search`'s vector-space guard rejects the query.
     pub fn with_embedder(store: &'a MemoryDagStore<MemoryNode>, embedder: Box<dyn Embedder>) -> Self {
-        Self { store, embedder, index_cache: None, include_in_flight: false }
+        Self { store, embedder, index_cache: None, include_in_flight: false, include_asserted: false }
     }
 
     /// Serve `search` from a shared [`TenantIndexCache`] (HNSW, built once per
@@ -333,6 +338,26 @@ impl<'a> Recall<'a> {
     /// only, so the trust guarantee holds unless a caller explicitly opts in.
     pub fn with_in_flight(mut self, yes: bool) -> Self {
         self.include_in_flight = yes;
+        self
+    }
+
+    /// Widen [`as_of`](Recall::as_of) to include the Asserted plane, changing the
+    /// question it answers from *"what did the deterministic record show at T"* to
+    /// *"what was claimed, and still stood, at T"*.
+    ///
+    /// Off by default, and deliberately so: the default snapshot is a
+    /// **deterministic replay**, reproducible because the Derived plane is a
+    /// projection of git and markdown. Signed claims are not reproducible in that
+    /// sense, so opting in forfeits replay-stability in exchange for being able to
+    /// time-filter claims at all.
+    ///
+    /// Without this there is no way to ask whether a signed claim is still current,
+    /// which leaves `valid_from` on an Asserted node write-only: correctly stored
+    /// and read by nothing. The bitemporal filter itself is identical either way,
+    /// and `apply_supersession` stamps `valid_to`, so a superseded claim drops out
+    /// of the snapshot exactly as a retired Derived node does.
+    pub fn with_asserted(mut self, yes: bool) -> Self {
+        self.include_asserted = yes;
         self
     }
 
@@ -706,12 +731,17 @@ impl<'a> Recall<'a> {
     /// `valid_from` is excluded from `compute_id`, but for dated Derived nodes it
     /// is itself deterministic (frontmatter `created:` / commit date — see
     /// `mem-ingest` F-3), so the snapshot is stable across rebuilds.
+    ///
+    /// [`with_asserted`](Recall::with_asserted) opts into the Asserted plane for
+    /// callers that need to ask the *other* question, "what was claimed and still
+    /// stood at T". That is a different question, not a better answer to this one,
+    /// which is why it is a separate opt-in rather than a widening of the default.
     pub fn as_of(&self, repo: &str, as_of_ms: Timestamp, budget: usize) -> Result<RecallResult, StoreError> {
         let nodes = self.tenant_nodes(repo)?;
         let total = nodes.len();
         let mut current: Vec<&MemoryNode> = nodes
             .iter()
-            .filter(|n| n.plane == Plane::Derived)
+            .filter(|n| self.include_asserted || n.plane == Plane::Derived)
             .filter(|n| n.valid_from <= as_of_ms)
             .filter(|n| n.valid_to.map(|vt| vt > as_of_ms).unwrap_or(true))
             .collect();
@@ -1073,6 +1103,56 @@ mod tests {
         let r = Recall::new(&s).as_of("a", 150, 10).unwrap();
         let titles: Vec<_> = r.items.iter().map(|i| i.title.as_str()).collect();
         assert_eq!(titles, vec!["derived"], "decision-replay is over the deterministic Derived projection only");
+    }
+
+    /// Opt-in: "what was CLAIMED and still stood at T", a different question from
+    /// the default "what did the deterministic record show at T".
+    ///
+    /// Without this, a signed claim can never be time-filtered at all, so a
+    /// consumer of the Asserted plane has no way to ask whether a claim is still
+    /// current as of now. `valid_from` on an Asserted node is write-only until
+    /// something reads it.
+    #[test]
+    fn as_of_with_asserted_includes_signed_claims_and_still_honours_retirement() {
+        let mut live = node("a", "a claim that still stands", 100);
+        live.plane = Plane::Asserted;
+        live.trust_tier = TrustTier::AgentAsserted;
+
+        // Superseded at T=120: `apply_supersession` stamps `valid_to` exactly so.
+        let mut retired = node("a", "a claim that was corrected", 100);
+        retired.plane = Plane::Asserted;
+        retired.trust_tier = TrustTier::AgentAsserted;
+        retired.valid_to = Some(120);
+        retired.status = Status::Superseded;
+
+        let s = store_with(&[node("a", "derived", 100), live, retired]);
+
+        // Default is unchanged: deterministic replay, Derived only.
+        let default = Recall::new(&s).as_of("a", 150, 10).unwrap();
+        assert_eq!(
+            default.items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+            vec!["derived"],
+            "the default must stay a pure deterministic-replay snapshot"
+        );
+
+        // Opt in: Derived plus claims still standing at T. The retired one is gone,
+        // which is the whole point — this is the staleness gate.
+        let widened = Recall::new(&s).with_asserted(true).as_of("a", 150, 10).unwrap();
+        let mut titles: Vec<&str> = widened.items.iter().map(|i| i.title.as_str()).collect();
+        titles.sort();
+        assert_eq!(
+            titles,
+            vec!["a claim that still stands", "derived"],
+            "opt-in adds live claims and still excludes retired ones"
+        );
+
+        // Before the claim was made, it is not yet visible either.
+        let early = Recall::new(&s).with_asserted(true).as_of("a", 50, 10).unwrap();
+        assert!(early.items.is_empty(), "nothing is valid before it began");
+
+        // And at a T before the correction, the retired claim WAS still standing.
+        let before_retirement = Recall::new(&s).with_asserted(true).as_of("a", 110, 10).unwrap();
+        assert_eq!(before_retirement.items.len(), 3, "history stays walkable");
     }
 
     // ---- WP-2.4 verify ----
