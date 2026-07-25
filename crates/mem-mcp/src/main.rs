@@ -1,10 +1,59 @@
-//! The multi-session MCP daemon: ONE process owns the RocksDB lock (and the
-//! transformer model, loaded once) and serves any number of concurrent MCP
-//! sessions over a Unix socket. Each Claude Code instance connects through the
-//! thin `mcp_connect` shim, so a whole team shares one graph.
+//! `mem-mcp` — the multi-session memory daemon.
 //!
-//!   cargo run -p mem-mcp --example mcp_serve --features rocksdb,transformer -- \
-//!       ./data/federation.bge.memdag ./data/memdag.sock
+//! ONE process owns the RocksDB lock (and the transformer model, loaded once)
+//! and serves any number of concurrent MCP sessions over a Unix socket. Each
+//! Claude Code instance connects through the thin `mcp_connect` shim, so a whole
+//! team shares one graph.
+//!
+//! ```text
+//! cargo build -p mem-mcp --bin mem-mcp --release --features rocksdb
+//! mem-mcp <store-path> <sock-path>
+//! ```
+//!
+//! **`--features rocksdb` is required** — the daemon is a RocksDB singleton, so
+//! the bin carries `required-features = ["rocksdb"]`. Without it cargo reports
+//! "no bin target named `mem-mcp`", which is exactly how the missing binary
+//! first surfaced when packaging citrate-core.
+//!
+//! # Promoted from an example (2026-07-25)
+//!
+//! This was `examples/mcp_serve.rs`. `citrate-core` declares `binaries/mem-mcp`
+//! as a Tauri `externalBin` and `tauri-build` validates every such path at build
+//! time, so the desktop app could not be packaged at all while the daemon existed
+//! only as an example. Promoting it (rather than writing a second daemon) keeps
+//! the shipped path and the tested path the same code.
+//!
+//! # The contract with citrate-core (do not change unilaterally)
+//!
+//! ```text
+//! mem-mcp <store-path> <sock-path>
+//! env: CITRATE_MEM_STORE_KEY = <hex>   (optional; see "Identity" below)
+//! ```
+//!
+//! Positional args only: `MemoryManager::build_spec` passes no lock/socket flags
+//! because the daemon owns both its singleton lock and its stale-socket cleanup.
+//! The key travels in the environment, never argv, so it cannot leak via `ps`.
+//!
+//! # Identity — the shipped binary must not carry a hardcoded key
+//!
+//! As an example this signed its grant with `SigningKey::from_bytes(&[1u8; 32])`
+//! and authored with `[2u8; 32]`. That is fine for a demo and wrong for a
+//! product: every install would share one identity, so `blame()` could not tell
+//! two users apart and any copy of the binary could mint that issuer's grants.
+//!
+//! `citrate-core` mints a per-user store wrapping key in the OS keyring and
+//! passes it as `CITRATE_MEM_STORE_KEY`, documenting it as a "forward-compatible
+//! seam — honoured IFF/when the daemon grows a key intake". This is that intake.
+//! The key is NOT used for encryption (mem-store seals each tenant with its own
+//! key inside the `KEYS` CF; `open_rocksdb_auto` takes only a path) — it seeds a
+//! **domain-separated** ed25519 identity via the same blake3 idiom
+//! `Asserter::for_principal` already uses. Domain separation is what keeps this
+//! from being key reuse: the derived key cannot be inverted to the wrapping key.
+//!
+//! Deriving from the keyring key also keeps the identity stable across restarts
+//! without writing a secret to disk in the clear. With no key in the environment
+//! the daemon falls back to an ephemeral per-process identity: reads are
+//! unaffected, authored writes get a per-process author.
 //!
 //! Singleton by construction: the RocksDB LOCK is taken *before* the socket is
 //! touched, so a second daemon racing for the same DB exits at open and never
@@ -15,7 +64,8 @@
 //! Each connection gets its own `MemoryMcpServer` — its own grant — over the
 //! shared store; writes are serialized through one write gate. All sessions
 //! share ONE persistent audit chain (`<db>.audit.jsonl`, verified on load). The
-//! grant here is the same demo wildcard as `mcp_stdio`; per-user signed grants
+//! session grant is wildcard over this user's tenants and is bounded by the
+//! socket's filesystem permissions (see `session_grant`); per-user signed grants
 //! (citrate-identity SIWE) are the v2 integration (F-5).
 //!
 //! ## Durability / recovery (MEM-S6 WP-6.5)
@@ -46,11 +96,53 @@ use mem_index::Embedder;
 use mem_mcp::{serve_connection, MemoryMcpServer};
 use mem_store::MemoryDagStore;
 
-fn demo_grant() -> CapabilityGrant {
+/// Env var carrying the per-user store wrapping key (hex), set by citrate-core.
+const STORE_KEY_ENV: &str = "CITRATE_MEM_STORE_KEY";
+
+/// Domain separator for the daemon's ed25519 identity. Changing it rotates every
+/// local daemon identity, so treat it as a constant.
+const IDENTITY_LABEL: &[u8] = b"mem-mcp:daemon-identity:v1";
+
+/// The daemon's signing identity, derived from the keyring-held wrapping key, or
+/// ephemeral when the seam is unset. See "Identity" in the module docs.
+fn daemon_identity() -> SigningKey {
+    match std::env::var(STORE_KEY_ENV).ok().and_then(|k| {
+        let raw = hex::decode(k.trim()).ok()?;
+        (!raw.is_empty()).then_some(raw)
+    }) {
+        Some(raw) => {
+            let mut h = blake3::Hasher::new();
+            h.update(IDENTITY_LABEL);
+            h.update(&(raw.len() as u64).to_le_bytes());
+            h.update(&raw);
+            SigningKey::from_bytes(h.finalize().as_bytes())
+        }
+        None => {
+            eprintln!(
+                "mem-mcp: {STORE_KEY_ENV} unset — using an ephemeral daemon identity \
+                 (reads unaffected; authored writes get a per-process author)"
+            );
+            let mut seed = [0u8; 32];
+            getrandom::getrandom(&mut seed).expect("OS randomness");
+            SigningKey::from_bytes(&seed)
+        }
+    }
+}
+
+/// The locally-minted session grant: wildcard read+write over this user's own
+/// tenants.
+///
+/// That is deliberate and is not a hole here, because the real trust boundary is
+/// the **filesystem permissions on the Unix socket** — it lives in the per-user
+/// app-data dir, one graph per user, never shared, so anyone who can `connect()`
+/// already holds the user's privileges. Callers needing finer authorization use
+/// the 2026-07-28 stateless profile and present a signed per-request grant in
+/// `_meta["ai.citrate/grant"]`, which overrides this for that call.
+fn session_grant(sk: &SigningKey) -> CapabilityGrant {
     let mut grant = CapabilityGrant {
-        id: "daemon-demo".into(),
-        issuer: "did:saul".into(),
-        recipient: "agent:mcp-client".into(),
+        id: "mem-mcp:local-session".into(),
+        issuer: "local:citrate-core".into(),
+        recipient: "local:mem-mcp".into(),
         allowed_resources: vec![ResourceScope { resource_id: "*".into(), can_read: true, can_write: true }],
         policy: PolicyProfile::Maintainer,
         expires_at_ms: u64::MAX,
@@ -59,7 +151,7 @@ fn demo_grant() -> CapabilityGrant {
         issuer_pubkey: vec![],
         signature: vec![],
     };
-    grant.sign_with(&SigningKey::from_bytes(&[1u8; 32]));
+    grant.sign_with(sk);
     grant
 }
 
@@ -72,11 +164,11 @@ fn load_query_embedder(store: &MemoryDagStore<MemoryNode>) -> Option<Arc<dyn Emb
     if model != mem_index::transformer::DEFAULT_MODEL_ID {
         return None;
     }
-    eprintln!("mcp_serve: store embedded with '{model}', loading transformer embedder…");
+    eprintln!("mem-mcp: store embedded with '{model}', loading transformer embedder…");
     match mem_index::TransformerEmbedder::bge_base() {
         Ok(e) => Some(Arc::new(e)),
         Err(e) => {
-            eprintln!("mcp_serve: failed to load embedder: {e}");
+            eprintln!("mem-mcp: failed to load embedder: {e}");
             std::process::exit(1);
         }
     }
@@ -137,12 +229,15 @@ fn main() {
     let db = std::env::args().nth(1).unwrap_or_else(|| "./data/federation.memdag".to_string());
     let sock = std::env::args().nth(2).unwrap_or_else(|| "./data/memdag.sock".to_string());
 
+    // One identity for this daemon process (see "Identity" in the module docs).
+    let identity = daemon_identity();
+
     // DB first: this is the singleton lock. If another daemon is live, we exit
     // here and never touch its socket.
     let store = match MemoryDagStore::<MemoryNode>::open_rocksdb_auto(&db) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("mcp_serve: cannot open {db} (another daemon live?): {e}");
+            eprintln!("mem-mcp: cannot open {db} (another daemon live?): {e}");
             std::process::exit(1);
         }
     };
@@ -150,7 +245,7 @@ fn main() {
     // Holding the DB lock proves any existing socket file is stale.
     if std::path::Path::new(&sock).exists() {
         if let Err(e) = std::fs::remove_file(&sock) {
-            eprintln!("mcp_serve: cannot remove stale socket {sock}: {e}");
+            eprintln!("mem-mcp: cannot remove stale socket {sock}: {e}");
             std::process::exit(1);
         }
     }
@@ -163,8 +258,8 @@ fn main() {
     let ckpt_keep = env_usize("MEM_CHECKPOINT_KEEP", 3).max(1);
     if ckpt_interval_secs > 0 {
         match rolling_checkpoint(&store, &db, ckpt_keep) {
-            Ok(name) => eprintln!("mcp_serve: startup checkpoint {} (keep {ckpt_keep})", name),
-            Err(e) => eprintln!("mcp_serve: WARN startup checkpoint failed (continuing): {e}"),
+            Ok(name) => eprintln!("mem-mcp: startup checkpoint {} (keep {ckpt_keep})", name),
+            Err(e) => eprintln!("mem-mcp: WARN startup checkpoint failed (continuing): {e}"),
         }
     }
 
@@ -176,12 +271,12 @@ fn main() {
     let audit_log = format!("{db}.audit.jsonl");
     let audit = match mem_authz::AuditChain::open(&audit_log) {
         Ok(c) => {
-            eprintln!("mcp_serve: audit chain {audit_log} verified ({} records)", c.len());
+            eprintln!("mem-mcp: audit chain {audit_log} verified ({} records)", c.len());
             Arc::new(Mutex::new(c))
         }
         Err(e) => {
             // Fail closed: a chain that cannot be trusted must not be extended.
-            eprintln!("mcp_serve: audit chain {audit_log} REJECTED: {e}");
+            eprintln!("mem-mcp: audit chain {audit_log} REJECTED: {e}");
             std::process::exit(1);
         }
     };
@@ -189,14 +284,17 @@ fn main() {
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("mcp_serve: cannot bind {sock}: {e}");
+            eprintln!("mem-mcp: cannot bind {sock}: {e}");
             std::process::exit(1);
         }
     };
-    eprintln!("mcp_serve: serving {db} on {sock}");
+    eprintln!("mem-mcp: serving {db} on {sock}");
 
     let write_gate = Arc::new(Mutex::new(()));
     let index_cache = Arc::new(mem_query::TenantIndexCache::new());
+    let grant = session_grant(&identity);
+    let identity = &identity;
+    let grant = &grant;
     let store = &store;
     let db_for_ckpt = db.clone();
     std::thread::scope(|scope| {
@@ -209,8 +307,8 @@ fn main() {
             scope.spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(ckpt_interval_secs as u64));
                 match rolling_checkpoint(store_ck, &db_ck, ckpt_keep) {
-                    Ok(name) => eprintln!("mcp_serve: checkpoint {name}"),
-                    Err(e) => eprintln!("mcp_serve: WARN checkpoint failed (continuing): {e}"),
+                    Ok(name) => eprintln!("mem-mcp: checkpoint {name}"),
+                    Err(e) => eprintln!("mem-mcp: WARN checkpoint failed (continuing): {e}"),
                 }
             });
         }
@@ -218,7 +316,7 @@ fn main() {
             let stream: UnixStream = match conn {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("mcp_serve: accept failed: {e}");
+                    eprintln!("mem-mcp: accept failed: {e}");
                     continue;
                 }
             };
@@ -230,7 +328,7 @@ fn main() {
                 // Fresh session: own grant + signing identity; the persistent
                 // audit chain is SHARED so every session extends one log.
                 let mut server =
-                    MemoryMcpServer::new_with_asserter(store, demo_grant(), Asserter::new(SigningKey::from_bytes(&[2u8; 32])))
+                    MemoryMcpServer::new_with_asserter(store, grant.clone(), Asserter::new(identity.clone()))
                         .with_write_gate(gate)
                         .with_index_cache(cache)
                         .with_audit_chain(audit);
@@ -240,12 +338,12 @@ fn main() {
                 let reader = match stream.try_clone() {
                     Ok(r) => BufReader::new(r),
                     Err(e) => {
-                        eprintln!("mcp_serve: cannot clone stream: {e}");
+                        eprintln!("mem-mcp: cannot clone stream: {e}");
                         return;
                     }
                 };
                 if let Err(e) = serve_connection(reader, stream, &mut server) {
-                    eprintln!("mcp_serve: session ended with error: {e}");
+                    eprintln!("mem-mcp: session ended with error: {e}");
                 }
             });
         }
