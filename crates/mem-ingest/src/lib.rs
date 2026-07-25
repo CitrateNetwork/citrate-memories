@@ -331,9 +331,29 @@ pub fn build_graph_gated(
     Ok((nodes, edges))
 }
 
+/// Is this a **marker** kind: a node whose content is a mechanical identifier
+/// rather than prose, and which is therefore deliberately left unembedded?
+///
+/// Only `Branch` qualifies today (see [`branch_node`]): its content is
+/// `<name>@<tip>`, so a vector over it would be noise, and the in-flight layer
+/// surfaces branches through `BranchContains` edges from real commits, never by
+/// semantic search.
+///
+/// This exists so bulk repair tooling can tell "unembedded because a bug dropped
+/// the vector" apart from "unembedded on purpose". A backfill that cannot make
+/// that distinction silently overrides a design decision everywhere it runs.
+///
+/// Note what is deliberately NOT here: `ref_node` stubs are `Adr`/`WorkPackage`,
+/// kinds that also carry real prose when asserted through the MCP surface. Keying
+/// on kind alone would skip legitimate content, so stubs stay embeddable.
+pub fn is_marker_kind(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Branch)
+}
+
 /// A `Branch` meta-node (ADR-09 B.2): content carries the tip, so a moving branch
 /// mints a new node per observed tip (like a chain checkpoint) and re-ingesting the
-/// same tip is idempotent. Not embedded (it is a marker, not searchable content).
+/// same tip is idempotent. Not embedded (it is a marker, not searchable content;
+/// see [`is_marker_kind`], which bulk tooling must honour).
 fn branch_node(repo: &str, name: &str, tip: &str, now_ms: u64) -> MemoryNode {
     MemoryNode {
         schema_version: SCHEMA_VERSION,
@@ -947,6 +967,24 @@ mod tests {
         let rep2 = ing.ingest_branches(&mirror, &store).expect("re-ingest");
         assert_eq!(rep2.branches_ingested, 0);
         assert_eq!(rep2.unchanged, 1);
+
+        // The Branch node the in-flight layer just wrote is a marker, and stays
+        // unembedded. Bulk repair tooling keys off `is_marker_kind` to leave it
+        // that way rather than overriding the decision.
+        let branch_nodes: Vec<MemoryNode> = store
+            .all_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Branch)
+            .collect();
+        assert_eq!(branch_nodes.len(), 1, "one Branch node for feat/x");
+        assert!(branch_nodes[0].embedding.is_none(), "marker nodes are not embedded");
+        assert!(is_marker_kind(&branch_nodes[0].kind), "and are reported as markers");
+        assert!(!is_marker_kind(&NodeKind::Commit), "real content is not a marker");
+        assert!(
+            !is_marker_kind(&NodeKind::WorkPackage),
+            "ref_node stubs share kinds with asserted prose, so they stay embeddable"
+        );
 
         // Regression: `refs/remotes/origin/HEAD` must not be enumerated. Git
         // abbreviates it to plain `origin` (not `origin/HEAD`), so a short-name
