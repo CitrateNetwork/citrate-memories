@@ -103,7 +103,7 @@ gateway the OAuth-aligned front door for the whole team.
 ### 3.1 `mem-mcp` (citrate-memories) — the one that needs work
 
 - **Stack:** Rust, custom JSON-RPC 2.0 (no SDK), newline-delimited stdio framing.
-- **Transport:** stdio shim (`mcp_connect`) onto a single-writer daemon (`mcp_serve`)
+- **Transport:** stdio shim (`mcp_connect`) onto a single-writer daemon (the `mem-mcp` binary, formerly the `mcp_serve` example)
   over a Unix socket. The daemon holds the RocksDB lock and takes rolling checkpoints.
 - **Protocol version:** `2024-11-05` (three revisions behind).
 - **State model:** stateful. A `CapabilityGrant` is bound to the per-connection server

@@ -16,6 +16,12 @@ mem-authz = { path = "../mem-authz" }
 mem-assert = { path = "../mem-assert" }
 serde_json = { workspace = true }
 ed25519-dalek = "2"
+# The `mem-mcp` daemon binary: blake3 derives its domain-separated identity from
+# the keyring-held wrapping key, hex decodes that key, getrandom seeds the
+# ephemeral fallback identity.
+blake3 = { workspace = true }
+hex = { workspace = true }
+getrandom = { workspace = true }
 
 [features]
 default = []
@@ -31,9 +37,17 @@ required-features = ["rocksdb"]
 name = "mcp_stdio"
 required-features = ["rocksdb"]
 
-# Multi-session: one daemon owns the DB lock, any number of shims connect.
-[[example]]
-name = "mcp_serve"
+# The daemon binary. Promoted from `examples/mcp_serve.rs` (2026-07-25) because
+# citrate-core declares `binaries/mem-mcp` as a Tauri externalBin and
+# `tauri-build` validates every such path — the desktop app could not be packaged
+# while the daemon existed only as an example.
+#
+# `required-features` means you MUST build it as:
+#   cargo build -p mem-mcp --bin mem-mcp --release --features rocksdb
+# Without the feature cargo reports "no bin target named `mem-mcp`".
+[[bin]]
+name = "mem-mcp"
+path = "src/main.rs"
 required-features = ["rocksdb"]
 
 [[example]]

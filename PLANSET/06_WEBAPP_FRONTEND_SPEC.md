@@ -133,7 +133,7 @@ everything — it is never mixed across Orgs on one screen.
 
 
 The engine is Rust (9 crates) speaking MCP over stdio/Unix-socket via the
-`mcp_serve` daemon. A browser can't speak that. So the package gains **one new
+`mem-mcp` daemon (formerly the `mcp_serve` example). A browser can't speak that. So the package gains **one new
 service** and the webapp is **three runtimes** (mirroring how `citrate-explorer` is
 structured):
 
