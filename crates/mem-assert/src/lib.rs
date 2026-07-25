@@ -89,7 +89,39 @@ impl Asserter {
     /// Build a signed Asserted node. The signature is over the node's
     /// content-addressed id (which already includes the author), so any edit to
     /// content/author breaks it.
+    ///
+    /// Stamps `valid_from = observed_at = now_ms` and leaves the node
+    /// unembedded. Callers that know the claim's real-world date, or that can
+    /// embed in the tenant's vector space, should use [`assert_node_with`]
+    /// instead: an unembedded node is invisible to `Recall::search`, which only
+    /// indexes nodes whose `embedding` is `Some`.
+    ///
+    /// [`assert_node_with`]: Asserter::assert_node_with
     pub fn assert_node(&self, repo: &str, kind: NodeKind, content: &str, now_ms: u64) -> MemoryNode {
+        self.assert_node_with(repo, kind, content, now_ms, now_ms, None)
+    }
+
+    /// [`assert_node`](Asserter::assert_node) with an explicit real-world
+    /// `valid_from` and an optional embedding.
+    ///
+    /// Both extras are safe by construction: `compute_id` covers
+    /// `{schema_version, plane, kind, repo, author, source_ref, content}` only,
+    /// so neither `valid_from` nor `embedding` is identity-bearing and neither
+    /// can invalidate the signature. That is also what makes them backfillable
+    /// on nodes already in a store, in place, with no change of id.
+    ///
+    /// `embedding` MUST come from the same model the tenant's other nodes were
+    /// built with. The index skips vectors from a mismatched model, so a wrong
+    /// space is indistinguishable from no vector at all.
+    pub fn assert_node_with(
+        &self,
+        repo: &str,
+        kind: NodeKind,
+        content: &str,
+        valid_from_ms: u64,
+        observed_at_ms: u64,
+        embedding: Option<mem_core::VersionedVector>,
+    ) -> MemoryNode {
         use ed25519_dalek::Signer;
         let key = format!("assert:{}", &blake3::hash(content.as_bytes()).to_hex()[..16]);
         let mut node = MemoryNode {
@@ -100,12 +132,12 @@ impl Asserter {
             author: self.pubkey_hex.clone(), // set before compute_id (identity-bearing)
             source_ref: SourceRef::DagNative { key },
             content: content.as_bytes().to_vec(),
-            valid_from: now_ms,
+            valid_from: valid_from_ms,
             valid_to: None,
-            observed_at: now_ms,
+            observed_at: observed_at_ms,
             trust_tier: TrustTier::AgentAsserted,
             signature: None,
-            embedding: None,
+            embedding,
             confidence: vec![BelnapValue::True],
             anchors: vec![],
             status: Status::Active,

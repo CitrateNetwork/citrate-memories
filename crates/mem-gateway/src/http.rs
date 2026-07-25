@@ -562,6 +562,10 @@ struct AssertBody {
     content: String,
     #[serde(default)]
     kind: Option<String>,
+    /// Real-world date this became true (ms since epoch). Defaults to now.
+    /// Recorded separately from the write time, which stays in `observed_at`.
+    #[serde(default)]
+    valid_from: Option<u64>,
 }
 
 async fn assert(
@@ -588,17 +592,39 @@ async fn assert(
     // FWA-C10-04: sign under a per-principal sub-identity so `blame()` names the
     // authenticated actor, not the shared gateway key.
     let asserter = Asserter::for_principal(&app.signing_key, &sub);
+    // Embed at write time in the store's own space, or the node is invisible to
+    // every semantic query: `Recall::search` indexes only nodes whose `embedding`
+    // is `Some`, and the model guard skips vectors from a mismatched space.
+    let (embedding, embed_warning) = match &app.embedder {
+        Some(e) => match e.embed(&body.content) {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e.to_string())),
+        },
+        None => (None, Some("gateway has no embedder configured".to_string())),
+    };
+    let now = now_ms();
     let id = {
         let _gate = lock(&app.write_gate); // serialize writes (single-writer store)
-        let node = asserter.assert_node(&body.repo, kind, &body.content, now_ms());
+        let node = asserter.assert_node_with(
+            &body.repo,
+            kind,
+            &body.content,
+            body.valid_from.unwrap_or(now),
+            now,
+            embedding,
+        );
         app.store.put_node(&node).map_err(ise)?
     };
     // The graph changed; drop the cached constellation so it rebuilds on demand.
     *lock(&app.layout_cache) = None;
+    // Never let a failed embed be silent: the write is durable either way, but an
+    // unembedded node will not answer memory.search until it is backfilled.
     Ok(Json(json!({
         "id": id.to_hex(),
         "repo": body.repo,
         "author": asserter.pubkey_hex(),
+        "embedded": embed_warning.is_none(),
+        "warning": embed_warning,
     })))
 }
 

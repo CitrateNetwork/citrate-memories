@@ -19,8 +19,13 @@ use std::sync::{Arc, Mutex};
 
 use mem_core::{ContentHash, MemoryNode, NodeKind, Plane, SourceRef, Status, Timestamp, TrustTier};
 use mem_index::{BruteForceIndex, Embedder, HashingEmbedder, HnswIndex, VectorIndex};
-use mem_ingest::{Ingestor, Watermark, EMBED_DIM};
+use mem_ingest::{Ingestor, Watermark};
 use mem_store::{MemoryDagStore, StoreError};
+
+/// The default hashing-embedder dimension `Recall::new` queries in. Re-exported
+/// so a writer can embed into the same space the reader will search, without
+/// taking a dependency on mem-ingest just for the constant.
+pub use mem_ingest::EMBED_DIM;
 
 /// One node in a recall result, flattened for display + decision-making.
 #[derive(Debug, Clone)]

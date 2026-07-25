@@ -39,5 +39,9 @@ name = "meta_ingest"
 required-features = ["rocksdb"]
 
 [[example]]
+name = "backfill_embeddings"
+required-features = ["rocksdb"]
+
+[[example]]
 name = "chain_ingest"
 required-features = ["rocksdb"]

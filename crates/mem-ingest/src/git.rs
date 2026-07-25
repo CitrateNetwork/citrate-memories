@@ -179,32 +179,38 @@ pub struct BranchRef {
 
 /// Every remote branch except the default and `origin/HEAD`, with its tip. Used by
 /// the in-flight layer to enumerate parallel work. `default_ref` is `origin/<name>`.
+///
+/// Matches on the FULL refname, not `%(refname:short)`. Git abbreviates
+/// `refs/remotes/origin/HEAD` to plain **`origin`** (the trailing `HEAD` is
+/// dropped, it does not shorten to `origin/HEAD`), so a `short == "origin/HEAD"`
+/// guard never fires and the symref gets enumerated as a phantom branch literally
+/// named `origin`, pointing at the default tip. Full refnames are unambiguous.
 pub fn list_branches(repo: &Path, default_ref: &str) -> Result<Vec<BranchRef>, IngestError> {
+    const REMOTE_PREFIX: &str = "refs/remotes/origin/";
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["for-each-ref", &format!("--format=%(refname:short){US}%(objectname)"), "refs/remotes/origin/"])
+        .args(["for-each-ref", &format!("--format=%(refname){US}%(objectname)"), REMOTE_PREFIX])
         .output()
         .map_err(|e| IngestError::Git(format!("failed to run git: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(IngestError::Git(format!("for-each-ref failed: {}", stderr.trim())));
     }
+    // `default_ref` is `origin/<name>`; compare on the bare branch name.
+    let default_name = default_ref.strip_prefix("origin/").unwrap_or(default_ref);
     let text = String::from_utf8_lossy(&out.stdout);
     let mut branches = Vec::new();
     for line in text.lines() {
-        let (short, tip) = match line.split_once(US) {
+        let (refname, tip) = match line.split_once(US) {
             Some(p) => p,
             None => continue,
         };
-        if short == "origin/HEAD" || short == default_ref {
+        let Some(name) = refname.strip_prefix(REMOTE_PREFIX) else { continue };
+        if name.is_empty() || name == "HEAD" || name == default_name {
             continue;
         }
-        let name = short.strip_prefix("origin/").unwrap_or(short).to_string();
-        if name.is_empty() {
-            continue;
-        }
-        branches.push(BranchRef { name, tip: tip.trim().to_string() });
+        branches.push(BranchRef { name: name.to_string(), tip: tip.trim().to_string() });
     }
     Ok(branches)
 }

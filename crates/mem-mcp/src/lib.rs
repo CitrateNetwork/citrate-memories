@@ -703,8 +703,25 @@ impl<'a> MemoryMcpServer<'a> {
             return Ok(deny);
         }
         let now = now_ms();
+        // A claim's real-world date (a proof date, a publish date) is not the
+        // moment we happened to write it down. Neither field is identity-bearing.
+        let valid_from = args
+            .get("valid_from")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(now);
+        // Embed at write time or the node is unfindable: `Recall::search` indexes
+        // only nodes whose `embedding` is `Some`, so an unembedded assertion is
+        // invisible to every semantic query, forever and silently.
+        let (embedding, embed_err) = self.embed_for_write(&content);
         let node = match self.asserter.as_ref() {
-            Some(a) => a.assert_node(&repo, node_kind_from_str(&kind_str), &content, now),
+            Some(a) => a.assert_node_with(
+                &repo,
+                node_kind_from_str(&kind_str),
+                &content,
+                valid_from,
+                now,
+                embedding,
+            ),
             None => return Ok(tool_error("server has no signing identity".to_string())),
         };
         let id = node.compute_id();
@@ -713,12 +730,37 @@ impl<'a> MemoryMcpServer<'a> {
             Err(deny) => return Ok(deny),
         };
         self.store.put_node(&node).map_err(store_err)?;
+        // Never let an embed failure be silent: the node is written and durable,
+        // but it will not answer `memory.search` until it is backfilled.
+        let warning = match embed_err {
+            Some(e) => format!(" — WARNING: not embedded ({e}); this node will NOT be findable by memory.search until backfilled"),
+            None => String::new(),
+        };
         Ok(tool_text(format!(
-            "asserted {} [{}] in {repo} by {}",
+            "asserted {} [{}] in {repo} by {}{warning}",
             &id.to_hex()[..12],
             node.kind.discriminant(),
             self.grant.recipient
         )))
+    }
+
+    /// Embed `content` in the space this server searches in: the configured query
+    /// embedder when the store has a real one, else the same hashing space
+    /// `Recall::new` defaults to. Matching matters as much as embedding at all,
+    /// since the index skips vectors from a mismatched model, which looks exactly
+    /// like no vector.
+    ///
+    /// Best-effort: an embedder failure returns the error for the caller to see
+    /// rather than rejecting an otherwise valid, durable write.
+    fn embed_for_write(&self, content: &str) -> (Option<mem_core::VersionedVector>, Option<String>) {
+        let result = match &self.query_embedder {
+            Some(e) => e.embed(content),
+            None => mem_index::HashingEmbedder::new(mem_query::EMBED_DIM).embed(content),
+        };
+        match result {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e.to_string())),
+        }
     }
 
     /// Merge a signed memory-diff (session subgraph). Write-gated on every repo the
@@ -814,11 +856,31 @@ fn edge_kind_from_str(s: &str) -> Option<EdgeKind> {
     }
 }
 
+/// Node kinds an MCP client may assert.
+///
+/// Kept in lockstep with the gateway's HTTP `/assert` parser
+/// (`mem-gateway/src/http.rs::parse_kind`): the two used to disagree, so the
+/// same logical write landed as a different kind depending on which surface the
+/// caller could reach, and a connect-token principal (which cannot use the
+/// OIDC-only HTTP route) could not reach `AgentAction` or `WorkPackage` at all.
+///
+/// This matters more than it looks: `kind` **is** identity-bearing
+/// (`MemoryNode::compute_id` covers it), so a node written under a fallback kind
+/// cannot be re-typed later. Correcting it mints a second node instead of fixing
+/// the first. Unknown kinds still fall back to `Rationale` rather than erroring.
 fn node_kind_from_str(s: &str) -> NodeKind {
     match s.to_ascii_lowercase().as_str() {
         "claim" => NodeKind::Claim(ClaimStatus::Confirmed),
         "analogy" | "analogy_hypothesis" => NodeKind::AnalogyHypothesis,
         "doc" | "note" => NodeKind::Doc,
+        "finding" => NodeKind::Finding,
+        "blocker" => NodeKind::Blocker,
+        "techdebt" | "tech_debt" => NodeKind::TechDebt,
+        "workpackage" | "work_package" => NodeKind::WorkPackage,
+        "adr" => NodeKind::Adr,
+        "handoff" => NodeKind::Handoff,
+        "benchmark" => NodeKind::Benchmark,
+        "agentaction" | "agent_action" => NodeKind::AgentAction,
         _ => NodeKind::Rationale,
     }
 }
@@ -997,13 +1059,14 @@ fn tools_list() -> Value {
         },
         {
             "name": "memory.assert",
-            "description": "Append a signed assertion (Asserted plane) — a rationale/claim/note that lives nowhere else. Requires write scope.",
+            "description": "Append a signed assertion (Asserted plane) — a rationale/claim/note that lives nowhere else. Embedded at write time, so it is findable by memory.search. Requires write scope.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo": { "type": "string" },
                     "content": { "type": "string", "description": "the assertion text" },
-                    "kind": { "type": "string", "enum": ["rationale", "claim", "analogy", "note"], "default": "rationale" }
+                    "kind": { "type": "string", "enum": ["rationale", "claim", "analogy", "note", "doc", "finding", "blocker", "techdebt", "workpackage", "adr", "handoff", "benchmark", "agentaction"], "default": "rationale" },
+                    "valid_from": { "type": "integer", "description": "real-world date this became true, ms since epoch (a proof date, a publish date). Defaults to now. Not the write time — that is recorded separately as observed_at." }
                 },
                 "required": ["repo", "content"]
             }
@@ -1516,6 +1579,131 @@ mod tests {
         assert_eq!(v["result"]["isError"], true);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("signing identity"));
+    }
+
+    /// The one node in `repo` whose content matches `needle`, or panic.
+    fn stored(s: &MemoryDagStore<MemoryNode>, repo: &str, needle: &str) -> MemoryNode {
+        s.all_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.repo == repo && String::from_utf8_lossy(&n.content).contains(needle))
+            .unwrap_or_else(|| panic!("no node in {repo} containing {needle:?}"))
+    }
+
+    /// The write path must produce a node the read path can find.
+    ///
+    /// `Asserter::assert_node` hardcodes `embedding: None`, and `Recall::search`
+    /// only indexes nodes where `embedding` is `Some` (there is no plane filter,
+    /// so a missing vector is the *whole* reason an assertion is unfindable).
+    /// Confirmed against the live gateway 2026-07-24: a tenant reporting
+    /// `1 nodes` returned `showing 0` for a query matching that node's text
+    /// verbatim. That makes the Asserted plane useless for retrieval-by-topic,
+    /// which is what any grounding or persona-recall workflow is built on.
+    #[test]
+    fn asserted_node_is_semantically_searchable() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        let wrote = call_json(
+            &mut srv,
+            "memory.assert",
+            json!({
+                "repo": "citrate-chain",
+                "kind": "claim",
+                "content": "the paymaster sponsors passkey wallet deployment",
+            }),
+        );
+        assert_eq!(wrote["isError"], false, "assert must succeed: {}", text_of(&wrote));
+
+        assert!(
+            stored(&s, "citrate-chain", "paymaster").embedding.is_some(),
+            "an asserted node must carry an embedding, or search can never see it"
+        );
+
+        let found = call_json(
+            &mut srv,
+            "memory.search",
+            json!({ "repo": "citrate-chain", "query": "paymaster sponsors passkey wallet", "budget": 5 }),
+        );
+        assert_eq!(found["isError"], false);
+        let text = text_of(&found);
+        assert!(
+            text.contains("paymaster sponsors passkey"),
+            "asserted node must be findable by semantic search, got:\n{text}"
+        );
+    }
+
+    /// The node must land in the SAME vector space the search will query with,
+    /// or the index's model guard silently skips it and we are back to invisible.
+    #[test]
+    fn asserted_node_uses_the_servers_query_embedder() {
+        let s = store();
+        // A non-default space (d=64), as if the store were bge-embedded and the
+        // gateway had handed us the matching embedder.
+        let embedder: Arc<dyn Embedder> = Arc::new(mem_index::HashingEmbedder::new(64));
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter())
+            .with_query_embedder(Arc::clone(&embedder));
+        call_json(
+            &mut srv,
+            "memory.assert",
+            json!({ "repo": "citrate-chain", "kind": "note", "content": "belnap join surfaces contradiction" }),
+        );
+        let v = stored(&s, "citrate-chain", "belnap join").embedding.expect("embedded");
+        assert_eq!(v.model, embedder.model_id(), "must embed in the server's space, not a default");
+        assert_eq!(v.data.len(), 64);
+    }
+
+    /// A FactCard's proof date and a Post's publish date are real-world dates.
+    /// `assert_node` stamps `valid_from = now`, so `memory.as_of` answers the
+    /// wrong question. `valid_from` is excluded from `compute_id`, so accepting
+    /// it is a pure addition that cannot change node identity.
+    #[test]
+    fn assert_accepts_explicit_valid_from() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        call_json(
+            &mut srv,
+            "memory.assert",
+            json!({
+                "repo": "citrate-chain",
+                "kind": "claim",
+                "content": "54 contracts deployed and byte-verified",
+                "valid_from": 1_752_883_200_000u64,   // the real proof date
+            }),
+        );
+        let n = stored(&s, "citrate-chain", "54 contracts");
+        assert_eq!(n.valid_from, 1_752_883_200_000, "world date, not write time");
+        assert!(n.observed_at >= n.valid_from, "observed_at stays the write time");
+    }
+
+    /// The MCP and HTTP assert surfaces disagreed: the gateway's `parse_kind`
+    /// reaches `AgentAction`/`WorkPackage`/`Finding`/..., the MCP one collapsed
+    /// everything it did not recognise to `Rationale`. `kind` IS identity-bearing
+    /// (`compute_id` covers it), so a node written under the wrong kind cannot be
+    /// re-typed later without minting a second node. The two surfaces must agree.
+    #[test]
+    fn assert_kind_set_matches_the_http_surface() {
+        for (arg, want) in [
+            ("claim", NodeKind::Claim(ClaimStatus::Confirmed)),
+            ("doc", NodeKind::Doc),
+            ("note", NodeKind::Doc),
+            ("analogy", NodeKind::AnalogyHypothesis),
+            ("rationale", NodeKind::Rationale),
+            ("agentaction", NodeKind::AgentAction),
+            ("agent_action", NodeKind::AgentAction),
+            ("workpackage", NodeKind::WorkPackage),
+            ("work_package", NodeKind::WorkPackage),
+            ("finding", NodeKind::Finding),
+            ("blocker", NodeKind::Blocker),
+            ("techdebt", NodeKind::TechDebt),
+            ("tech_debt", NodeKind::TechDebt),
+            ("adr", NodeKind::Adr),
+            ("handoff", NodeKind::Handoff),
+            ("benchmark", NodeKind::Benchmark),
+        ] {
+            assert_eq!(node_kind_from_str(arg), want, "kind {arg:?} must map to {want:?}");
+        }
+        // Unknown kinds still fall back rather than erroring (unchanged behaviour).
+        assert_eq!(node_kind_from_str("wat"), NodeKind::Rationale);
     }
 
     /// Grant readable (+writable) on BOTH fixture tenants.

@@ -948,6 +948,16 @@ mod tests {
         assert_eq!(rep2.branches_ingested, 0);
         assert_eq!(rep2.unchanged, 1);
 
+        // Regression: `refs/remotes/origin/HEAD` must not be enumerated. Git
+        // abbreviates it to plain `origin` (not `origin/HEAD`), so a short-name
+        // guard missed it and it became a phantom branch named `origin` pointing
+        // at the default tip, inflating `unchanged` and writing a junk watermark
+        // for every mirrored repo.
+        let default_ref = git::default_branch_ref(&mirror).expect("default ref");
+        let listed = git::list_branches(&mirror, &default_ref).expect("list");
+        let names: Vec<&str> = listed.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["feat/x"], "only the real non-default branch is enumerated");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
