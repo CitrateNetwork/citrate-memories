@@ -160,11 +160,31 @@ fn session_grant(sk: &SigningKey) -> CapabilityGrant {
 /// The hashing baseline needs no setup, so a hashing store returns `None`.
 #[cfg(feature = "transformer")]
 fn load_query_embedder(store: &MemoryDagStore<MemoryNode>) -> Option<Arc<dyn Embedder>> {
-    let model = mem_query::detect_store_embedding_model(store).ok().flatten()?;
-    if model != mem_index::transformer::DEFAULT_MODEL_ID {
-        return None;
+    let detected = mem_query::detect_store_embedding_model(store).ok().flatten();
+    // `CITRATE_MEM_EMBED=bge` FORCES the BGE embedder even on a FRESH store (none
+    // detected yet). Without it, a brand-new store's first write falls back to the
+    // HashingEmbedder (embed_for_write) and locks the store to lexical vectors
+    // forever — so a client that wants semantic recall (citrate-core) sets this to
+    // bootstrap the store to BGE for BOTH writes and queries. A store ALREADY
+    // embedded with a different (non-BGE) model is never overridden.
+    let force_bge = std::env::var("CITRATE_MEM_EMBED")
+        .map(|v| v.eq_ignore_ascii_case("bge"))
+        .unwrap_or(false);
+    match detected.as_deref() {
+        Some(m) if m == mem_index::transformer::DEFAULT_MODEL_ID => {
+            eprintln!("mem-mcp: store embedded with '{m}', loading transformer embedder…");
+        }
+        Some(other) => {
+            if force_bge {
+                eprintln!("mem-mcp: store already embedded with '{other}', not overriding to BGE");
+            }
+            return None;
+        }
+        None if force_bge => {
+            eprintln!("mem-mcp: fresh store, CITRATE_MEM_EMBED=bge → bootstrapping to BGE");
+        }
+        None => return None,
     }
-    eprintln!("mem-mcp: store embedded with '{model}', loading transformer embedder…");
     match mem_index::TransformerEmbedder::bge_base() {
         Ok(e) => Some(Arc::new(e)),
         Err(e) => {

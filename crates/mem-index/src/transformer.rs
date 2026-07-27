@@ -53,21 +53,51 @@ impl TransformerEmbedder {
     /// vector (and enforced by the index guard), and `revision` pins the repo.
     pub fn load(repo: &str, model_id: &str, revision: &str) -> Result<Self, EmbedError> {
         let device = Device::Cpu;
-        let api = Api::new().map_err(|e| EmbedError::Load(format!("hf-hub init: {e}")))?;
-        let repo_handle = api.repo(Repo::with_revision(
-            repo.to_string(),
-            RepoType::Model,
-            revision.to_string(),
-        ));
 
-        let get = |file: &str| -> Result<std::path::PathBuf, EmbedError> {
-            repo_handle
-                .get(file)
-                .map_err(|e| EmbedError::Load(format!("fetch {file} from {repo}: {e}")))
-        };
-        let config_path = get("config.json")?;
-        let tokenizer_path = get("tokenizer.json")?;
-        let weights_path = get("model.safetensors")?;
+        // Offline, pinned weights: if `CITRATE_BGE_MODEL_DIR` points at a directory
+        // holding `config.json`, `tokenizer.json`, and `model.safetensors`, load
+        // them DIRECTLY and skip the HuggingFace Hub download entirely. citrate-core
+        // sets this to a bundled resource dir so a packaged app needs no runtime
+        // network and ships pinned/verified weights (supply-chain-safe for a T1
+        // app). Absent the env, fall back to the HF Hub cache (downloading on first
+        // use) — the reproducible default for dev + servers.
+        let (config_path, tokenizer_path, weights_path) =
+            match std::env::var("CITRATE_BGE_MODEL_DIR") {
+                Ok(dir) if !dir.is_empty() => {
+                    let d = std::path::PathBuf::from(dir);
+                    let need = |f: &str| -> Result<std::path::PathBuf, EmbedError> {
+                        let p = d.join(f);
+                        if p.is_file() {
+                            Ok(p)
+                        } else {
+                            Err(EmbedError::Load(format!(
+                                "CITRATE_BGE_MODEL_DIR is set but {f} is missing at {}",
+                                p.display()
+                            )))
+                        }
+                    };
+                    (
+                        need("config.json")?,
+                        need("tokenizer.json")?,
+                        need("model.safetensors")?,
+                    )
+                }
+                _ => {
+                    let api =
+                        Api::new().map_err(|e| EmbedError::Load(format!("hf-hub init: {e}")))?;
+                    let repo_handle = api.repo(Repo::with_revision(
+                        repo.to_string(),
+                        RepoType::Model,
+                        revision.to_string(),
+                    ));
+                    let get = |file: &str| -> Result<std::path::PathBuf, EmbedError> {
+                        repo_handle
+                            .get(file)
+                            .map_err(|e| EmbedError::Load(format!("fetch {file} from {repo}: {e}")))
+                    };
+                    (get("config.json")?, get("tokenizer.json")?, get("model.safetensors")?)
+                }
+            };
 
         let config_json = std::fs::read_to_string(&config_path)
             .map_err(|e| EmbedError::Load(format!("read config.json: {e}")))?;
