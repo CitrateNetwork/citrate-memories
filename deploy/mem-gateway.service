@@ -1,46 +1,51 @@
-# Memrizz mem-gateway — systemd unit for the DGX (spark-2e01).
+# mem-gateway — systemd unit TEMPLATE (fill the placeholders for your deployment)
 #
-# WHY HERE: the federation store (RocksDB) and the bge embedder both live on the
-# DGX, so the gateway runs co-located with them. It binds to the DGX's Tailscale
-# IP; the public TLS hostname (mem-gateway.citrate.ai) is fronted by Caddy on the
-# droplet (citrate-rpc-1, 142.93.58.145), which reverse-proxies over Tailscale —
-# exactly the infer.citrate.ai pattern. So the handoff's "--bind 127.0.0.1:8799"
-# becomes the Tailscale IP here, because Caddy is NOT co-located.
+# Run the gateway on the backend host co-located with the RocksDB store + the
+# embedder. Bind it to a private address; terminate public TLS on a separate
+# edge host with Caddy (see deploy/Caddyfile.mem-gateway).
+#
+# Placeholders:
+#   <INSTALL_DIR>    where the repo/binary lives, e.g. /opt/mem-gateway
+#   <RUN_USER>       unprivileged service account, e.g. mem-gateway
+#   <BIND_ADDR>      private bind address:port, e.g. 10.0.0.5:8799 or 127.0.0.1:8799
+#   <ORG>            your org/tenant slug (or set MEM_DEFAULT_ORG)
+#   <OIDC_ISSUER>    your OIDC issuer URL, e.g. https://auth.example.com
+#   <OIDC_AUDIENCE>  the client_id this gateway accepts tokens for
 #
 # Install:
 #   sudo cp deploy/mem-gateway.service /etc/systemd/system/
-#   sudo mkdir -p /etc/memrizz /var/lib/memrizz
-#   curl -s https://auth.citrate.ai/jwks -o /etc/memrizz/jwks.json
-#   # write /etc/memrizz/mem-gateway.env (chmod 600) with the two secrets below
+#   sudo mkdir -p /etc/mem-gateway /var/lib/mem-gateway
+#   curl -s <OIDC_ISSUER>/jwks -o /etc/mem-gateway/jwks.json
+#   # write /etc/mem-gateway/mem-gateway.env (chmod 600) with the two secrets below
 #   sudo systemctl daemon-reload && sudo systemctl enable --now mem-gateway
 
 [Unit]
-Description=Memrizz mem-gateway (citrate-memories HTTP API)
-After=network-online.target tailscaled.service
+Description=mem-gateway (citrate-memories HTTP API)
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=saul
-WorkingDirectory=/home/saul/Projects/Citrate-Labs/citrate-memories
+User=<RUN_USER>
+WorkingDirectory=<INSTALL_DIR>
 
-# --- OIDC (production: fail-closed). aud MUST be the client_id `memrizz`. ---
-Environment=OIDC_ISSUER=https://auth.citrate.ai
-Environment=OIDC_AUDIENCE=memrizz
-Environment=OIDC_JWKS_FILE=/etc/memrizz/jwks.json
+# --- OIDC (production: fail-closed). Audience MUST be the accepted client_id. ---
+Environment=OIDC_ISSUER=<OIDC_ISSUER>
+Environment=OIDC_AUDIENCE=<OIDC_AUDIENCE>
+Environment=OIDC_JWKS_FILE=/etc/mem-gateway/jwks.json
 
 # --- durable state (survives restart; back this volume up) ---
-Environment=MEM_GATEWAY_CONTROL_PATH=/var/lib/memrizz/control.json
-Environment=MEM_GATEWAY_AUDIT_PATH=/var/lib/memrizz/gateway-audit.jsonl
+Environment=MEM_GATEWAY_CONTROL_PATH=/var/lib/mem-gateway/control.json
+Environment=MEM_GATEWAY_AUDIT_PATH=/var/lib/mem-gateway/gateway-audit.jsonl
 
 # --- secrets: MEM_GATEWAY_ASSERTER_SEED + MEM_CONNECT_SECRET (chmod 600) ---
-#     MEM_CONNECT_SECRET MUST byte-match the value set on Vercel (memrizz).
-EnvironmentFile=/etc/memrizz/mem-gateway.env
+#     MEM_CONNECT_SECRET MUST byte-match the value your webapp/BFF uses.
+EnvironmentFile=/etc/mem-gateway/mem-gateway.env
 
-ExecStart=/home/saul/Projects/Citrate-Labs/citrate-memories/target/release/mem-gateway \
-  --org citrate-federation \
-  --store /home/saul/Projects/Citrate-Labs/citrate-memories/data/federation.bge.memdag \
-  --bind 100.68.173.64:8799
+ExecStart=<INSTALL_DIR>/target/release/mem-gateway \
+  --org <ORG> \
+  --store <INSTALL_DIR>/data/federation.bge.memdag \
+  --bind <BIND_ADDR>
 
 Restart=always
 RestartSec=3

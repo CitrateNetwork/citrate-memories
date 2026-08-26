@@ -19,9 +19,17 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The org whose repos this feed will ingest. A push for any other owner is
-/// rejected before parsing.
-pub const ALLOWED_OWNER: &str = "CitrateNetwork";
+/// The org whose repos this feed will ingest, from `MEM_ALLOWED_OWNER`
+/// (default `CitrateNetwork`). A push for any other owner is rejected before
+/// parsing. Never resolves to empty/wildcard — a blank env falls back to the
+/// default so the allowlist stays fail-closed to a single named owner.
+pub fn allowed_owner() -> String {
+    std::env::var("MEM_ALLOWED_OWNER")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "CitrateNetwork".to_string())
+}
 
 /// A decoded, trusted push event (only the fields the feed needs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +90,7 @@ pub fn is_safe_repo_name(name: &str) -> bool {
 /// bare repo name when accepted, else None (foreign owner or unsafe name).
 pub fn allowed_repo(full_name: &str) -> Option<String> {
     let (owner, repo) = full_name.split_once('/')?;
-    if owner != ALLOWED_OWNER {
+    if owner != allowed_owner() {
         return None;
     }
     if !is_safe_repo_name(repo) {

@@ -63,4 +63,4 @@ merged branches. Sprints live under
 `citrate-federation/repos/citrate-memories/sprints/`.
 
 ---
-© 2026 Citrate Inc.. Licensed under Apache-2.0.
+© 2026 Citrate Inc. Licensed under Apache-2.0.
