@@ -1,0 +1,32 @@
+# Public release allowlist — the ONLY paths exported to the public repo.
+#
+# Fail-closed by design: the exporter (scripts/build-public-release.sh) copies a
+# tracked file ONLY if it matches an entry here. Anything not listed — data/,
+# webapp/, PLANSET/, .agentile/, handoffs/, audits/, mutants.out*, internal docs,
+# the DAG itself — can never leak, even if added later.
+#
+# A line ending in "/" matches that directory and everything under it.
+# A line without a trailing "/" matches that exact file.
+# Lines starting with "#" and blank lines are ignored.
+
+# --- Build + license + hygiene ---
+Cargo.toml
+Cargo.lock
+LICENSE
+NOTICE
+.gitignore
+.gitleaks.toml
+
+# --- The engine: all 10 mem-* crates (owner decision 2026-08-26) ---
+crates/
+
+# --- Operator templates (sanitized in PR #18; no real infra) ---
+deploy/
+
+# --- Local MCP launchers ---
+scripts/mcp-stdio.sh
+scripts/mcp-connector.py
+
+# NOTE: README.md is NOT listed here — the exporter substitutes the standalone
+# oss/README.public.md so the public repo never ships internal PLANSET/handoff
+# links. .github/ is intentionally excluded (write fresh public CI separately).

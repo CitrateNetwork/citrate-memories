@@ -1,4 +1,0 @@
-crates/mem-authz/src/audit.rs:280:9: replace AuditChain::is_empty -> bool with true
-crates/mem-authz/src/audit.rs:280:9: replace AuditChain::is_empty -> bool with false
-crates/mem-authz/src/audit.rs:237:9: replace AuditChain::log_path -> Option<&Path> with None
-crates/mem-authz/src/audit.rs:149:20: delete ! in AuditChain::open
