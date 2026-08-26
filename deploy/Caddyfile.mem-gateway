@@ -1,22 +1,28 @@
-# mem-gateway.citrate.ai — append this block to the droplet Caddyfile
-# (/etc/caddy/Caddyfile on citrate-rpc-1, 142.93.58.145), then:
+# mem-gateway reverse-proxy — TEMPLATE (fill the placeholders for your deployment)
+#
+# Append this block to your edge host's Caddyfile, then:
 #   caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy
 #
-# Mirrors the infer.citrate.ai block: Caddy owns public TLS and reverse-proxies
-# over Tailscale to the service running on the DGX. The DGX mem-gateway listens
-# on its Tailscale IP 100.68.173.64:8799.
+# Pattern: Caddy owns public TLS on an edge/CDN host and reverse-proxies to the
+# mem-gateway service running on a backend host (co-located with the RocksDB
+# store + embedder). If the backend is reachable only over a private network
+# (e.g. Tailscale/WireGuard), point reverse_proxy at its private address.
 #
-# NO CORS: the Memrizz webapp reaches this server-to-server (Vercel BFF →
-# gateway), never browser → gateway. Do not add Access-Control-Allow-Origin.
+# Placeholders:
+#   <PUBLIC_HOSTNAME>   e.g. mem-gateway.example.com
+#   <BACKEND_ADDR>      backend host:port, e.g. 10.0.0.5:8799 or a private-net IP
+#
+# NO CORS: the webapp/BFF reaches this server-to-server, never browser -> gateway.
+# Do not add Access-Control-Allow-Origin.
 
-https://mem-gateway.citrate.ai {
+https://<PUBLIC_HOSTNAME> {
 	encode gzip
 
 	# Caddy-handled liveness (the app also serves GET /api/health).
 	@health path /healthz
 	respond @health "ok" 200
 
-	reverse_proxy 100.68.173.64:8799 {
+	reverse_proxy <BACKEND_ADDR> {
 		# CRITICAL: forward the bearer — the gateway independently verifies
 		# the user's id_token (iss+aud+exp, RS256). Caddy forwards by default;
 		# explicit so a future edit can't silently strip it.
@@ -26,7 +32,7 @@ https://mem-gateway.citrate.ai {
 
 		transport http {
 			# The /api/orgs/:org/layout endpoint can be heavy on first build
-			# (PCA over the federation embeddings), then it's cached.
+			# (PCA over the embeddings), then it's cached.
 			read_timeout 300s
 			write_timeout 300s
 			dial_timeout 5s

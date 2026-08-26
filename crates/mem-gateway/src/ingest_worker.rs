@@ -31,7 +31,7 @@ use mem_ingest::Ingestor;
 use mem_store::MemoryDagStore;
 
 use crate::http::AppState;
-use crate::webhook::{PushEvent, ALLOWED_OWNER};
+use crate::webhook::{allowed_owner, PushEvent};
 
 /// Poll interval for the queue. Pushes are bursty; coalescing per cycle means a
 /// flurry of commits to one repo costs one ingest.
@@ -112,12 +112,21 @@ pub fn ensure_mirror(base: &Path, repo: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// The mirror root: `MEM_INGEST_MIRROR_DIR` or a sensible user-writable default.
+/// The mirror root: `MEM_INGEST_MIRROR_DIR`, else an XDG/HOME-based user cache
+/// (`$XDG_CACHE_HOME` or `$HOME/.cache`), falling back to `./.cache` when neither
+/// is set. No machine- or user-specific path is baked in.
 fn mirror_base() -> PathBuf {
-    PathBuf::from(
-        std::env::var("MEM_INGEST_MIRROR_DIR")
-            .unwrap_or_else(|_| "/home/saul/.cache/memrizz/mirrors".to_string()),
-    )
+    if let Ok(dir) = std::env::var("MEM_INGEST_MIRROR_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let cache = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.cache")))
+        .unwrap_or_else(|| ".cache".to_string());
+    PathBuf::from(cache).join("mem-gateway").join("mirrors")
 }
 
 /// Drain every queued event once: coalesce to unique repos, then mirror + ingest
@@ -205,7 +214,7 @@ pub fn drain_once(state: &AppState, base: &Path) -> usize {
 /// Validate a bare repo name through the same allowlist the webhook uses, so a
 /// name that reaches `git` is always org-scoped and free of shell/path metachars.
 fn safe_repo(name: &str) -> Option<String> {
-    crate::webhook::allowed_repo(&format!("{ALLOWED_OWNER}/{}", name.trim()))
+    crate::webhook::allowed_repo(&format!("{}/{}", allowed_owner(), name.trim()))
 }
 
 /// The set of federation repos to keep current: every repo we've already mirrored

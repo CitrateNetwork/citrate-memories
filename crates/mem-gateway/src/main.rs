@@ -29,8 +29,11 @@ struct Args {
 }
 
 fn parse_args() -> Args {
-    let mut org = DEFAULT_ORG.to_string();
-    let mut store = DEFAULT_STORE.to_string();
+    // Defaults are env-configurable so a deployment need not hardcode the org or
+    // store path on the CLI; an explicit `--org`/`--store` flag still wins below.
+    let mut org = std::env::var("MEM_DEFAULT_ORG").unwrap_or_else(|_| DEFAULT_ORG.to_string());
+    let mut store =
+        std::env::var("MEM_DEFAULT_STORE").unwrap_or_else(|_| DEFAULT_STORE.to_string());
     let mut bind = DEFAULT_BIND.to_string();
     let mut bootstrap_owner = None;
 

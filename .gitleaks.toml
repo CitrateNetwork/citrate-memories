@@ -1,0 +1,21 @@
+# gitleaks config for citrate-memories.
+# Extends the default ruleset and allowlists known non-secret test fixtures so a
+# public scan does not flag them. Do NOT add real secrets here.
+
+title = "citrate-memories gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test-only fixtures and documented placeholders (no real credentials)"
+paths = [
+  # Throwaway 2048-bit RSA key used ONLY under #[cfg(test)] to sign JWTs in the
+  # OIDC verifier unit tests (crates/mem-gateway/src/oidc.rs). Not a credential.
+  '''crates/mem-gateway/src/testdata/oidc_test_rsa\.pem''',
+]
+regexes = [
+  # Placeholder tokens in docs/runbooks (e.g. PASTE_YOUR_TOKEN_HERE, cgk_XXXX).
+  '''PASTE_YOUR_TOKEN_HERE''',
+  '''cgk_XXXX''',
+]
