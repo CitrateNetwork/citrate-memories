@@ -45,7 +45,7 @@ no-auth. This means the OSS-ahead-of-chain story is ~90% there by architecture a
 
 ### Open access gaps (owner-side)
 - **Tailnet ops path is broken from the laptop.** Even with Tailscale up, the DGX
-  (`spark-2e01` / `100.68.173.64`) is not an enrolled peer and the droplet peer
+  (the DGX (private tailnet host/IP)) is not an enrolled peer and the droplet peer
   (`citrate-rpc-1`) shows offline 86d. Production serves publicly, but store ops
   (rebuild/re-encrypt/inspect the DAG, mint the `cgk_` key, restart the gateway) can only
   run from `larrys-mac-studio` or on the boxes until the tailnet is reconciled.
@@ -87,7 +87,7 @@ recalls storyline/code-shape and asserts signed memory against the live DAG.
   `DEFAULT_ORG="citrate-federation"` (`mem-gateway/src/main.rs:19`), webhook allowlist
   `ALLOWED_OWNER="CitrateNetwork"` (`mem-gateway/src/webhook.rs:24`), git remote default
   `git@github.com:CitrateNetwork` (`ingest_worker.rs:92`), mirror path
-  `/home/saul/.cache/memrizz/mirrors` (`ingest_worker.rs:119`) → `MEM_DEFAULT_ORG`,
+  a personal `$HOME` cache path (`ingest_worker.rs:119`) → `MEM_DEFAULT_ORG`,
   `MEM_ALLOWED_OWNER`, `MEM_GIT_REMOTE`, `$HOME`-based cache, with neutral defaults.
 
 ## Phase 3 — OSS extraction (public repo, shipped ahead of the chain)
@@ -96,14 +96,13 @@ recalls storyline/code-shape and asserts signed memory against the live DAG.
 1. **Add `LICENSE` + `NOTICE`.** README/Cargo declare Apache-2.0 but no license text file exists.
 2. **Reconcile copyright.** README says "© Citrate Inc."; Cargo authors say "Citrate
    Network / Citrate Inc.". Pick one entity; add consistent SPDX headers.
-3. **Sanitize `deploy/` (tracked).** Leaks tailnet IP `100.68.173.64`, DGX `spark-2e01`,
-   `/home/saul/...` in `Caddyfile.mem-gateway`, `mem-gateway.service`, `deploy/README.md`.
+3. **Sanitize `deploy/` (tracked).** Leaks the DGX tailnet IP + host,
+   the droplet IP, and a `$HOME` path in `Caddyfile.mem-gateway`, `mem-gateway.service`, `deploy/README.md`.
    Replace with placeholders / ship as `.example` templates.
 4. **Delete/exclude the tracked handoff** `handoffs/MEM_GATEWAY_P3_P4_UNBLOCK_HANDOFF_2026-07-19.md`
    — leaks DGX host, tailnet IP, droplet topology, SSH notes. Audit the whole `handoffs/` convention.
 4a. **History scrub is mandatory (not just HEAD).** Sanitizing the working tree (done in the
-   OSS-prep PR) removes leaks from HEAD, but the real infra values (`100.68.173.64`,
-   `spark-2e01`, `142.93.58.145`, `/home/saul`) remain in prior commits. The PRIVATE→PUBLIC
+   OSS-prep PR) removes leaks from HEAD, but the real infra values (the DGX tailnet IP + host, the droplet IP, and a `$HOME` path) remain in prior commits. The PRIVATE→PUBLIC
    flip must therefore be a **curated/squashed export or a fresh-history public mirror**, not
    a raw history flip of this repo. Treat the git history as leaked until scrubbed.
 

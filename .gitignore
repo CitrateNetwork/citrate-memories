@@ -10,3 +10,7 @@
 specs/tla2tools.jar
 specs/*_TTrace_*
 specs/states/
+
+# OSS history-scrub replacements (contains real infra values — never commit)
+oss-scrub-replacements.txt
+*.scrub-replacements.txt
