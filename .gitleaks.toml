@@ -13,9 +13,14 @@ paths = [
   # Throwaway 2048-bit RSA key used ONLY under #[cfg(test)] to sign JWTs in the
   # OIDC verifier unit tests (crates/mem-gateway/src/oidc.rs). Not a credential.
   '''crates/mem-gateway/src/testdata/oidc_test_rsa\.pem''',
+  # Chain-state ingest test fixture: recorded on-chain block data (public
+  # Ethereum-style addresses / tx hashes for chain 40204). Not secrets.
+  '''crates/mem-ingest/tests/fixtures/40204\.json''',
 ]
 regexes = [
   # Placeholder tokens in docs/runbooks (e.g. PASTE_YOUR_TOKEN_HERE, cgk_XXXX).
   '''PASTE_YOUR_TOKEN_HERE''',
   '''cgk_XXXX''',
+  # False positive: a doc comment about L2-normalised embedding vectors.
+  '''L2-normalised''',
 ]

@@ -14,3 +14,7 @@ specs/states/
 # OSS history-scrub replacements (contains real infra values — never commit)
 oss-scrub-replacements.txt
 *.scrub-replacements.txt
+
+# mutation-testing artifacts (regeneratable; never tracked/published)
+mutants.out/
+mutants.out.old/
