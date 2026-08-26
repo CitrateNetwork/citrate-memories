@@ -1,14 +1,7 @@
 citrate-memories
 Copyright 2026 Citrate Inc.
 
-This product includes software developed by the Citrate Network / Citrate Inc. and its contributors.
+This product includes software developed by Citrate Inc. and its contributors.
 
 Licensed under the Apache License, Version 2.0. See the LICENSE file for the
 full license text.
-
----
-NOTE (pre-release): the copyright holder above matches the declaration in
-README.md and Cargo.toml at the time of writing. Confirm the definitive legal
-entity (Citrate Inc. vs. Citrate Network vs. Citrate Inc.) before the
-PRIVATE -> PUBLIC flip, and reconcile LICENSE, NOTICE, README, and Cargo.toml
-`authors` to that single entity.

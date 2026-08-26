@@ -19,7 +19,7 @@ members = [
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Citrate Network / Citrate Inc."]
+authors = ["Citrate Inc."]
 repository = "https://github.com/CitrateNetwork/citrate-memories"
 
 [workspace.dependencies]
