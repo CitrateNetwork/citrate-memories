@@ -12,10 +12,21 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LIVE="$REPO/data/federation.bge.memdag"
+# Prefer the encrypted store; fall back to the plaintext one. Override with
+# MEM_MCP_STORE. The encrypted store needs no external key to open — the
+# per-tenant keys live in the store's keyring column family (crypto-shred model),
+# so a snapshot reads fine on its own.
+if [ -n "${MEM_MCP_STORE:-}" ]; then
+  LIVE="$MEM_MCP_STORE"
+elif [ -d "$REPO/data/federation.bge.enc.memdag" ]; then
+  LIVE="$REPO/data/federation.bge.enc.memdag"
+else
+  LIVE="$REPO/data/federation.bge.memdag"
+fi
 SNAP="${MEM_MCP_SNAPSHOT:-/tmp/mem-snapshot.memdag}"
 BIN="$REPO/target/release/examples/mcp_stdio"
 
+[ -d "$LIVE" ] || { echo "mcp-stdio: no store at $LIVE (set MEM_MCP_STORE)" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "mcp-stdio: missing $BIN — build with: cargo build -p mem-mcp --example mcp_stdio --features rocksdb,transformer --release" >&2; exit 1; }
 
 # (Re)take the snapshot from the live store, then drop the copied LOCK so we can open it.
