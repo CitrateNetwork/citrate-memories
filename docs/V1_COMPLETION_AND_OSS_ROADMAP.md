@@ -101,6 +101,16 @@ recalls storyline/code-shape and asserts signed memory against the live DAG.
    Replace with placeholders / ship as `.example` templates.
 4. **Delete/exclude the tracked handoff** `handoffs/MEM_GATEWAY_P3_P4_UNBLOCK_HANDOFF_2026-07-19.md`
    — leaks DGX host, tailnet IP, droplet topology, SSH notes. Audit the whole `handoffs/` convention.
+4a. **History scrub is mandatory (not just HEAD).** Sanitizing the working tree (done in the
+   OSS-prep PR) removes leaks from HEAD, but the real infra values (`100.68.173.64`,
+   `spark-2e01`, `142.93.58.145`, `/home/saul`) remain in prior commits. The PRIVATE→PUBLIC
+   flip must therefore be a **curated/squashed export or a fresh-history public mirror**, not
+   a raw history flip of this repo. Treat the git history as leaked until scrubbed.
+
+**DONE (OSS-prep PR, infra-free slice):** LICENSE+NOTICE added; `deploy/` sanitized to
+placeholder templates; defaults genericized to env-first fail-closed fallbacks
+(`MEM_DEFAULT_ORG`/`MEM_DEFAULT_STORE`/`MEM_ALLOWED_OWNER`, XDG/`$HOME` mirror path);
+`.gitleaks.toml` allowlist for the test RSA fixture. mem-gateway 21 tests green, clippy clean.
 
 **SHOULD-FIX:**
 5. Strip private sibling-repo path refs in `.agentile/AGENT_ENTRY.md`, README, PLANSET
