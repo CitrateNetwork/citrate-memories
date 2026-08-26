@@ -41,7 +41,9 @@ use mem_mcp::MemoryMcpServer;
 use mem_query::{NeighborItem, Recall, RecallItem, RecallResult, TenantIndexCache};
 use mem_store::MemoryDagStore;
 
-use crate::auth::{mint_grant, repo_resource, verify_connect_token, OidcVerifier};
+use crate::auth::{
+    mint_connect_token, mint_grant, repo_resource, verify_connect_token, OidcVerifier,
+};
 use crate::control::{Control, OrgStatus};
 use crate::now_ms;
 use crate::scene::{self, NodeInput, Scene};
@@ -79,6 +81,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/connector.py", get(connector_script))
+        .route("/connect/token", post(connect_token))
         .route("/api/orgs/:org/layout", get(layout))
         .route("/api/orgs/:org/recall", get(recall))
         .route("/api/orgs/:org/search", get(search))
@@ -653,6 +656,32 @@ async fn ops(State(app): State<AppState>, headers: HeaderMap) -> Result<Json<Val
         json!({ "enabled": true, "note": "on-chain anchor lookup not wired in this build" }),
     );
     Ok(Json(Value::Object(obj)))
+}
+
+/// POST /connect/token — trade a verified OIDC id_token for a long-lived HS256
+/// connect token, so a user/agent never handles a raw secret. This is what a
+/// `citrate connect` one-click calls after login: it presents the id_token as a
+/// bearer, and gets back a token it writes to its config. `authenticate` fails
+/// closed when OIDC isn't configured; minting needs `MEM_CONNECT_SECRET`. It
+/// asserts IDENTITY only — authz is still enforced at use time (the BYOM handler
+/// checks org membership), so minting for any authenticated user is safe.
+async fn connect_token(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let sub = authenticate(&app, &headers)?;
+    let secret = app.connect_secret.as_ref().ok_or_else(|| {
+        ApiError::new(StatusCode::NOT_IMPLEMENTED, "connect minting not configured")
+    })?;
+    const TTL_SECS: usize = 30 * 24 * 60 * 60; // 30 days
+    let now_secs = (now_ms() / 1000) as usize;
+    let token = mint_connect_token(secret, &sub, now_secs, TTL_SECS)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "mint failed"))?;
+    Ok(Json(json!({
+        "connect_token": token,
+        "sub": sub,
+        "expires_in": TTL_SECS,
+    })))
 }
 
 /// BYOM (bring-your-own-model) MCP-over-HTTP: a connect-token-authenticated

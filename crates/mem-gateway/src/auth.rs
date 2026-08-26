@@ -117,8 +117,10 @@ pub fn repo_resource(tenant: &str) -> String {
 mod verify {
     use std::collections::HashMap;
 
-    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
-    use serde::Deserialize;
+    use jsonwebtoken::{
+        decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+    };
+    use serde::{Deserialize, Serialize};
     use thiserror::Error;
 
     #[derive(Debug, Error)]
@@ -248,12 +250,41 @@ mod verify {
             .map(|d| d.claims.sub)
             .map_err(|e| AuthError::Token(e.to_string()))
     }
+
+    #[derive(Debug, Serialize)]
+    struct MintClaims {
+        sub: String,
+        exp: usize,
+    }
+
+    /// Mint an HS256 connect token for `sub`, expiring `ttl_secs` after
+    /// `now_secs`. Symmetric with [`verify_connect_token`] — signed with the same
+    /// `MEM_CONNECT_SECRET`, so a token minted here verifies there. This is what
+    /// lets a client trade a verified OIDC id_token for a long-lived agent token,
+    /// so a user never handles a raw secret.
+    pub fn mint_connect_token(
+        secret: &str,
+        sub: &str,
+        now_secs: usize,
+        ttl_secs: usize,
+    ) -> Result<String, AuthError> {
+        let claims = MintClaims {
+            sub: sub.to_string(),
+            exp: now_secs.saturating_add(ttl_secs),
+        };
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .map_err(|e| AuthError::Token(e.to_string()))
+    }
 }
 
 #[cfg(feature = "server")]
 pub use verify::{AuthError, OidcVerifier};
 #[cfg(feature = "server")]
-pub use verify::verify_connect_token;
+pub use verify::{mint_connect_token, verify_connect_token};
 
 #[cfg(test)]
 mod tests {
@@ -268,6 +299,34 @@ mod tests {
             scopes,
             parent: None,
         }
+    }
+
+    #[cfg(feature = "server")]
+    fn now_secs() -> usize {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn minted_connect_token_verifies_and_carries_sub() {
+        let secret = "connect-secret-xyz";
+        // exp in the real future (jsonwebtoken validates exp against system time)
+        let token = mint_connect_token(secret, "user-42", now_secs(), 3600).unwrap();
+        assert_eq!(verify_connect_token(secret, &token).unwrap(), "user-42");
+        // a different secret rejects it
+        assert!(verify_connect_token("wrong-secret", &token).is_err());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn expired_connect_token_is_rejected() {
+        let secret = "s";
+        // minted well in the past (beyond jsonwebtoken's default 60s leeway)
+        let token = mint_connect_token(secret, "u", now_secs() - 1000, 1).unwrap();
+        assert!(verify_connect_token(secret, &token).is_err());
     }
 
     #[test]
