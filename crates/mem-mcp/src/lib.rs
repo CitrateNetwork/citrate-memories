@@ -74,6 +74,12 @@ pub struct MemoryMcpServer<'a> {
     /// distributed tracing). Set for the duration of one `handle_line` and folded
     /// into the audit detail so a call correlates from agent to graph, then cleared.
     req_trace: Option<String>,
+    /// A per-request `_meta` capability grant (2026-07-28 stateless profile),
+    /// validated against the connection-bound grant and applied as an
+    /// *attenuation*: authorization is the intersection of this grant and the
+    /// session grant, never a replacement (MEM-B-001). Set for the duration of one
+    /// `handle_line`, enforced in [`authorize`](Self::authorize), then cleared.
+    req_grant: Option<CapabilityGrant>,
 }
 
 impl<'a> MemoryMcpServer<'a> {
@@ -88,6 +94,7 @@ impl<'a> MemoryMcpServer<'a> {
             write_gate: None,
             audit: Arc::new(Mutex::new(AuditChain::new())),
             req_trace: None,
+            req_grant: None,
         }
     }
 
@@ -106,6 +113,7 @@ impl<'a> MemoryMcpServer<'a> {
             write_gate: None,
             audit: Arc::new(Mutex::new(AuditChain::new())),
             req_trace: None,
+            req_grant: None,
         }
     }
 
@@ -178,30 +186,58 @@ impl<'a> MemoryMcpServer<'a> {
             .and_then(|m| m.get("traceparent"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let restore_grant = match meta.and_then(|m| m.get(GRANT_META_KEY)) {
-            None => None,
+        let has_req_grant = match meta.and_then(|m| m.get(GRANT_META_KEY)) {
+            None => false,
             Some(raw) => match serde_json::from_value::<CapabilityGrant>(raw.clone()) {
                 Err(e) => {
                     self.req_trace = None;
                     return id.map(|id| err_response(id, -32602, &format!("invalid _meta grant: {e}")));
                 }
-                // Fail closed: a grant that does not verify never authorizes a call.
-                Ok(grant) => match grant.verify_signature() {
-                    Err(e) => {
+                // A presented `_meta` grant is an *attenuation* of the
+                // connection-bound (session) grant, never a replacement
+                // (MEM-B-001). Accept it only if it is bound to the same trust
+                // root and principal as the session grant, then intersect the two
+                // in `authorize` so it can only narrow authority:
+                //   1. it verifies against its own embedded key (fail closed);
+                //   2. that key IS the trust root — the same issuer key that
+                //      signed the session grant (the gateway/daemon signing key),
+                //      so a self-signed grant minted by the client is rejected;
+                //   3. it names the same authenticated principal (`recipient`) as
+                //      the session grant, so a caller cannot present a grant issued
+                //      to someone else.
+                Ok(grant) => {
+                    if let Err(e) = grant.verify_signature() {
                         self.req_trace = None;
                         return id.map(|id| err_response(id, GRANT_REJECTED, &format!("grant rejected: {e}")));
                     }
-                    Ok(()) => Some(std::mem::replace(&mut self.grant, grant)),
-                },
+                    if grant.issuer_pubkey != self.grant.issuer_pubkey {
+                        self.req_trace = None;
+                        return id.map(|id| {
+                            err_response(id, GRANT_REJECTED, "grant rejected: issuer is not the trusted grant root")
+                        });
+                    }
+                    if grant.recipient != self.grant.recipient {
+                        self.req_trace = None;
+                        return id.map(|id| {
+                            err_response(
+                                id,
+                                GRANT_REJECTED,
+                                "grant rejected: recipient is not the authenticated principal",
+                            )
+                        });
+                    }
+                    self.req_grant = Some(grant);
+                    true
+                }
             },
         };
 
         let outcome = self.dispatch(&method, params);
 
-        // Restore the connection-bound grant so a per-request override never leaks
-        // into the next call — the property that makes this instance reusable.
-        if let Some(prev) = restore_grant {
-            self.grant = prev;
+        // Clear the per-request grant so an attenuation never leaks into the next
+        // call — the property that makes this instance reusable across principals.
+        if has_req_grant {
+            self.req_grant = None;
         }
         self.req_trace = None;
 
@@ -287,7 +323,14 @@ impl<'a> MemoryMcpServer<'a> {
             Ok(g) => g,
             Err(_) => return Err(tool_error("audit chain lock poisoned; refusing to proceed".to_string())),
         };
-        match self.grant.check(&resource, op, now) {
+        // Effective authority is the intersection of the connection-bound grant
+        // and any per-request `_meta` attenuation: both must permit the op
+        // (MEM-B-001). An attenuation can only narrow, never widen.
+        let decision = self.grant.check(&resource, op, now).and_then(|()| match &self.req_grant {
+            Some(rg) => rg.check(&resource, op, now),
+            None => Ok(()),
+        });
+        match decision {
             Ok(()) => {
                 let event = match op {
                     Op::Read => MemoryEvent::Read,
@@ -1259,6 +1302,45 @@ mod tests {
         g
     }
 
+    /// The trust-root signing key the session grant is minted with — the analogue
+    /// of the gateway's `signing_key`. `grant()` above signs with this same key, so
+    /// a legitimate `_meta` attenuation must be signed by it and name the session
+    /// principal (`agent:test`). `grant_read()` signs with a *different* key
+    /// ([7u8;32]) and a *different* recipient, i.e. it models a forged grant.
+    fn trust_key() -> SigningKey {
+        SigningKey::from_bytes(&[3u8; 32])
+    }
+
+    /// Build a grant for `recipient` scoped to `resource_id`, read-only,
+    /// far-future expiry, signed by `key`.
+    fn grant_scoped(resource_id: &str, recipient: &str, key: &SigningKey) -> CapabilityGrant {
+        let mut g = CapabilityGrant {
+            id: format!("g-{resource_id}"),
+            issuer: "did:human".into(),
+            recipient: recipient.into(),
+            allowed_resources: vec![ResourceScope {
+                resource_id: resource_id.into(),
+                can_read: true,
+                can_write: false,
+            }],
+            policy: PolicyProfile::ReadOnly,
+            expires_at_ms: u64::MAX,
+            revoked: false,
+            delegation_chain: vec![],
+            issuer_pubkey: vec![],
+            signature: vec![],
+        };
+        g.sign_with(key);
+        g
+    }
+
+    /// A session (connection-bound) grant that reads *every* repo, signed by the
+    /// trust root, for the session principal `agent:test` — the anchor a narrowing
+    /// `_meta` grant attenuates.
+    fn session_grant_all() -> CapabilityGrant {
+        grant_scoped("*", "agent:test", &trust_key())
+    }
+
     #[test]
     fn initialize_negotiates_protocol_version() {
         let s = store();
@@ -1319,25 +1401,85 @@ mod tests {
         }
     }
 
+    /// MEM-B-001 tripwire: a legitimate `_meta` grant attenuates the session grant
+    /// (narrows scope for one request) — it can never *widen* it. This fixture
+    /// previously encoded the vulnerability: it presented a foreign-key,
+    /// foreign-recipient grant that *widened* scope to a new tenant and asserted the
+    /// call was allowed. Under the fix a presented grant is an attenuation bound to
+    /// the session's trust root and principal, so authorization is the intersection.
     #[test]
-    fn stateless_per_request_grant_from_meta() {
+    fn stateless_meta_grant_attenuates_never_widens() {
         let s = store();
-        // Connection-bound grant reads citrate-chain only.
-        let mut srv = MemoryMcpServer::new(&s, grant());
+        // Connection-bound grant reads every repo (wildcard), signed by the trust
+        // root, principal `agent:test`.
+        let mut srv = MemoryMcpServer::new(&s, session_grant_all());
 
-        // Under the connection grant, citrate-identity is denied.
-        let denied: Value = serde_json::from_str(
+        // Baseline: under the wildcard session grant both tenants are readable.
+        let base: Value = serde_json::from_str(
             &srv.handle_line(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#,
             )
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(denied["result"]["isError"], true, "citrate-identity denied under connection grant");
+        assert_eq!(base["result"]["isError"], false, "wildcard session grant reads citrate-identity");
 
-        // Same instance, a signed grant for citrate-identity in `_meta` → allowed.
-        let call = json!({
+        // A legitimate attenuation (trust-root-signed, same principal) that narrows
+        // to citrate-chain: citrate-chain still allowed …
+        let allowed = json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "memory.recall",
+                "arguments": { "repo": "citrate-chain" },
+                "_meta": { "ai.citrate/grant": grant_scoped("repo:citrate-chain/memory", "agent:test", &trust_key()) }
+            }
+        })
+        .to_string();
+        let ok: Value = serde_json::from_str(&srv.handle_line(&allowed).unwrap()).unwrap();
+        assert_eq!(ok["result"]["isError"], false, "attenuation still permits the in-scope repo");
+
+        // … but citrate-identity is now DENIED for that request — the attenuation
+        // narrowed authority (intersection), it did not widen it.
+        let narrowed = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "memory.recall",
+                "arguments": { "repo": "citrate-identity" },
+                "_meta": { "ai.citrate/grant": grant_scoped("repo:citrate-chain/memory", "agent:test", &trust_key()) }
+            }
+        })
+        .to_string();
+        let denied: Value = serde_json::from_str(&srv.handle_line(&narrowed).unwrap()).unwrap();
+        assert_eq!(denied["result"]["isError"], true, "attenuation narrows citrate-identity away");
+
+        // The per-request attenuation did not leak: the wildcard session grant is
+        // restored for the next call.
+        let again: Value = serde_json::from_str(
+            &srv.handle_line(
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again["result"]["isError"], false, "session grant restored after the attenuation");
+    }
+
+    /// MEM-B-001 tripwire: a `_meta` grant a client mints for itself — a valid
+    /// ed25519 signature over an issuer key the server never trusted — must be
+    /// rejected. A `Role::ReadOnly` member cannot escalate to a `*` read+write
+    /// grant by self-signing one.
+    #[test]
+    fn stateless_meta_grant_from_untrusted_issuer_is_rejected() {
+        let s = store();
+        // Session grant reads citrate-chain only (trust key, principal agent:test).
+        let mut srv = MemoryMcpServer::new(&s, grant());
+
+        // Attacker self-signs a grant with a key the server has never seen
+        // ([7u8;32], via grant_read) and presents it for a tenant they were never
+        // granted. It is a valid signature over the attacker's own pubkey — the
+        // exact forgery MEM-B-001 describes.
+        let forged = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {
                 "name": "memory.recall",
                 "arguments": { "repo": "citrate-identity" },
@@ -1345,18 +1487,48 @@ mod tests {
             }
         })
         .to_string();
-        let ok: Value = serde_json::from_str(&srv.handle_line(&call).unwrap()).unwrap();
-        assert_eq!(ok["result"]["isError"], false, "citrate-identity allowed under the _meta grant");
+        let v: Value = serde_json::from_str(&srv.handle_line(&forged).unwrap()).unwrap();
+        assert_eq!(
+            v["error"]["code"], GRANT_REJECTED,
+            "a self-signed grant from an untrusted issuer must be rejected, not honored"
+        );
 
-        // The per-request override did not leak: the connection grant is restored.
-        let again: Value = serde_json::from_str(
+        // And the forged grant did not leak into the store: the session grant still
+        // denies citrate-identity.
+        let after: Value = serde_json::from_str(
             &srv.handle_line(
-                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#,
             )
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(again["result"]["isError"], true, "connection grant restored after override");
+        assert_eq!(after["result"]["isError"], true, "session grant intact after rejected forgery");
+    }
+
+    /// MEM-B-001 tripwire: a `_meta` grant that is signed by the trust root but
+    /// issued to a *different* principal cannot be replayed by another caller —
+    /// `recipient` must equal the authenticated session principal.
+    #[test]
+    fn stateless_meta_grant_for_other_principal_is_rejected() {
+        let s = store();
+        // Session principal is `agent:test` (from grant()).
+        let mut srv = MemoryMcpServer::new(&s, grant());
+
+        // Trust-root-signed, but bound to someone else — `agent:evil`.
+        let wrong_principal = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "memory.recall",
+                "arguments": { "repo": "citrate-chain" },
+                "_meta": { "ai.citrate/grant": grant_scoped("*", "agent:evil", &trust_key()) }
+            }
+        })
+        .to_string();
+        let v: Value = serde_json::from_str(&srv.handle_line(&wrong_principal).unwrap()).unwrap();
+        assert_eq!(
+            v["error"]["code"], GRANT_REJECTED,
+            "a grant issued to another principal must not authorize this session"
+        );
     }
 
     #[test]
