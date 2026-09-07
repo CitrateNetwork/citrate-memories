@@ -44,7 +44,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use mem_authz::{AuthzError, CapabilityGrant, Op};
-use mem_core::{join_confidence, ContentHash, Edge, EdgeKind, MemoryNode, Plane, Status};
+use mem_core::{
+    join_confidence, CodeAnchor, ContentHash, Edge, EdgeKind, EdgeMethod, MemoryNode, Plane,
+    Status, TrustTier, VersionedVector,
+};
 use mem_store::{MemoryDagStore, StoreError, SupersessionError};
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +72,15 @@ pub enum SyncError {
     /// resolved and therefore cannot be authorized. Fail closed.
     #[error("merge denied: edge endpoint {0} owns no resolvable repo (cannot authorize)")]
     UnresolvableEndpoint(String),
+    /// MEM-B-004 / WP-MEM trust-root anchoring: the presenting peer's grant is
+    /// not issued by the trusted grant root (its `issuer_pubkey` does not match
+    /// the `trust_root` the merge was called with). `CapabilityGrant::check`
+    /// verifies a grant's signature against the key carried *inside* the grant, so
+    /// a peer that mints and self-signs a `*` read+write grant would otherwise
+    /// pass — exactly the forgeable-grant hole the MCP `_meta` path closed
+    /// (MEM-B-001). Fail closed: the whole bundle is refused.
+    #[error("merge denied: grant issuer is not the trusted grant root")]
+    UntrustedIssuer,
 }
 
 /// Map a tenant `repo` to the capability-grant resource id. MUST match the MCP
@@ -138,8 +150,92 @@ fn status_rank(s: Status) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MEM-B-002: order-independent merge of advisory (non-identity) fields.
+//
+// The CRDT is a *state-based* merge, so it must be a join-semilattice:
+// commutative, associative and idempotent. `merge_node`/the edge merge used to
+// keep the LOCAL value of `embedding`/`trust_tier`/`plane`/`provenance`/
+// `signature`/`anchors` — i.e. first-writer-wins *on the receiving replica* — so
+// two replicas that exchanged bundles in different orders never converged. Every
+// non-identity field is now folded by an explicit, order-independent rule.
+// ---------------------------------------------------------------------------
+
+/// Trust rank where a SMALLER number is LESS trusted. The merge keeps the
+/// least-trusted value on a conflict (monotone downward, matching the one-way
+/// quarantine rule) — conservative *and* order-independent.
+fn trust_conservatism(t: TrustTier) -> u8 {
+    match t {
+        TrustTier::InferredAdvisory => 0,
+        TrustTier::AgentAsserted => 1,
+        TrustTier::HumanConfirmed => 2,
+        TrustTier::DerivedDeterministic => 3,
+    }
+}
+
+/// The least-trusted of two tiers (commutative, associative, idempotent).
+fn less_trusted(a: TrustTier, b: TrustTier) -> TrustTier {
+    if trust_conservatism(a) <= trust_conservatism(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// A total, order-independent comparison key for an embedding: `(model, bits)`.
+/// `f32` is not `Ord`, so compare the raw IEEE-754 bit patterns.
+fn embedding_key(v: &VersionedVector) -> (String, Vec<u32>) {
+    (v.model.clone(), v.data.iter().map(|f| f.to_bits()).collect())
+}
+
+/// Deterministic tiebreak: the lexicographically smallest `(model, bits)`. Absent
+/// on either side adopts the present one; absent on both stays absent.
+fn min_embedding(a: &Option<VersionedVector>, b: &Option<VersionedVector>) -> Option<VersionedVector> {
+    match (a, b) {
+        (None, x) | (x, None) => x.clone(),
+        (Some(x), Some(y)) => {
+            if embedding_key(x) <= embedding_key(y) {
+                Some(x.clone())
+            } else {
+                Some(y.clone())
+            }
+        }
+    }
+}
+
+/// Deterministic tiebreak over an optional signature (smallest bytes; present
+/// beats absent). Both sides carry a valid signature over the *same* content id,
+/// so either is verifiable — the choice only needs to be replica-independent.
+fn min_opt_bytes(a: &Option<Vec<u8>>, b: &Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match (a, b) {
+        (None, x) | (x, None) => x.clone(),
+        (Some(x), Some(y)) => {
+            if x <= y {
+                Some(x.clone())
+            } else {
+                Some(y.clone())
+            }
+        }
+    }
+}
+
+/// Grow-only set union of code anchors (sorted + deduped by a total key), so
+/// `anchors` converge instead of silently keeping the receiver's copy.
+fn union_anchors(a: &[CodeAnchor], b: &[CodeAnchor]) -> Vec<CodeAnchor> {
+    let key = |c: &CodeAnchor| {
+        (c.repo.clone(), c.path.clone(), c.symbol.clone(), c.line_start, c.line_end)
+    };
+    let mut all: Vec<CodeAnchor> = a.iter().chain(b).cloned().collect();
+    all.sort_by(|x, y| key(x).cmp(&key(y)));
+    all.dedup_by(|x, y| key(x) == key(y));
+    all
+}
+
 /// Merge a remote node's advisory state into the local copy (same content id).
 /// Returns the merged node and whether anything changed / contradicted.
+///
+/// MEM-B-002: EVERY field outside the content id is folded by an
+/// order-independent rule, so replicas converge regardless of gossip order.
 fn merge_node(local: &MemoryNode, remote: &MemoryNode) -> (MemoryNode, bool, usize) {
     let mut merged = local.clone();
 
@@ -163,13 +259,45 @@ fn merge_node(local: &MemoryNode, remote: &MemoryNode) -> (MemoryNode, bool, usi
         };
     }
 
-    // Embedding is advisory side-data: keep local, adopt remote only if absent.
-    if merged.embedding.is_none() {
-        merged.embedding = remote.embedding.clone();
-    }
+    // Advisory fields — order-independent joins (MEM-B-002). Least-trusted wins;
+    // embedding/signature use a deterministic tiebreak; anchors grow-only union;
+    // bitemporal marks keep the earliest observation.
+    merged.trust_tier = less_trusted(local.trust_tier, remote.trust_tier);
+    merged.embedding = min_embedding(&local.embedding, &remote.embedding);
+    merged.signature = min_opt_bytes(&local.signature, &remote.signature);
+    merged.anchors = union_anchors(&local.anchors, &remote.anchors);
+    merged.valid_from = local.valid_from.min(remote.valid_from);
+    merged.observed_at = local.observed_at.min(remote.observed_at);
 
     let changed = merged != *local;
     (merged, changed, contradictions)
+}
+
+/// A total, order-independent selection key for an edge's advisory (non-key)
+/// fields. Ordered so the merge deterministically keeps the LEAST-trusted edge
+/// (matching the one-way quarantine rule), then breaks ties on
+/// plane/provenance/signature — making the edge merge commutative (MEM-B-002).
+fn edge_advisory_key(e: &Edge) -> (u8, u8, u8, String, u64, String, Vec<u8>) {
+    let plane_rank = match e.plane {
+        Plane::Derived => 0,
+        Plane::Asserted => 1,
+    };
+    let method_rank = match e.provenance.method {
+        EdgeMethod::Trailer => 0,
+        EdgeMethod::Ingest => 1,
+        EdgeMethod::Nlp => 2,
+        EdgeMethod::Analogy => 3,
+        EdgeMethod::Manual => 4,
+    };
+    (
+        trust_conservatism(e.trust_tier),
+        plane_rank,
+        method_rank,
+        e.provenance.asserter.clone(),
+        e.provenance.at,
+        e.provenance.evidence.clone().unwrap_or_default(),
+        e.signature.clone().unwrap_or_default(),
+    )
 }
 
 /// Resolve the repo that owns a node id: prefer the bundle's own nodes (so a
@@ -198,9 +326,19 @@ fn endpoint_repo(
 fn authorize_bundle(
     store: &MemoryDagStore<MemoryNode>,
     grant: &CapabilityGrant,
+    trust_root: &[u8],
     bundle: &SyncBundle,
     now_ms: u64,
 ) -> Result<(), SyncError> {
+    // MEM-B-004 / WP-MEM trust-root anchoring. `grant.check` (below) verifies the
+    // grant's signature against the `issuer_pubkey` carried *inside* the grant, so
+    // a peer that mints its own ed25519 keypair and self-signs a `*` read+write
+    // grant would authorize itself for every repo. Bind the issuer to the trusted
+    // grant root first — the same anchoring the MCP `_meta` path uses (MEM-B-001).
+    // A grant whose issuer key is not the root is refused wholesale, fail closed.
+    if grant.issuer_pubkey.as_slice() != trust_root {
+        return Err(SyncError::UntrustedIssuer);
+    }
     let in_bundle: BTreeMap<ContentHash, String> =
         bundle.nodes.iter().map(|n| (n.compute_id(), n.repo.clone())).collect();
 
@@ -228,23 +366,31 @@ fn authorize_bundle(
 /// order-insensitive in the final state; see the module docs for the one
 /// documented exception (concurrent contradictory supersessions).
 ///
-/// **FWA-C10-01/02 (authorization).** The merging peer presents a
-/// [`CapabilityGrant`]; the merge authorizes a `Write` to EVERY repo the bundle
-/// touches (node repos + edge-endpoint repos) before any write lands — the same
-/// gate the MCP `merge_diff` path uses. A peer therefore cannot inject
-/// Derived-plane nodes or unsigned Derived `Supersedes` edges into a repo its
-/// grant does not cover. Asserted-plane items must still carry a valid signature
-/// (per-item), unchanged. Use [`merge_bundle_trusted`] only for in-process,
-/// already-trusted ingest (it grants `*`), never across a federation boundary.
+/// **FWA-C10-01/02 + MEM-B-004 (authorization).** The merging peer presents a
+/// [`CapabilityGrant`] and the caller supplies `trust_root`, the ed25519 public
+/// key that legitimately issues grants (the gateway/operator key). The merge (a)
+/// requires the grant's `issuer_pubkey` to equal `trust_root` — a self-signed
+/// grant a peer mints for itself is refused, closing the forgeable-grant hole the
+/// MCP `_meta` path closed (MEM-B-001) — and (b) authorizes a `Write` to EVERY
+/// repo the bundle touches (node repos + edge-endpoint repos) before any write
+/// lands, the same gate the MCP `merge_diff` path uses. A peer therefore cannot
+/// inject Derived-plane nodes or unsigned Derived `Supersedes` edges into a repo
+/// its grant does not cover, and cannot mint that grant itself. Asserted-plane
+/// items must still carry a valid signature (per-item), unchanged. Use
+/// [`merge_bundle_trusted`] only for in-process, already-trusted ingest (it grants
+/// `*` and is its own trust root), never across a federation boundary.
 pub fn merge_bundle(
     store: &MemoryDagStore<MemoryNode>,
     bundle: &SyncBundle,
     grant: &CapabilityGrant,
+    trust_root: &[u8],
     now_ms: u64,
 ) -> Result<MergeOutcome, SyncError> {
-    // FWA-C10-01/02: authorize the WHOLE bundle first — fail closed, no partial
-    // application, before a single node or edge can reach the store.
-    authorize_bundle(store, grant, bundle, now_ms)?;
+    // FWA-C10-01/02 + MEM-B-004: authorize the WHOLE bundle first — the grant must
+    // be issued by `trust_root` AND authorize a Write to every repo the bundle
+    // touches — fail closed, no partial application, before a single node or edge
+    // can reach the store.
+    authorize_bundle(store, grant, trust_root, bundle, now_ms)?;
 
     let mut out = MergeOutcome::default();
 
@@ -300,6 +446,16 @@ pub fn merge_bundle(
                 // One-way promotion: confirmed anywhere = confirmed everywhere.
                 merged.quarantined = local.quarantined && remote.quarantined;
                 merged.confidence = join_confidence(&local.confidence, &remote.confidence);
+                // MEM-B-002: converge the advisory group (trust_tier / plane /
+                // provenance / signature) deterministically — least-trusted, then
+                // a total tiebreak — instead of silently keeping the receiver's
+                // copy, so the edge merge is order-independent.
+                if edge_advisory_key(remote) < edge_advisory_key(&local) {
+                    merged.trust_tier = remote.trust_tier;
+                    merged.plane = remote.plane;
+                    merged.provenance = remote.provenance.clone();
+                    merged.signature = remote.signature.clone();
+                }
                 if merged != local {
                     store.add_edge(&merged)?;
                     out.edges_merged += 1;
@@ -371,7 +527,10 @@ pub fn merge_bundle_trusted(
     store: &MemoryDagStore<MemoryNode>,
     bundle: &SyncBundle,
 ) -> Result<MergeOutcome, SyncError> {
-    merge_bundle(store, bundle, &trusted_local_grant(), 0)
+    // Self-issued grant: it IS its own trust root (MEM-B-004).
+    let grant = trusted_local_grant();
+    let root = grant.issuer_pubkey.clone();
+    merge_bundle(store, bundle, &grant, &root, 0)
 }
 
 // ---------------------------------------------------------------------------

@@ -40,6 +40,14 @@ pub(crate) fn grant_for(repos: &[&str], write: bool) -> CapabilityGrant {
     g
 }
 
+/// The ed25519 public key that signs [`grant_for`] — the trusted grant root the
+/// federation merge anchors against (MEM-B-004). A grant not issued by this key
+/// (e.g. one a peer self-signs) is refused by `merge_bundle`. Shared with
+/// `transport.rs` tests.
+pub(crate) fn trust_root() -> Vec<u8> {
+    SigningKey::from_bytes(&[42u8; 32]).verifying_key().to_bytes().to_vec()
+}
+
 /// Test shim: most existing CRDT tests merge a tenant's own export back (trusted
 /// local replica semantics) and predate the authz gate — route them through the
 /// explicit trusted-local grant so their CRDT assertions are unchanged.
@@ -310,7 +318,7 @@ fn fwa_c10_01_forged_derived_node_rejected_without_grant() {
 
     // Attacker holds a grant for its OWN repo only — not the victim's.
     let attacker_grant = grant_for(&["attacker-tenant"], true);
-    let res = crate::merge_bundle(&victim, &bundle, &attacker_grant, 100);
+    let res = crate::merge_bundle(&victim, &bundle, &attacker_grant, &trust_root(), 100);
 
     // FIX: the merge is denied wholesale; nothing landed.
     assert!(
@@ -354,7 +362,7 @@ fn fwa_c10_02_unsigned_derived_supersedes_rejected_without_grant() {
     };
 
     let attacker_grant = grant_for(&["attacker-tenant"], true);
-    let res = crate::merge_bundle(&victim, &bundle, &attacker_grant, 100);
+    let res = crate::merge_bundle(&victim, &bundle, &attacker_grant, &trust_root(), 100);
 
     assert!(
         matches!(res, Err(SyncError::Denied(_))),
@@ -381,7 +389,7 @@ fn fwa_c10_authorized_peer_merges_normally() {
         edges: vec![],
     };
     let grant = grant_for(&["citrate-chain"], true);
-    let out = crate::merge_bundle(&dst, &bundle, &grant, 100).expect("authorized merge ok");
+    let out = crate::merge_bundle(&dst, &bundle, &grant, &trust_root(), 100).expect("authorized merge ok");
     assert_eq!(out.nodes_added, 1);
     assert!(dst.get_node(&n.compute_id()).unwrap().is_some());
 }
@@ -398,7 +406,7 @@ fn fwa_c10_read_only_grant_cannot_merge() {
         edges: vec![],
     };
     let read_only = grant_for(&["citrate-chain"], false);
-    let res = crate::merge_bundle(&dst, &bundle, &read_only, 100);
+    let res = crate::merge_bundle(&dst, &bundle, &read_only, &trust_root(), 100);
     assert!(
         matches!(res, Err(SyncError::Denied(AuthzError::OperationDenied(Op::Write)))),
         "read-only grant must be denied Write on merge, got {res:?}"
@@ -418,7 +426,7 @@ fn fwa_c10_expired_grant_fails_closed() {
     };
     // grant_for sets expires_at_ms = u64::MAX, so force expiry by querying at MAX.
     let grant = grant_for(&["citrate-chain"], true);
-    let res = crate::merge_bundle(&dst, &bundle, &grant, u64::MAX);
+    let res = crate::merge_bundle(&dst, &bundle, &grant, &trust_root(), u64::MAX);
     assert!(matches!(res, Err(SyncError::Denied(AuthzError::Expired))), "got {res:?}");
     assert_eq!(dst.node_count().unwrap(), 0);
 }
@@ -438,7 +446,7 @@ fn fwa_c10_mixed_repo_bundle_refused_wholesale() {
         edges: vec![],
     };
     let grant = grant_for(&["citrate-chain"], true); // NOT victim-tenant
-    let res = crate::merge_bundle(&dst, &bundle, &grant, 100);
+    let res = crate::merge_bundle(&dst, &bundle, &grant, &trust_root(), 100);
     assert!(matches!(res, Err(SyncError::Denied(_))), "got {res:?}");
     assert_eq!(dst.node_count().unwrap(), 0, "no partial application — even the authorized node is held back");
 }
@@ -473,7 +481,7 @@ fn fwa_c10_edge_endpoint_repo_is_authorized() {
         edges: vec![edge],
     };
     let grant = grant_for(&["citrate-chain"], true); // covers the node repo, not victim-tenant
-    let res = crate::merge_bundle(&dst, &bundle, &grant, 100);
+    let res = crate::merge_bundle(&dst, &bundle, &grant, &trust_root(), 100);
     assert!(
         matches!(res, Err(SyncError::Denied(_))),
         "an edge crossing into an unauthorized repo must be denied, got {res:?}"
@@ -505,7 +513,7 @@ fn fwa_c10_unresolvable_edge_endpoint_fails_closed() {
         edges: vec![edge],
     };
     let grant = grant_for(&["citrate-chain"], true);
-    let res = crate::merge_bundle(&dst, &bundle, &grant, 100);
+    let res = crate::merge_bundle(&dst, &bundle, &grant, &trust_root(), 100);
     assert!(
         matches!(res, Err(SyncError::UnresolvableEndpoint(_))),
         "an edge with an unresolvable endpoint must fail closed, got {res:?}"
@@ -530,11 +538,215 @@ fn fwa_c10_asserted_signature_check_still_applies_under_authz() {
     };
     let grant = grant_for(&["r"], true);
     let dst = store();
-    let out = crate::merge_bundle(&dst, &bundle, &grant, 100)
+    let out = crate::merge_bundle(&dst, &bundle, &grant, &trust_root(), 100)
         .unwrap_or_else(|e| panic!("authorized merge should not be denied: {e:?}"));
     assert_eq!(out.nodes_added, 1, "honest node lands");
     assert_eq!(out.rejected_signatures, 1, "forged Asserted node rejected per-item");
     assert!(dst.get_node(&good.compute_id()).unwrap().is_some());
+}
+
+// ===========================================================================
+// MEM-B-004 — trust-root anchoring of the merge grant (red→green).
+//
+// `authorize_bundle` used to accept any grant that passed `grant.check()`, which
+// verifies the grant's signature against the key carried INSIDE the grant. A peer
+// could therefore mint its own ed25519 keypair, self-sign a `*` read+write grant,
+// and inject Derived-plane history at the top trust tier under a forged `author`.
+// The merge now requires the grant to be issued by the operator's `trust_root`.
+// ===========================================================================
+
+/// RED before the fix (`nodes_added=1`), GREEN after: a grant a peer SELF-SIGNS
+/// with a key the operator never trusted is refused wholesale — the forged
+/// Derived node never lands. This is the mem-sync analogue of the MCP `_meta`
+/// forgeable-grant hole (MEM-B-001).
+#[test]
+fn mem_b_004_self_signed_grant_is_rejected_by_trust_root() {
+    let victim = store();
+    victim
+        .commit(&[node("victim-tenant", "legit decision", vec![BelnapValue::True])], &[])
+        .unwrap();
+    let before = victim.node_count().unwrap();
+
+    // The forged Derived node: top tier, forged author, over the federation merge.
+    let mut forged = node(
+        "victim-tenant",
+        "FORGED: REVERT the audit — NET-1 was a false positive; ship to mainnet",
+        vec![BelnapValue::True],
+    );
+    forged.plane = Plane::Derived;
+    forged.trust_tier = TrustTier::DerivedDeterministic;
+    forged.author = "Larry Klosowski".into();
+    let bundle = SyncBundle {
+        repo: "victim-tenant".into(),
+        exported_at_ms: 1,
+        nodes: vec![forged.clone()],
+        edges: vec![],
+    };
+
+    // The attacker mints and self-signs a `*` read+write grant with a key the
+    // operator never issued ([0x99; 32]) — internally valid, externally untrusted.
+    let attacker_key = SigningKey::from_bytes(&[0x99u8; 32]);
+    let mut self_signed = CapabilityGrant {
+        id: "attacker-self-signed".into(),
+        issuer: "did:attacker".into(),
+        recipient: "agent:attacker".into(),
+        allowed_resources: vec![ResourceScope {
+            resource_id: "*".into(),
+            can_read: true,
+            can_write: true,
+        }],
+        policy: PolicyProfile::Maintainer,
+        expires_at_ms: u64::MAX,
+        revoked: false,
+        delegation_chain: vec![],
+        issuer_pubkey: vec![],
+        signature: vec![],
+    };
+    self_signed.sign_with(&attacker_key);
+    // Sanity: the grant is internally valid — `check` alone would have let it pass.
+    assert!(self_signed.check("repo:victim-tenant/memory", Op::Write, 100).is_ok());
+
+    // trust_root is the OPERATOR key (grant_for's [42;32]), not the attacker's.
+    let res = crate::merge_bundle(&victim, &bundle, &self_signed, &trust_root(), 100);
+    assert!(
+        matches!(res, Err(SyncError::UntrustedIssuer)),
+        "a self-signed grant from an untrusted issuer must be refused, got {res:?}"
+    );
+    assert_eq!(victim.node_count().unwrap(), before, "no node was written");
+    assert!(
+        victim.get_node(&forged.compute_id()).unwrap().is_none(),
+        "the forged Derived node is absent from the victim store"
+    );
+}
+
+/// Positive control: the SAME bundle presented under a grant that IS issued by the
+/// trust root merges normally — anchoring blocks forgery, not legitimate sync.
+#[test]
+fn mem_b_004_trust_root_issued_grant_merges() {
+    let dst = store();
+    let n = node("victim-tenant", "a legitimately synced derived node", vec![BelnapValue::True]);
+    let bundle = SyncBundle {
+        repo: "victim-tenant".into(),
+        exported_at_ms: 1,
+        nodes: vec![n.clone()],
+        edges: vec![],
+    };
+    // grant_for signs with the operator key [42;32]; trust_root() is its pubkey.
+    let grant = grant_for(&["victim-tenant"], true);
+    let out = crate::merge_bundle(&dst, &bundle, &grant, &trust_root(), 100)
+        .expect("trust-root-issued grant must merge");
+    assert_eq!(out.nodes_added, 1);
+    assert!(dst.get_node(&n.compute_id()).unwrap().is_some());
+}
+
+// ===========================================================================
+// MEM-B-002 — the Belnap-CRDT merge is a join-semilattice (red→green).
+//
+// Before the fix, `merge_node` kept the LOCAL `embedding`/`trust_tier`/`anchors`
+// and the edge merge kept the LOCAL `trust_tier`/`plane`/`provenance`/`signature`
+// (first-writer-wins on the receiving replica), so two replicas that exchanged
+// bundles in different orders never converged. This deals the SAME updates to two
+// replicas in OPPOSITE orders, gossips to a fixpoint, and asserts byte-identical
+// state. It FAILS on the pre-fix code (divergent embedding + edge advisory group)
+// and PASSES once every non-identity field is folded order-independently.
+// ===========================================================================
+
+/// Two nodes that share a content id but differ on every advisory field, and two
+/// edges that share `(from,to,kind)` but differ on tier/plane/provenance —
+/// dealt A-then-B on one replica and B-then-A on the other.
+#[test]
+fn mem_b_002_crdt_converges_regardless_of_merge_order() {
+    // Shared node id (plane+kind+repo+author+source+content are identical); the
+    // two variants disagree on embedding, trust_tier, confidence, anchors.
+    let base = node("r", "a shared claim", vec![BelnapValue::True]);
+    let mut a_node = base.clone();
+    a_node.embedding = Some(VersionedVector { model: "bge@q8".into(), data: vec![9.0, 9.0, 9.0] });
+    a_node.trust_tier = TrustTier::DerivedDeterministic;
+    a_node.anchors = vec![CodeAnchor {
+        repo: "r".into(),
+        path: "src/a.rs".into(),
+        symbol: Some("f".into()),
+        line_start: 1,
+        line_end: 2,
+    }];
+    let mut b_node = base.clone();
+    b_node.embedding = Some(VersionedVector { model: "bge@q8".into(), data: vec![1.0, 1.0, 1.0] });
+    b_node.trust_tier = TrustTier::InferredAdvisory;
+    b_node.confidence = vec![BelnapValue::False];
+    b_node.anchors = vec![CodeAnchor {
+        repo: "r".into(),
+        path: "src/b.rs".into(),
+        symbol: None,
+        line_start: 3,
+        line_end: 4,
+    }];
+    assert_eq!(a_node.compute_id(), b_node.compute_id(), "same content id, differing advisory state");
+
+    // Two endpoints for a shared-key edge.
+    let x = node("r", "endpoint x", vec![]);
+    let y = node("r", "endpoint y", vec![]);
+
+    // Same (from,to,kind) edge, differing advisory group.
+    let edge_a = Edge {
+        from: x.compute_id(),
+        to: y.compute_id(),
+        kind: EdgeKind::References,
+        plane: Plane::Derived,
+        trust_tier: TrustTier::DerivedDeterministic,
+        provenance: EdgeProvenance { method: EdgeMethod::Ingest, asserter: "alice".into(), at: 1, evidence: None },
+        confidence: vec![BelnapValue::True],
+        quarantined: false,
+        signature: None,
+    };
+    // Both edges are Derived (an unsigned Asserted edge would be rejected by the
+    // per-item signature check); they disagree on the advisory group the security
+    // edge of MEM-B-002/003 is about — trust_tier and provenance.
+    let mut edge_b = edge_a.clone();
+    edge_b.trust_tier = TrustTier::InferredAdvisory;
+    edge_b.provenance = EdgeProvenance { method: EdgeMethod::Nlp, asserter: "mallory".into(), at: 2, evidence: Some("guess".into()) };
+    edge_b.confidence = vec![BelnapValue::False];
+
+    // Seed each endpoint node on both replicas (edges need their endpoints).
+    let ra = store();
+    let rb = store();
+    for s in [&ra, &rb] {
+        s.put_node(&x).unwrap();
+        s.put_node(&y).unwrap();
+    }
+
+    // Replica A applies A-variants first, then B's bundle; replica B the reverse.
+    ra.put_node(&a_node).unwrap();
+    ra.add_edge(&edge_a).unwrap();
+    rb.put_node(&b_node).unwrap();
+    rb.add_edge(&edge_b).unwrap();
+
+    let bundle_from_a = export_tenant(&ra, "r", 1).unwrap();
+    let bundle_from_b = export_tenant(&rb, "r", 1).unwrap();
+
+    // Gossip to a fixpoint in opposite orders.
+    for _ in 0..3 {
+        merge_bundle(&ra, &bundle_from_b).unwrap();
+        merge_bundle(&rb, &bundle_from_a).unwrap();
+    }
+
+    // Byte-identical convergence over the FULL records (not just the anchor root).
+    let mut a_nodes = ra.all_nodes().unwrap();
+    let mut b_nodes = rb.all_nodes().unwrap();
+    a_nodes.sort_by_key(|n| n.compute_id());
+    b_nodes.sort_by_key(|n| n.compute_id());
+    assert_eq!(a_nodes, b_nodes, "replicas did not converge on node state (MEM-B-002)");
+
+    let mut a_edges = ra.all_edges().unwrap();
+    let mut b_edges = rb.all_edges().unwrap();
+    a_edges.sort_by_key(|e| e.key());
+    b_edges.sort_by_key(|e| e.key());
+    assert_eq!(a_edges, b_edges, "replicas did not converge on edge state (MEM-B-002)");
+
+    // And the merged advisory values are the conservative (least-trusted) ones.
+    let merged = a_nodes.iter().find(|n| n.compute_id() == a_node.compute_id()).unwrap();
+    assert_eq!(merged.trust_tier, TrustTier::InferredAdvisory, "least-trusted wins");
+    let merged_edge = a_edges.iter().find(|e| e.kind == EdgeKind::References).unwrap();
+    assert_eq!(merged_edge.trust_tier, TrustTier::InferredAdvisory, "least-trusted edge group wins");
 }
 
 // ---------------------------------------------------------------------------
