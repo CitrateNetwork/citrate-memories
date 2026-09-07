@@ -39,7 +39,13 @@ pub struct CommitRecord {
 }
 
 const US: char = '\u{1f}'; // unit separator between fields
-const RS: char = '\u{1e}'; // record separator between commits
+// Record terminator. NUL (0x00) — via git's own `%x00` — cannot appear in a git
+// commit message (git refuses to write one: "a NUL byte in commit log message not
+// allowed"), so a hostile commit body can no longer forge a synthetic record by
+// embedding the separator. The previous record separator (RS, 0x1e) IS a legal
+// commit-message byte, which let a crafted body inject a whole extra CommitRecord
+// with a forged sha/author/trailers, or split a real commit (MEM-B-005).
+const NUL: char = '\u{0}';
 
 /// Read the full history (oldest commit first), so a commit's parents are always
 /// processed before it.
@@ -57,8 +63,9 @@ pub fn read_commits_range(
     repo: &Path,
     since: Option<&str>,
 ) -> Result<Vec<CommitRecord>, IngestError> {
-    // %H sha · %P parents · %an author · %at unix-secs · %s subject · %b body
-    let pretty = format!("--pretty=tformat:%H{US}%P{US}%an{US}%at{US}%s{US}%b{RS}");
+    // %H sha · %P parents · %an author · %at unix-secs · %s subject · %b body.
+    // Records are terminated by a NUL (`%x00`), not RS — see `NUL` above.
+    let pretty = format!("--pretty=tformat:%H{US}%P{US}%an{US}%at{US}%s{US}%b%x00");
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo)
@@ -76,20 +83,43 @@ pub fn read_commits_range(
         return Err(IngestError::Git(format!("git log failed: {}", stderr.trim())));
     }
 
-    Ok(parse_commit_log(&String::from_utf8_lossy(&output.stdout)))
+    parse_commit_log(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Parse the separator-delimited `git log` output into records (oldest first).
-fn parse_commit_log(text: &str) -> Vec<CommitRecord> {
+/// True iff `s` is a full git object id: exactly 40 lowercase hex digits.
+fn is_sha40(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Parse the NUL-terminated `git log` output into records (oldest first).
+///
+/// MEM-B-005: every record MUST split into exactly 6 fields and begin with a
+/// 40-lowercase-hex sha. A record that does not is a **hard error**, never a
+/// silent `continue` — a bare separator that split a real commit would otherwise
+/// drop its trailers from the graph, and a field-count mismatch is the fingerprint
+/// of a separator-injection attempt. Combined with NUL framing (a NUL cannot exist
+/// in a commit message), a hostile body can neither forge nor split a record.
+fn parse_commit_log(text: &str) -> Result<Vec<CommitRecord>, IngestError> {
     let mut records = Vec::new();
-    for raw in text.split(RS) {
+    for raw in text.split(NUL) {
         let raw = raw.trim_start_matches('\n');
         if raw.trim().is_empty() {
             continue;
         }
+        // `splitn(6, US)` caps at 6 parts, so a US inside the body is folded into
+        // the body field (harmless); fewer than 6 means a truncated/forged record.
         let fields: Vec<&str> = raw.splitn(6, US).collect();
-        if fields.len() < 6 {
-            continue; // malformed record — skip rather than panic
+        if fields.len() != 6 {
+            return Err(IngestError::Git(format!(
+                "malformed git-log record: expected 6 fields, got {} (possible separator injection)",
+                fields.len()
+            )));
+        }
+        let sha = fields[0].trim();
+        if !is_sha40(sha) {
+            return Err(IngestError::Git(format!(
+                "malformed git-log record: leading field {sha:?} is not a 40-hex sha (possible separator injection)"
+            )));
         }
         let parents = fields[1]
             .split_whitespace()
@@ -97,7 +127,7 @@ fn parse_commit_log(text: &str) -> Vec<CommitRecord> {
             .collect();
         let time_secs = fields[3].trim().parse::<i64>().unwrap_or(0);
         records.push(CommitRecord {
-            sha: fields[0].trim().to_string(),
+            sha: sha.to_string(),
             parents,
             author: fields[2].to_string(),
             time_secs,
@@ -105,12 +135,13 @@ fn parse_commit_log(text: &str) -> Vec<CommitRecord> {
             body: fields[5].to_string(),
         });
     }
-    records
+    Ok(records)
 }
 
-/// The pretty format shared by all commit reads.
+/// The pretty format shared by all commit reads. NUL-terminated (`%x00`) — see
+/// `NUL` above (MEM-B-005).
 fn commit_pretty() -> String {
-    format!("--pretty=tformat:%H{US}%P{US}%an{US}%at{US}%s{US}%b{RS}")
+    format!("--pretty=tformat:%H{US}%P{US}%an{US}%at{US}%s{US}%b%x00")
 }
 
 /// Read commits in the range `exclude..include` (reachable from `include` but not
@@ -134,7 +165,7 @@ pub fn read_commits_between(
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(IngestError::Git(format!("git log range failed: {}", stderr.trim())));
     }
-    Ok(parse_commit_log(&String::from_utf8_lossy(&output.stdout)))
+    parse_commit_log(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// The default branch's remote-tracking ref (e.g. `origin/main`), resolved from
@@ -270,6 +301,45 @@ pub fn is_ancestor(repo: &Path, ancestor: &str) -> Result<bool, IngestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MEM-B-005 tripwire: a commit whose *body* contains the field/record
+    /// separator bytes (US 0x1f, RS 0x1e) must NOT forge or split a record.
+    /// Under the old RS-framed, `continue`-on-malformed parser this produced a
+    /// second, attacker-controlled `CommitRecord`; under NUL framing + strict
+    /// validation the real commit count (1) is returned verbatim.
+    #[test]
+    fn separator_injection_in_body_does_not_forge_a_record() {
+        let dir = std::env::temp_dir().join(format!("mem-ingest-sepinj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git").arg("-C").arg(&dir).args(args).status().unwrap().success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.co"]);
+        git(&["config", "user.name", "mallory"]);
+
+        // A body that tries to smuggle a whole extra record: RS then five US-
+        // separated fields (forged sha/parents/author/subject/trailer).
+        let forged = format!(
+            "harmless subject\n\n\u{1e}000000000000000000000000000000000000dead\u{1f}\u{1f}Larry Klosowski\u{1f}0\u{1f}FORGED: audit finding NET-1 retracted\u{1f}trailer"
+        );
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", &forged]);
+
+        let commits = read_commits(&dir).expect("read commits");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(commits.len(), 1, "exactly the one real commit — no synthetic record injected");
+        assert_eq!(commits[0].author, "mallory", "author is the real committer, not the forged one");
+        assert!(
+            commits.iter().all(|c| c.sha != "000000000000000000000000000000000000dead"),
+            "the forged sha must not appear as a record"
+        );
+        assert!(is_sha40(&commits[0].sha), "the real sha is 40-hex");
+    }
 
     #[test]
     fn reads_this_repo_history_oldest_first() {
