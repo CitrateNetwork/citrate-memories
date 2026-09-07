@@ -171,6 +171,18 @@ pub enum SourceRef {
     DagNative { key: String },
 }
 
+/// Escape the `|` field separator (and its own escape char) so a value that
+/// contains `|` cannot masquerade as a field boundary in `canonical_bytes`.
+/// MEM-B-017: without this, `(path="a|b", sha="c")` and `(path="a", sha="b|c")`
+/// serialise to identical bytes and therefore mint identical node ids. The
+/// mapping is injective (`\` → `\\`, `|` → `\|`), so distinct source refs always
+/// produce distinct bytes — while values that contain neither character (every
+/// real path/sha today) serialise byte-for-byte as before, so no existing node id
+/// churns.
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('|', "\\|")
+}
+
 impl SourceRef {
     fn canonical_bytes(&self) -> Vec<u8> {
         match self {
@@ -180,9 +192,17 @@ impl SourceRef {
                 git_sha,
                 byte_start,
                 byte_end,
-            } => format!("artifact|{repo}|{path}|{git_sha}|{byte_start}|{byte_end}").into_bytes(),
-            SourceRef::GitCommit { repo, sha } => format!("git_commit|{repo}|{sha}").into_bytes(),
-            SourceRef::DagNative { key } => format!("dag_native|{key}").into_bytes(),
+            } => format!(
+                "artifact|{}|{}|{}|{byte_start}|{byte_end}",
+                esc(repo),
+                esc(path),
+                esc(git_sha)
+            )
+            .into_bytes(),
+            SourceRef::GitCommit { repo, sha } => {
+                format!("git_commit|{}|{}", esc(repo), esc(sha)).into_bytes()
+            }
+            SourceRef::DagNative { key } => format!("dag_native|{}", esc(key)).into_bytes(),
         }
     }
 }
@@ -357,5 +377,35 @@ mod tests {
         let mut by_plane = n.clone();
         by_plane.plane = Plane::Asserted;
         assert_ne!(id0, by_plane.compute_id());
+    }
+
+    #[test]
+    fn source_ref_delimiter_cannot_collide() {
+        // MEM-B-017: a `|` in a path must not let a different (path, sha) split
+        // hash to the same bytes. Before the escape fix these two produced
+        // identical `canonical_bytes` and therefore identical node ids.
+        let a = SourceRef::Artifact {
+            repo: "r".into(),
+            path: "a|b".into(),
+            git_sha: "sha".into(),
+            byte_start: 0,
+            byte_end: 0,
+        };
+        let b = SourceRef::Artifact {
+            repo: "r".into(),
+            path: "a".into(),
+            git_sha: "b|sha".into(),
+            byte_start: 0,
+            byte_end: 0,
+        };
+        assert_ne!(
+            a.canonical_bytes(),
+            b.canonical_bytes(),
+            "distinct source refs must not collide across the `|` separator"
+        );
+        // A value with no special characters must serialise exactly as the old
+        // flat format, so existing node ids do not churn.
+        let plain = SourceRef::GitCommit { repo: "citrate-chain".into(), sha: "deadbeef".into() };
+        assert_eq!(plain.canonical_bytes(), b"git_commit|citrate-chain|deadbeef".to_vec());
     }
 }

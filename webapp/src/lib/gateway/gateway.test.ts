@@ -1,7 +1,7 @@
 /**
  * BFF ⇄ mem-gateway wiring (WP-7.2). Hermetic: a loopback HTTP server stands in
  * for the Rust gateway, returning its real JSON shapes. Proves the client builds
- * correct URLs, forwards the verified `sub` as `x-dev-sub`, parses typed
+ * correct URLs, forwards the verified bearer by default (MEM-B-013), parses typed
  * responses, FAILS CLOSED when MEM_GATEWAY_ORIGIN is unset, and that the
  * authenticated route handler 401s without a session and proxies with one.
  */
@@ -12,6 +12,7 @@ import type { AddressInfo } from "node:net";
 let server: Server;
 let origin: string;
 let lastDevSub: string | null = null;
+let lastAuth: string | null = null;
 let lastBody: string | null = null;
 
 function send(res: ServerResponse, status: number, body: unknown) {
@@ -23,6 +24,7 @@ function send(res: ServerResponse, status: number, body: unknown) {
 beforeAll(async () => {
   server = createServer((req: IncomingMessage, res: ServerResponse) => {
     lastDevSub = (req.headers["x-dev-sub"] as string) ?? null;
+    lastAuth = (req.headers["authorization"] as string) ?? null;
     const url = new URL(req.url ?? "/", "http://x");
     const p = url.pathname;
     // write route (gap G-1)
@@ -114,11 +116,32 @@ describe("gateway client", () => {
     expect(await gateway.health()).toEqual({ ok: true, service: "mem-gateway" });
   });
 
-  it("forwards the verified sub as x-dev-sub and parses typed orgs", async () => {
+  // MEM-B-013: bearer-forward is the SECURE default. The caller's verified OIDC
+  // bearer is forwarded; the unauthenticated x-dev-sub impersonation header is
+  // NOT sent unless explicitly opted into via MEM_GATEWAY_DEV_SUB=1.
+  it("forwards the verified bearer by default and never x-dev-sub", async () => {
+    delete process.env.MEM_GATEWAY_DEV_SUB;
+    lastDevSub = null;
+    lastAuth = null;
     const { gateway } = await import("./client");
-    const r = await gateway.listOrgs({ sub: "did:citrate:aleia" });
-    expect(lastDevSub).toBe("did:citrate:aleia");
+    const r = await gateway.listOrgs({ sub: "did:citrate:aleia", token: "tok-123" });
+    expect(lastAuth).toBe("Bearer tok-123");
+    expect(lastDevSub).toBeNull();
     expect(r.orgs[0].name).toBe("Citrate Federation");
+  });
+
+  it("uses x-dev-sub ONLY when MEM_GATEWAY_DEV_SUB=1 is set", async () => {
+    process.env.MEM_GATEWAY_DEV_SUB = "1";
+    lastDevSub = null;
+    lastAuth = null;
+    try {
+      const { gateway } = await import("./client");
+      await gateway.listOrgs({ sub: "did:citrate:aleia" });
+      expect(lastDevSub).toBe("did:citrate:aleia");
+      expect(lastAuth).toBeNull();
+    } finally {
+      delete process.env.MEM_GATEWAY_DEV_SUB;
+    }
   });
 
   it("parses the constellation scene (nodes + edges)", async () => {
@@ -137,14 +160,20 @@ describe("gateway client", () => {
     await expect(gateway.listTenants({ sub: "s" }, "forbidden")).rejects.toBeInstanceOf(GatewayError);
   });
 
-  it("assert() POSTs the body and forwards the verified sub (gap G-1)", async () => {
+  it("assert() POSTs the body and forwards the verified bearer (gap G-1)", async () => {
+    delete process.env.MEM_GATEWAY_DEV_SUB;
+    lastDevSub = null;
+    lastAuth = null;
     const { gateway } = await import("./client");
-    const r = await gateway.assert({ sub: "did:citrate:aleia" }, "citrate-federation", "mem-gateway", {
-      content: "we chose per-Org isolation",
-      kind: "rationale",
-    });
+    const r = await gateway.assert(
+      { sub: "did:citrate:aleia", token: "tok-abc" },
+      "citrate-federation",
+      "mem-gateway",
+      { content: "we chose per-Org isolation", kind: "rationale" },
+    );
     expect(r.id).toBe("newnode01");
-    expect(lastDevSub).toBe("did:citrate:aleia");
+    expect(lastAuth).toBe("Bearer tok-abc");
+    expect(lastDevSub).toBeNull();
     expect(JSON.parse(lastBody ?? "{}").content).toBe("we chose per-Org isolation");
   });
 
@@ -242,7 +271,9 @@ describe("BFF route handler — auth gate", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { orgs: { name: string }[] };
     expect(body.orgs[0].name).toBe("Citrate Federation");
-    expect(lastDevSub).toBe("did:citrate:aleia");
+    // MEM-B-013: the BFF forwards the caller's verified bearer, not x-dev-sub.
+    expect(lastAuth).toMatch(/^Bearer /);
+    expect(lastDevSub).toBeNull();
   });
 
   it("BYOM connect token (G-7 client): mints a scoped token, 503 without a secret", async () => {

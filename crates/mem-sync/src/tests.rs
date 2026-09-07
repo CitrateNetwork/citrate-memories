@@ -932,3 +932,38 @@ fn tripwire_merge_bundle_is_authorized_and_is_the_sole_write_entry() {
         "merge_bundle_trusted must delegate to the authorized merge_bundle"
     );
 }
+
+#[test]
+fn tripwire_trusted_local_grant_key_is_not_hardcoded() {
+    // MEM-B-018: the trusted-ingest signing key must be seeded from the OS CSPRNG,
+    // not a published constant like `[0xA1u8; 32]`. A hardcoded key is a known,
+    // publishable signing key sitting beside the one no-authz merge entry point.
+    let lib = include_str!("lib.rs");
+    let start = lib.find("pub fn trusted_local_grant(").expect("trusted_local_grant exists");
+    let open = start + lib[start..].find('{').expect("body");
+    let body = &lib[open..];
+    let mut depth = 0usize;
+    let mut end = body.len();
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &body[..end];
+    assert!(
+        body.contains("getrandom::getrandom("),
+        "trusted_local_grant must seed its key from the OS CSPRNG (MEM-B-018)"
+    );
+    assert!(
+        !body.contains("from_bytes(&[0x") && !body.contains("from_bytes(&[0xA1"),
+        "trusted_local_grant must NOT sign with a hardcoded constant key (MEM-B-018)"
+    );
+}

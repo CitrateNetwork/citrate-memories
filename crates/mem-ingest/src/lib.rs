@@ -424,7 +424,7 @@ fn doc_node(
     repo: &str,
     rel_path: &str,
     title: &str,
-    file_len: usize,
+    blob_sha: &str,
     fm: &BTreeMap<String, String>,
     kind: NodeKind,
     body: &str,
@@ -443,14 +443,18 @@ fn doc_node(
         kind,
         repo: repo.to_string(),
         author: fm.get("author").cloned().unwrap_or_else(|| "ingest".to_string()),
-        // path identifies the file; title is the canonical content. No HEAD sha
-        // here, so a doc's identity does not churn on unrelated commits.
+        // MEM-B-014: identity is (repo, path, blob_sha) — a pure function of git.
+        // The blob sha comes from the index (`git ls-files -s`), so two teammates
+        // ingesting the same commit mint the SAME node id regardless of worktree
+        // byte length (autocrlf / smudge filters / LFS / a dirty tree). It also
+        // does not churn on unrelated commits, and a whitespace-only edit that
+        // changes the committed blob mints a new node deterministically.
         source_ref: SourceRef::Artifact {
             repo: repo.to_string(),
             path: rel_path.to_string(),
-            git_sha: String::new(),
+            git_sha: blob_sha.to_string(),
             byte_start: 0,
-            byte_end: file_len as u64,
+            byte_end: 0,
         },
         content: title.as_bytes().to_vec(),
         valid_from,
@@ -472,9 +476,16 @@ fn build_doc_graph(
     repo_root: &Path,
     now_ms: u64,
     embedder: &dyn Embedder,
-    authoritative: &HashSet<String>,
 ) -> Result<(Vec<MemoryNode>, Vec<Edge>, usize), IngestError> {
     let paths = docs::list_md_files(repo_root)?;
+    // MEM-B-014: blob shas from the index give each doc a git-pure identity.
+    let blobs = docs::list_md_blobs(repo_root)?;
+    // MEM-B-012: a markdown doc's frontmatter `author:` is unauthenticated
+    // (anyone who can land a tracked `.md` writes it), so a doc-sourced trailer
+    // edge must NEVER be honored as authority-bearing — its Supersedes/Refutes
+    // edges stay quarantined regardless of any authoritative-author set. Only
+    // git-commit authorship (build_graph_gated) consults `authoritative`.
+    let doc_authoritative: HashSet<String> = HashSet::new();
     let mut nodes: Vec<MemoryNode> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut ref_ids: HashMap<String, ContentHash> = HashMap::new();
@@ -489,9 +500,13 @@ fn build_doc_graph(
         let (fm, body) = frontmatter::parse(&text);
         let kind = docs::classify(rel, &fm, body);
         let title = docs::doc_title(rel, &fm, body);
-        // The doc's frontmatter author owns its agentile-block trailers.
+        // The doc's frontmatter author owns its agentile-block trailers — but is
+        // NOT trusted as authoritative (MEM-B-012; see `doc_authoritative`).
         let doc_author = fm.get("author").cloned().unwrap_or_else(|| "ingest".to_string());
-        let node = doc_node(repo, rel, &title, bytes.len(), &fm, kind, body, now_ms, embedder)?;
+        // MEM-B-014: identity uses the git blob sha (empty only if git did not
+        // report one for this path, which cannot happen for a tracked file).
+        let blob_sha = blobs.get(rel.as_str()).map(String::as_str).unwrap_or("");
+        let node = doc_node(repo, rel, &title, blob_sha, &fm, kind, body, now_ms, embedder)?;
         let id = node.compute_id();
         nodes.push(node);
         doc_count += 1;
@@ -511,7 +526,7 @@ fn build_doc_graph(
                     now_ms,
                     Some(t.key.clone()),
                     &doc_author,
-                    authoritative,
+                    &doc_authoritative,
                 ));
             }
         }
@@ -586,7 +601,6 @@ impl Ingestor {
             &root,
             now,
             self.embedder.as_ref(),
-            &self.authoritative_authors,
         )?;
         nodes.extend(doc_nodes);
         edges.extend(doc_edges);
@@ -681,7 +695,6 @@ impl Ingestor {
             &root,
             now,
             self.embedder.as_ref(),
-            &self.authoritative_authors,
         )?;
         nodes.extend(doc_nodes);
         edges.extend(doc_edges);
@@ -1270,6 +1283,79 @@ mod tests {
         let r = ing.ingest_incremental(&dir, &store).unwrap();
         assert_eq!(r.commits, 2, "rewrite triggers a full re-derive");
         assert_eq!(ing.read_watermark(&store).unwrap().unwrap().head_count, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn doc_node_for<'a>(nodes: &'a [MemoryNode], path: &str) -> Option<&'a MemoryNode> {
+        nodes.iter().find(|n| {
+            matches!(&n.source_ref, SourceRef::Artifact { path: p, .. } if p == path)
+        })
+    }
+
+    #[test]
+    fn doc_identity_is_git_pure_not_worktree_bytes() {
+        // MEM-B-014: a doc node's id must come from the git blob sha, so a dirty
+        // worktree (different byte length, same committed blob) mints the SAME id.
+        let dir = tmp_repo();
+        commit(&dir, "note.md", "---\ntitle: Note\n---\n# Note\nbody\n", "add note");
+
+        let ing = Ingestor::new("r");
+        let s1 = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        ing.ingest_incremental(&dir, &s1).unwrap();
+        let n1 = doc_node_for(&s1.all_nodes().unwrap(), "note.md").expect("doc node").clone();
+        // Identity now carries the git blob sha, and the volatile worktree length
+        // is gone from the SourceRef.
+        match &n1.source_ref {
+            SourceRef::Artifact { git_sha, byte_end, .. } => {
+                assert!(!git_sha.is_empty(), "identity must carry the git blob sha");
+                assert_eq!(*byte_end, 0, "worktree byte length must not be in identity");
+            }
+            _ => panic!("expected an Artifact source_ref"),
+        }
+
+        // Dirty the WORKTREE (append whitespace) without committing — the index
+        // blob is unchanged. A fresh ingest must produce the identical node id.
+        std::fs::write(dir.join("note.md"), "---\ntitle: Note\n---\n# Note\nbody\n\n\n   \n").unwrap();
+        let s2 = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        ing.ingest_incremental(&dir, &s2).unwrap();
+        let nodes2 = s2.all_nodes().unwrap();
+        let n2 = doc_node_for(&nodes2, "note.md").expect("doc node");
+        assert_eq!(
+            n1.compute_id(),
+            n2.compute_id(),
+            "doc identity must be invariant to worktree byte length (MEM-B-014)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doc_frontmatter_author_is_never_authoritative() {
+        // MEM-B-012: frontmatter `author:` is attacker-controlled (anyone landing a
+        // tracked .md), so a doc-sourced Supersedes must stay quarantined EVEN when
+        // that author is in the authoritative set — docs never confer authority.
+        let dir = tmp_repo();
+        let doc = "---\nauthor: trusted-maintainer\ntitle: Sneaky\n---\n# Sneaky\n\n\
+                   ```agentile\nSupersedes: ADR-canonical\n```\n";
+        commit(&dir, "sneaky.md", doc, "add sneaky doc");
+
+        // Even with the spoofed author explicitly allow-listed as authoritative...
+        let ing = Ingestor::new("r").with_authoritative_authors(["trusted-maintainer".to_string()]);
+        let store = MemoryDagStore::<MemoryNode>::new(Box::new(InMemoryKv::new()));
+        ing.ingest_incremental(&dir, &store).unwrap();
+
+        let all = store.all_nodes().unwrap();
+        let doc_node = doc_node_for(&all, "sneaky.md").expect("doc node");
+        let supersedes: Vec<_> = store
+            .out_edges(&doc_node.compute_id())
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::Supersedes)
+            .collect();
+        assert_eq!(supersedes.len(), 1, "the doc minted its Supersedes edge");
+        assert!(
+            supersedes[0].quarantined,
+            "a doc-frontmatter author must NOT make a Supersedes load-bearing (MEM-B-012)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

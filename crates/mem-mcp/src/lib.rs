@@ -364,7 +364,7 @@ impl<'a> MemoryMcpServer<'a> {
 
     fn call_recall(&mut self, args: &Value) -> Result<Value, (i64, String)> {
         let repo = arg_str(args, "repo")?;
-        let budget = arg_usize(args, "budget", 15);
+        let budget = arg_budget(args, 15);
         let in_flight = arg_bool(args, "include_in_flight", false);
         if let Err(deny) = self.authorize_read(&repo, &format!("memory.recall budget={budget} in_flight={in_flight}")) {
             return Ok(deny);
@@ -379,7 +379,7 @@ impl<'a> MemoryMcpServer<'a> {
     fn call_search(&mut self, args: &Value) -> Result<Value, (i64, String)> {
         let repo = arg_str(args, "repo")?;
         let query = arg_str(args, "query")?;
-        let budget = arg_usize(args, "budget", 10);
+        let budget = arg_budget(args, 10);
         let in_flight = arg_bool(args, "include_in_flight", false);
         if let Err(deny) = self.authorize_read(&repo, &format!("memory.search {query:?} in_flight={in_flight}")) {
             return Ok(deny);
@@ -398,7 +398,7 @@ impl<'a> MemoryMcpServer<'a> {
     fn call_neighbors(&mut self, args: &Value) -> Result<Value, (i64, String)> {
         let repo = arg_str(args, "repo")?;
         let prefix = arg_str(args, "id_prefix")?;
-        let budget = arg_usize(args, "budget", 20);
+        let budget = arg_budget(args, 20);
         if let Err(deny) = self.authorize_read(&repo, &format!("memory.neighbors {prefix}")) {
             return Ok(deny);
         }
@@ -455,7 +455,7 @@ impl<'a> MemoryMcpServer<'a> {
             .get("as_of_ms")
             .and_then(|v| v.as_u64())
             .ok_or((-32602, "missing integer argument 'as_of_ms' (epoch ms)".to_string()))?;
-        let budget = arg_usize(args, "budget", 15);
+        let budget = arg_budget(args, 15);
         // Off by default: the snapshot is a deterministic replay of the Derived
         // projection. Opting in answers "what was claimed and still stood at T",
         // which is the only way to time-filter a signed claim at all.
@@ -534,7 +534,7 @@ impl<'a> MemoryMcpServer<'a> {
     /// what an agent acting on the result might be missing.
     fn call_critique(&mut self, args: &Value) -> Result<Value, (i64, String)> {
         let repo = arg_str(args, "repo")?;
-        let budget = arg_usize(args, "budget", 15);
+        let budget = arg_budget(args, 15);
         let query = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
         let detail = match &query {
             Some(q) => format!("memory.critique search {q:?} budget={budget}"),
@@ -698,6 +698,22 @@ impl<'a> MemoryMcpServer<'a> {
             Ok(guard) => guard,
             Err(deny) => return Ok(deny),
         };
+        // MEM-B-009: a proposal must never demote a load-bearing edge. The store
+        // now no-ops such a write; report it honestly instead of claiming a
+        // proposal was recorded (which would imply the confirmed edge was touched).
+        let confirmed_exists = self
+            .store
+            .out_edges(&from_id)
+            .map_err(store_err)?
+            .into_iter()
+            .any(|e| e.to == to_id && e.kind == kind && !e.quarantined);
+        if confirmed_exists {
+            return Ok(tool_text(format!(
+                "a load-bearing {kind_str} edge {} -> {} already exists — left intact (not re-proposed)",
+                &from_id.to_hex()[..10],
+                &to_id.to_hex()[..10]
+            )));
+        }
         self.store.add_edge(&edge).map_err(store_err)?;
         Ok(tool_text(format!(
             "proposed (quarantined) {} -{kind_str}-> {} — promote with memory.confirm_edge",
@@ -985,6 +1001,18 @@ fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
     args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(default)
 }
 
+/// Upper bound on a caller-supplied `budget` on read tools. MEM-B-020: without a
+/// cap a client can pass `budget: u64::MAX`; `storyline` scans the whole tenant
+/// and `.take(budget)` then renders every node — a context-flooding primitive for
+/// an MCP agent (and an unbounded response body over HTTP). Mirrors the gateway's
+/// `budget()` clamp so both surfaces share one ceiling.
+const MAX_BUDGET: usize = 500;
+
+/// Read a `budget` argument, clamped to [`MAX_BUDGET`] at the tool boundary.
+fn arg_budget(args: &Value, default: usize) -> usize {
+    arg_usize(args, "budget", default).min(MAX_BUDGET)
+}
+
 fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
@@ -1226,6 +1254,16 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use mem_assert::Asserter;
+
+    #[test]
+    fn budget_is_clamped_at_the_tool_boundary() {
+        // MEM-B-020: an unbounded budget is a context-flooding primitive.
+        let args = serde_json::json!({ "budget": u64::MAX });
+        assert_eq!(arg_budget(&args, 15), MAX_BUDGET);
+        // A sane request passes through untouched; a missing one takes the default.
+        assert_eq!(arg_budget(&serde_json::json!({ "budget": 12 }), 15), 12);
+        assert_eq!(arg_budget(&serde_json::json!({}), 15), 15);
+    }
 
     fn node(repo: &str, subject: &str) -> MemoryNode {
         // Embedded with Recall::new's default space (hashing, d=256) so search works.

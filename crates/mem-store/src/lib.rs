@@ -61,6 +61,12 @@ pub enum SupersessionError {
     Cycle,
     #[error("edge is quarantined (a proposal, not a load-bearing supersession)")]
     Quarantined,
+    /// MEM-B-010: an Asserted-plane edge tried to retract a Derived-plane node.
+    /// A Derived node is corrected by re-deriving it from source, never by a
+    /// self-signed assertion — otherwise any keyholder could retroactively delete
+    /// deterministic history from every decision-replay snapshot.
+    #[error("an Asserted-plane edge cannot supersede a Derived-plane node")]
+    PlaneViolation,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -579,11 +585,40 @@ where
         k
     }
 
+    /// The stored edge with the same identity key (from, to, kind), if any.
+    fn stored_edge(&self, edge: &Edge) -> Result<Option<Edge>, StoreError> {
+        Ok(self
+            .out_edges(&edge.from)?
+            .into_iter()
+            .find(|e| e.to == edge.to && e.kind == edge.kind))
+    }
+
+    /// A quarantined (proposal) write must never demote or overwrite an existing
+    /// load-bearing edge with the same identity key. MEM-B-009: `Edge::key()` is
+    /// only `from‖to‖kind`, so `memory.propose_edge` (or a re-signed edge in a
+    /// merge diff) would otherwise silently clobber a confirmed, deterministically
+    /// ingested edge — flipping `quarantined` back to true and replacing its
+    /// provenance — which erases canonical structure from every agent-facing view.
+    /// Quarantine is therefore monotone downward: once confirmed, a proposal
+    /// cannot re-quarantine it. Mirrors the CRDT merge's `local && remote` rule.
+    fn is_demoting_write(&self, edge: &Edge) -> Result<bool, StoreError> {
+        if !edge.quarantined {
+            return Ok(false);
+        }
+        Ok(matches!(self.stored_edge(edge)?, Some(existing) if !existing.quarantined))
+    }
+
     /// Add an edge. Written to both the out- and in-adjacency CFs in one atomic
     /// batch so a half-written edge can never be observed. Idempotent by
     /// (from, to, kind). When encrypting at rest the value is sealed under the
     /// `from` endpoint's tenant key (fallback: `to`) — see `shred` module docs.
+    ///
+    /// A quarantined write over an already-confirmed edge is a no-op (MEM-B-009):
+    /// proposals never demote load-bearing edges.
     pub fn add_edge(&self, edge: &Edge) -> Result<(), StoreError> {
+        if self.is_demoting_write(edge)? {
+            return Ok(());
+        }
         let ops = self.edge_put_ops(edge, &HashMap::new())?;
         self.kv.kv_write_batch(&ops).map_err(StoreError::Backend)
     }
@@ -604,6 +639,11 @@ where
             });
         }
         for e in edges {
+            // MEM-B-009: a re-signed quarantined edge in a merge diff must not
+            // clobber a confirmed edge with the same key.
+            if self.is_demoting_write(e)? {
+                continue;
+            }
             ops.extend(self.edge_put_ops(e, &batch_tenants)?);
         }
         self.kv.kv_write_batch(&ops).map_err(StoreError::Backend)
@@ -738,6 +778,15 @@ impl MemoryDagStore<MemoryNode> {
         let mut target = self
             .get_node(&edge.to)?
             .ok_or_else(|| SupersessionError::MissingNode(edge.to.to_hex()))?;
+        // MEM-B-010: plane/tier guard. An Asserted-plane supersession must not
+        // retract a Derived-plane node — the two planes are not interchangeable
+        // authorities. `apply_diff`/`merge_bundle` verify only the edge signature,
+        // so without this a keyholder could assert a throwaway Asserted edge and
+        // supersede any `DerivedDeterministic` node (stamping an attacker-chosen
+        // `valid_to`), retroactively hiding it from `as_of` replay.
+        if edge.plane == mem_core::Plane::Asserted && target.plane == mem_core::Plane::Derived {
+            return Err(SupersessionError::PlaneViolation);
+        }
         if self.would_cycle_supersedes(&edge.from, &edge.to)? {
             return Err(SupersessionError::Cycle);
         }
@@ -1362,6 +1411,60 @@ mod tests {
         assert!(matches!(err, SupersessionError::Cycle));
         assert!(s.out_edges(&b.compute_id()).unwrap()[0].quarantined, "proposal stays quarantined");
         assert_eq!(s.get_node(&a.compute_id()).unwrap().unwrap().status, Status::Active);
+    }
+
+    #[test]
+    fn proposing_over_a_confirmed_edge_cannot_demote_it() {
+        // MEM-B-009: a confirmed, deterministically-ingested edge must survive a
+        // later quarantined proposal with the same (from, to, kind) key — its
+        // provenance and load-bearing status intact.
+        let s = store();
+        let (a, b) = (node("a"), node("b"));
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+
+        // Canonical, load-bearing edge from ingest.
+        let mut canonical = edge(&a, &b, EdgeKind::Implements);
+        canonical.provenance.evidence = Some("git trailer Implements:".into());
+        canonical.provenance.asserter = "ingest".into();
+        s.add_edge(&canonical).unwrap();
+
+        // A hostile quarantined proposal with attacker provenance over the same key.
+        let mut proposal = edge(&a, &b, EdgeKind::Implements);
+        proposal.quarantined = true;
+        proposal.trust_tier = TrustTier::InferredAdvisory;
+        proposal.provenance.evidence = Some("mallory says maybe".into());
+        proposal.provenance.asserter = "mallory".into();
+        s.add_edge(&proposal).unwrap(); // no-op, not an error
+
+        let stored = &s.out_edges(&a.compute_id()).unwrap()[0];
+        assert!(!stored.quarantined, "confirmed edge must not be re-quarantined");
+        assert_eq!(stored.trust_tier, TrustTier::DerivedDeterministic, "tier preserved");
+        assert_eq!(
+            stored.provenance.evidence.as_deref(),
+            Some("git trailer Implements:"),
+            "canonical provenance preserved"
+        );
+        assert_eq!(stored.provenance.asserter, "ingest", "canonical asserter preserved");
+    }
+
+    #[test]
+    fn asserted_edge_cannot_supersede_a_derived_node() {
+        // MEM-B-010: a self-signed Asserted-plane Supersedes edge must not retract
+        // a Derived-plane node (which is corrected by re-deriving, never asserted).
+        let s = store();
+        let (attacker, victim) = (node("throwaway assertion"), node("canonical derived memory"));
+        s.put_node(&attacker).unwrap();
+        s.put_node(&victim).unwrap(); // Plane::Derived (see `node` helper)
+        let mut e = supersedes_at(&attacker, &victim, 1);
+        e.plane = Plane::Asserted;
+        let err = s.apply_supersession(&e).unwrap_err();
+        assert!(matches!(err, SupersessionError::PlaneViolation));
+        assert_eq!(
+            s.get_node(&victim.compute_id()).unwrap().unwrap().status,
+            Status::Active,
+            "Derived node not superseded by an Asserted edge"
+        );
     }
 
     #[test]

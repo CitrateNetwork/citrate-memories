@@ -28,6 +28,23 @@ jobs:
       - name: clippy -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  cargo-audit:
+    # MEM-B-015: fail the build on a known-vulnerable dependency (RUSTSEC). The
+    # gateway's h2/hyper HTTP listener is unauthenticated at the framing layer, so
+    # a codec advisory is directly reachable. Default `cargo audit` fails on
+    # VULNERABILITIES (not merely unmaintained/unsound warnings), so a new RUSTSEC
+    # vuln hard-blocks the merge while the accepted transformer-stack warnings do
+    # not perpetually redden CI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit
+
   tla-model-check:
     # WP-0.5 gate: TLC over SupersededDag / Ingestion / Authz. This is where a
     # broken safety invariant hard-blocks the merge (it caught the SupersededDag
