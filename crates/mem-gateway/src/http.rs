@@ -188,11 +188,22 @@ fn authenticate(app: &AppState, headers: &HeaderMap) -> Result<String, ApiError>
     Err(unauthorized("authentication not configured"))
 }
 
-fn audit_event(app: &AppState, ev: MemoryEvent, actor: &str, resource: &str, detail: &str) {
+/// Append one audited decision, failing CLOSED: MEM-B-011 — if the append fails
+/// (disk full, read-only audit path, poisoned chain) the caller must NOT serve
+/// the request. Mirrors `mem-mcp::authorize`, which already 500s on an audit
+/// error rather than performing an unaudited read/write.
+fn audit_event(
+    app: &AppState,
+    ev: MemoryEvent,
+    actor: &str,
+    resource: &str,
+    detail: &str,
+) -> Result<(), ApiError> {
     let mut chain = lock(&app.audit);
-    if let Err(e) = chain.append(ev, actor, resource, detail, now_ms()) {
+    chain.append(ev, actor, resource, detail, now_ms()).map(|_| ()).map_err(|e| {
         tracing::error!("audit append failed for {actor} on {resource}: {e}");
-    }
+        ise(format!("audit append failed; refusing to proceed: {e}"))
+    })
 }
 
 /// Authenticate, then authorize one operation against the principal's Org
@@ -240,7 +251,8 @@ fn gate_with_grant(
             Some(m) => m.clone(),
             None => {
                 drop(control);
-                audit_event(app, MemoryEvent::Denied, &sub, resource, "no membership");
+                // Best-effort on the deny path: the outcome is already a refusal.
+                let _ = audit_event(app, MemoryEvent::Denied, &sub, resource, "no membership");
                 return Err(forbidden("no membership in org"));
             }
         }
@@ -254,11 +266,12 @@ fn gate_with_grant(
                 Op::Read => MemoryEvent::Read,
                 Op::Write => MemoryEvent::Write,
             };
-            audit_event(app, ev, &sub, resource, detail);
+            // Fail closed: an allowed op that cannot be audited must not run.
+            audit_event(app, ev, &sub, resource, detail)?;
             Ok((sub, grant))
         }
         Err(e) => {
-            audit_event(app, MemoryEvent::Denied, &sub, resource, &e.to_string());
+            let _ = audit_event(app, MemoryEvent::Denied, &sub, resource, &e.to_string());
             Err(forbidden("not authorized for resource"))
         }
     }

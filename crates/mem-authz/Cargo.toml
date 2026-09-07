@@ -14,3 +14,7 @@ blake3.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 ed25519-dalek = "2"
+# MEM-B-011: an flock on the persistent audit log so two processes cannot fork
+# the hash-chain (duplicate sequence numbers brick it on reopen).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }

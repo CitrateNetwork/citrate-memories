@@ -51,6 +51,25 @@ pub enum AuditError {
     /// was truncated (or rolled back) behind the chain head.
     #[error("audit log truncated: head commits to {head} records but log holds {log}")]
     Truncated { head: u64, log: u64 },
+    /// Another process already holds the exclusive lock on this log (MEM-B-011).
+    /// Two processes appending to one chain fork it into duplicate sequence
+    /// numbers, which brick the log permanently on the next reopen — so the
+    /// second opener refuses to start rather than corrupt the chain.
+    #[error("audit log is locked by another process: {0}")]
+    Locked(String),
+}
+
+/// Take an exclusive, non-blocking advisory lock on the open log file. The lock
+/// lives with the open file description, so holding the [`FileSink`] holds the
+/// lock for the life of the process (MEM-B-011). A second opener fails fast.
+#[cfg(unix)]
+fn lock_log_exclusive(file: &File) -> Result<(), AuditError> {
+    use rustix::fs::{flock, FlockOperation};
+    flock(file, FlockOperation::NonBlockingLockExclusive).map_err(|e| AuditError::Locked(e.to_string()))
+}
+#[cfg(not(unix))]
+fn lock_log_exclusive(_file: &File) -> Result<(), AuditError> {
+    Ok(())
 }
 
 fn feed(h: &mut blake3::Hasher, tag: u8, bytes: &[u8]) {
@@ -151,6 +170,7 @@ impl AuditChain {
                 }
             }
             let log = OpenOptions::new().create_new(true).append(true).open(&log_path)?;
+            lock_log_exclusive(&log)?;
             write_head(&head_path, 0, &[0u8; 32])?;
             return Ok(Self {
                 records: Vec::new(),
@@ -218,12 +238,16 @@ impl AuditChain {
             )));
         }
 
-        // Repair the head after an accepted crash window.
+        let log = OpenOptions::new().append(true).open(&log_path)?;
+        // Acquire the lock BEFORE trusting/repairing the head — a second process
+        // must not race the head rewrite below (MEM-B-011).
+        lock_log_exclusive(&log)?;
+
+        // Repair the head after an accepted crash window (now that we hold the lock).
         if head.len != log_len {
             write_head(&head_path, log_len, &last_hash)?;
         }
 
-        let log = OpenOptions::new().append(true).open(&log_path)?;
         Ok(Self {
             records,
             last_hash,
@@ -318,6 +342,22 @@ mod tests {
     fn cleanup(p: &Path) {
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(head_path_for(p));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_opener_is_refused_while_first_holds_the_lock() {
+        // MEM-B-011: two live chains on one log fork the hash-chain into duplicate
+        // sequence numbers and brick it. The second opener must fail fast instead.
+        let p = temp_log("lock");
+        let first = AuditChain::open(&p).expect("first open");
+        let second = AuditChain::open(&p);
+        assert!(matches!(second, Err(AuditError::Locked(_))), "second opener must be refused");
+        drop(first); // releases the flock
+        // Once released, reopening succeeds and the chain still verifies.
+        let reopened = AuditChain::open(&p).expect("reopen after release");
+        assert_eq!(reopened.verify_integrity(), Ok(0));
+        cleanup(&p);
     }
 
     #[test]
