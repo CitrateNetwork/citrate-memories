@@ -3,12 +3,12 @@
  * handlers in src/app/api/*) is the ONLY thing that calls this; the browser never
  * holds a gateway credential (planset §2).
  *
- * Auth to the gateway: the gateway today runs dev-auth (`x-dev-sub` header behind
- * MEM_GATEWAY_ALLOW_DEV_AUTH=1) and fails closed otherwise — real OIDC bearer
- * verification is gateway gap G-2 (planset §3.A). So this client forwards the
- * caller's already-verified OIDC `sub` as `x-dev-sub` by default. The seam to
- * switch to bearer-forwarding (once G-2 lands) is one branch: set
- * MEM_GATEWAY_FORWARD_BEARER=1 and pass the caller's token.
+ * Auth to the gateway (MEM-B-013): this client forwards the caller's verified
+ * OIDC bearer token by DEFAULT (the secure posture, gateway OIDC = gap G-2). The
+ * `x-dev-sub` header is an unauthenticated impersonation string, so it is only
+ * used when `MEM_GATEWAY_DEV_SUB=1` is set for a local/dev deployment whose
+ * gateway also runs dev-auth (`MEM_GATEWAY_ALLOW_DEV_AUTH=1`) — never as a silent
+ * fallback.
  *
  * Fail closed: gatewayOrigin() throws if MEM_GATEWAY_ORIGIN is unset, so a
  * misconfigured deploy errors loudly rather than silently calling localhost.
@@ -42,17 +42,27 @@ function gatewayOrigin(): string {
 export interface GatewayCaller {
   /** The verified OIDC subject (from the auth seam's requireOwner). */
   sub: string;
-  /** The caller's bearer token, forwarded only when MEM_GATEWAY_FORWARD_BEARER=1. */
+  /** The caller's verified bearer token; forwarded to the gateway by default. */
   token?: string | null;
 }
 
-/** Auth headers for a gateway call — bearer-forward (G-2) or dev-sub. */
+/**
+ * Auth headers for a gateway call — bearer-forward (G-2) by default, dev-sub only
+ * when explicitly opted in.
+ *
+ * MEM-B-013: forwarding the caller's verified OIDC bearer is the SECURE default.
+ * The `x-dev-sub` header is an unauthenticated impersonation string (OIDC `sub`
+ * values are not secret), so it is used ONLY when `MEM_GATEWAY_DEV_SUB=1` is set —
+ * never as the silent fallback. If bearer-forward is desired but no token is
+ * present, we send neither header and let the gateway fail closed (401) rather
+ * than silently impersonate via dev-sub.
+ */
 function callerHeaders(caller: GatewayCaller): Record<string, string> {
   const headers: Record<string, string> = { accept: "application/json" };
-  if (process.env.MEM_GATEWAY_FORWARD_BEARER === "1" && caller.token) {
-    headers.authorization = `Bearer ${caller.token}`;
-  } else {
+  if (process.env.MEM_GATEWAY_DEV_SUB === "1") {
     headers["x-dev-sub"] = caller.sub;
+  } else if (caller.token) {
+    headers.authorization = `Bearer ${caller.token}`;
   }
   return headers;
 }

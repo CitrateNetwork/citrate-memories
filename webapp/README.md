@@ -24,9 +24,8 @@ locked; the rest is staged in
   (`src/lib/gateway/*`, `src/app/api/*`): the browser → BFF → `mem-gateway` read API
   (orgs/tenants/layout/recall/node/verify/neighbors). Fail-closed verified end-to-end
   (health 503 with no gateway, 401 with no session) against a hermetic loopback
-  gateway. Forwards the verified OIDC `sub` as `x-dev-sub` today; flips to
-  bearer-forwarding via `MEM_GATEWAY_FORWARD_BEARER=1` once the gateway gains real
-  OIDC (gap G-2). Four-ratchet baseline in `.agentile/coverage/baseline.json`.
+  gateway. Forwards the verified OIDC bearer by default (MEM-B-013); set
+  `MEM_GATEWAY_DEV_SUB=1` only for a local dev gateway to send `x-dev-sub` instead. Four-ratchet baseline in `.agentile/coverage/baseline.json`.
 
 - **WP-7.4** — the constellation engine ported 1:1 to a typed `ConstellationEngine`
   (`src/components/constellation/`), decoupled from the prototype's globals: orbit
@@ -42,9 +41,8 @@ locked; the rest is staged in
   bearer verification against the authority JWKS (issuer+audience+expiry, RS256
   pinned), wired into `AppState`/`authn` (OIDC takes precedence, fails closed) and
   the binary (`OIDC_ISSUER`/`OIDC_AUDIENCE` + `OIDC_JWKS_JSON`|`_FILE`). 32 gateway
-  tests pass, clippy clean. To use it from the webapp, set
-  `MEM_GATEWAY_FORWARD_BEARER=1` so the BFF forwards the caller's bearer instead of
-  `x-dev-sub`.
+  tests pass, clippy clean. To use it from the webapp, leave `MEM_GATEWAY_DEV_SUB` unset so the BFF forwards the caller's bearer
+  (the default) rather than the `x-dev-sub` dev header.
 
 - **Gateway G-3 + G-1 (Rust) — DONE.** **G-3:** `ControlPlane` now persists
   atomically (`load_or_default` / `save_atomic`, temp→fsync→rename) and is loaded at
@@ -157,7 +155,7 @@ webapp/
 1. **WP-7.4** — port `constellation.js` to a typed `ConstellationEngine` module and
    feed it from `GET /api/orgs/[org]/layout` (the BFF route is live).
 2. **Gateway (Rust)** — G-2 real OIDC/JWKS verification + G-3 durable ControlPlane in
-   `crates/mem-gateway`; then flip the BFF to `MEM_GATEWAY_FORWARD_BEARER=1`. G-1 write
+   `crates/mem-gateway`; the BFF already forwards the bearer by default. G-1 write
    routes (assert/propose/confirm) unblock the HITL surfaces.
 3. **WP-7.1 follow-through** — register Memrizz as an OIDC client in
    `citrate-identity/src/config.ts`; add `/auth/callback` + client provider

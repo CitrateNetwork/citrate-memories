@@ -35,6 +35,28 @@ fn resolve_asserter_seed(env_val: Option<String>) -> Result<String, &'static str
     )
 }
 
+/// MEM-B-013: guard the dev-auth cliff. When OIDC is off and
+/// `MEM_GATEWAY_ALLOW_DEV_AUTH=1`, the gateway trusts the unauthenticated
+/// `x-dev-sub` impersonation header — anyone with network reach can read/write as
+/// any member. That is a development-only posture. To make it impossible to reach
+/// by casually flipping one env var to "fix" a 401 in production, dev-auth also
+/// requires an explicit non-production acknowledgement
+/// (`MEM_GATEWAY_DEV_AUTH_ACK=1`). Missing it → refuse to start.
+fn dev_auth_permitted(oidc_on: bool, allow_dev_auth: bool, ack: Option<&str>) -> Result<(), String> {
+    if oidc_on || !allow_dev_auth {
+        return Ok(());
+    }
+    if ack == Some("1") {
+        Ok(())
+    } else {
+        Err("MEM_GATEWAY_ALLOW_DEV_AUTH=1 trusts the unauthenticated x-dev-sub header \
+             (impersonate any member). Refusing to start: this is DEVELOPMENT ONLY. \
+             Set MEM_GATEWAY_DEV_AUTH_ACK=1 to acknowledge a non-production deployment, \
+             or configure OIDC_* for real authentication."
+            .to_string())
+    }
+}
+
 struct Args {
     org: String,
     store: String,
@@ -211,7 +233,11 @@ async fn main() {
             eprintln!("mem-gateway: WARNING no OrgOwner membership for '{}' — every real user will get 403. Bootstrap with --bootstrap-owner <sub>.", args.org);
         }
     } else if allow_dev_auth {
-        eprintln!("mem-gateway: AUTH = dev-auth (x-dev-sub) — DEVELOPMENT ONLY");
+        // MEM-B-013: refuse to start in a dev-auth posture without explicit ack.
+        if let Err(m) = dev_auth_permitted(false, true, env_opt("MEM_GATEWAY_DEV_AUTH_ACK").as_deref()) {
+            fail(&m);
+        }
+        eprintln!("mem-gateway: AUTH = dev-auth (x-dev-sub) — DEVELOPMENT ONLY (acknowledged)");
     } else {
         eprintln!("mem-gateway: AUTH = none configured — all Org routes will 401 (fail closed). Set OIDC_* or MEM_GATEWAY_ALLOW_DEV_AUTH=1.");
     }
@@ -241,7 +267,22 @@ async fn main() {
 
 #[cfg(test)]
 mod seed_tests {
-    use super::resolve_asserter_seed;
+    use super::{dev_auth_permitted, resolve_asserter_seed};
+
+    /// MEM-B-013 tripwire: dev-auth (x-dev-sub impersonation) must not be reachable
+    /// by flipping one env var — it also requires an explicit non-prod ack.
+    #[test]
+    fn dev_auth_requires_explicit_ack() {
+        // OIDC on → dev-auth is ignored, always fine.
+        assert!(dev_auth_permitted(true, true, None).is_ok());
+        // OIDC off, dev-auth off → fine (fail-closed 401 posture).
+        assert!(dev_auth_permitted(false, false, None).is_ok());
+        // OIDC off, dev-auth on, no ack → refuse to start.
+        assert!(dev_auth_permitted(false, true, None).is_err());
+        assert!(dev_auth_permitted(false, true, Some("0")).is_err());
+        // Explicit acknowledgement → permitted.
+        assert!(dev_auth_permitted(false, true, Some("1")).is_ok());
+    }
 
     /// MEM-B-006 tripwire: with the seed unset the gateway must refuse to start
     /// (Err), never silently fall back to a constant key.
