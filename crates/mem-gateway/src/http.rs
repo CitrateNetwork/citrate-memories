@@ -34,7 +34,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use mem_assert::Asserter;
-use mem_authz::{AuditChain, MemoryEvent, Op};
+use mem_authz::{AuditChain, CapabilityGrant, MemoryEvent, Op, PolicyProfile, ResourceScope};
 use mem_core::{MemoryNode, NodeKind};
 use mem_index::Embedder;
 use mem_mcp::MemoryMcpServer;
@@ -42,7 +42,8 @@ use mem_query::{NeighborItem, Recall, RecallItem, RecallResult, TenantIndexCache
 use mem_store::MemoryDagStore;
 
 use crate::auth::{
-    mint_connect_token, mint_grant, repo_resource, verify_connect_token, OidcVerifier,
+    mint_connect_token, mint_grant, repo_resource, verify_connect_token, ConnectClaims,
+    OidcVerifier,
 };
 use crate::control::{Control, OrgStatus};
 use crate::now_ms;
@@ -206,6 +207,22 @@ fn gate(
     op: Op,
     detail: &str,
 ) -> Result<String, ApiError> {
+    gate_with_grant(app, headers, org, resource, op, detail).map(|(sub, _)| sub)
+}
+
+/// Like [`gate`], but also returns the caller's full minted [`CapabilityGrant`],
+/// so a handler can apply per-item grant intersection (e.g. filter cross-tenant
+/// neighbours to the tenants this caller may actually read — MEM-B-007). The grant
+/// is the SAME one `gate` authorizes `resource` against; the extra return lets a
+/// read handler police the *other* nodes it surfaces, not just the anchor.
+fn gate_with_grant(
+    app: &AppState,
+    headers: &HeaderMap,
+    org: &str,
+    resource: &str,
+    op: Op,
+    detail: &str,
+) -> Result<(String, CapabilityGrant), ApiError> {
     // Single-Org runner: this gateway serves exactly one store.
     if org != app.org_id.as_str() {
         return Err(not_found("unknown org on this gateway"));
@@ -238,13 +255,93 @@ fn gate(
                 Op::Write => MemoryEvent::Write,
             };
             audit_event(app, ev, &sub, resource, detail);
-            Ok(sub)
+            Ok((sub, grant))
         }
         Err(e) => {
             audit_event(app, MemoryEvent::Denied, &sub, resource, &e.to_string());
             Err(forbidden("not authorized for resource"))
         }
     }
+}
+
+/// FUA-MEMORIES-01 / MEM-B-007: resolve an id prefix and confirm the node lives in
+/// `repo`. `Recall::resolve_prefix` is tenant-blind — it matches across ALL
+/// tenants — so a caller authorized on `repo` could pass a prefix of a node in a
+/// tenant their membership excludes and read its content/neighbours (a
+/// cross-tenant IDOR). A prefix that does not resolve, OR resolves into another
+/// tenant, reads as 404 (never 403) so existence does not leak. This mirrors the
+/// guard already applied on the MCP surface (`mem-mcp` `call_neighbors`/
+/// `call_verify`); it is lifted here so both surfaces share one rule.
+fn resolve_in_tenant(
+    store: &MemoryDagStore<MemoryNode>,
+    rc: &Recall<'_>,
+    repo: &str,
+    prefix: &str,
+) -> Result<(mem_core::ContentHash, MemoryNode), ApiError> {
+    let id = rc
+        .resolve_prefix(prefix)
+        .map_err(ise)?
+        .ok_or_else(|| not_found("node id prefix did not resolve"))?;
+    match store.get_node(&id).map_err(ise)? {
+        Some(n) if n.repo == repo => Ok((id, n)),
+        _ => Err(not_found("node id prefix did not resolve")),
+    }
+}
+
+/// Grant-intersection read check (R3): may this caller's grant READ `repo`? Used
+/// to filter individual cross-tenant items (e.g. neighbours reached via a
+/// cross-DAG `AnalogousTo` edge) so neither their content nor existence leaks to a
+/// caller whose membership excludes that tenant (MEM-B-007).
+fn grant_can_read(grant: &CapabilityGrant, repo: &str) -> bool {
+    grant.check(&repo_resource(repo), Op::Read, now_ms()).is_ok()
+}
+
+/// MEM-B-008: intersect a membership grant with the attenuation a BYOM connect
+/// token declares. `verify_connect_token` used to read ONLY `sub`, so the token's
+/// `scope`/`tenants` were silently discarded and `byom` minted the principal's
+/// FULL membership grant — an Owner/Admin `*` read+write for the whole TTL, though
+/// the token was presented to the user as read-only on a named tenant list. The
+/// effective authority is now the INTERSECTION of membership and token: never
+/// wider than either.
+///   * `tenants` present → restrict resources to exactly those repos the token
+///     names AND the membership already permits (drops a `*` wildcard).
+///   * write is allowed only when the token's `scope` names a write-y capability
+///     (`write` or `propose`); an absent scope defaults to read-only (least
+///     privilege) so a legacy claimless token cannot silently escalate.
+/// The narrowed grant is re-signed with the gateway key so it still verifies.
+fn attenuate_grant(grant: &CapabilityGrant, claims: &ConnectClaims, sk: &SigningKey) -> CapabilityGrant {
+    let token_allows_write = claims
+        .scope
+        .as_deref()
+        .map(|s| s.split(',').any(|t| matches!(t.trim(), "write" | "propose")))
+        .unwrap_or(false);
+    let now = now_ms();
+
+    let mut narrowed = grant.clone();
+    match &claims.tenants {
+        Some(tenants) => {
+            narrowed.allowed_resources = tenants
+                .iter()
+                .map(|t| {
+                    let rid = repo_resource(t);
+                    let can_read = grant.check(&rid, Op::Read, now).is_ok();
+                    let can_write = token_allows_write && grant.check(&rid, Op::Write, now).is_ok();
+                    ResourceScope { resource_id: rid, can_read, can_write }
+                })
+                .collect();
+        }
+        None => {
+            // No tenant restriction — keep the membership scopes but gate write.
+            for r in narrowed.allowed_resources.iter_mut() {
+                r.can_write = r.can_write && token_allows_write;
+            }
+        }
+    }
+    if !token_allows_write {
+        narrowed.policy = PolicyProfile::ReadOnly;
+    }
+    narrowed.sign_with(sk);
+    narrowed
 }
 
 // --------------------------------------------------------------------------
@@ -451,13 +548,19 @@ async fn neighbors(
 ) -> Result<Json<Value>, ApiError> {
     let repo = qparam(&q, "repo").ok_or_else(|| bad("repo query param required"))?;
     let id_prefix = qparam(&q, "id").ok_or_else(|| bad("id query param required"))?;
-    gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "neighbors")?;
+    let (_sub, grant) =
+        gate_with_grant(&app, &headers, &org, &repo_resource(&repo), Op::Read, "neighbors")?;
     let rc = recaller(&app);
-    let id = rc
-        .resolve_prefix(&id_prefix)
-        .map_err(ise)?
-        .ok_or_else(|| not_found("node id prefix did not resolve"))?;
+    // MEM-B-007: the anchor must live in the authorized tenant (cross-tenant → 404).
+    let (id, _node) = resolve_in_tenant(&app.store, &rc, &repo, &id_prefix)?;
     let ns = rc.neighbors(&id, budget(&q, 20)).map_err(ise)?;
+    // MEM-B-007 (grant intersection, R3): a neighbour in another tenant is shown
+    // only if this caller's grant can READ that tenant; others are dropped so
+    // neither content nor existence leaks.
+    let ns: Vec<NeighborItem> = ns
+        .into_iter()
+        .filter(|nb| nb.node.as_ref().map(|n| n.repo == repo || grant_can_read(&grant, &n.repo)).unwrap_or(true))
+        .collect();
     Ok(Json(json!({
         "id": id.to_hex(),
         "count": ns.len(),
@@ -475,15 +578,9 @@ async fn verify(
     let id_prefix = qparam(&q, "id").ok_or_else(|| bad("id query param required"))?;
     gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "verify")?;
     let rc = recaller(&app);
-    let id = rc
-        .resolve_prefix(&id_prefix)
-        .map_err(ise)?
-        .ok_or_else(|| not_found("node id prefix did not resolve"))?;
-    let node = app
-        .store
-        .get_node(&id)
-        .map_err(ise)?
-        .ok_or_else(|| not_found("node not found"))?;
+    // MEM-B-007: resolve within the authorized tenant — a prefix of a node in
+    // another tenant reads as 404 (was a cross-tenant IDOR returning its content).
+    let (id, node) = resolve_in_tenant(&app.store, &rc, &repo, &id_prefix)?;
     let ns = rc.neighbors(&id, 64).map_err(ise)?;
     let superseded = matches!(node.status, mem_core::Status::Superseded)
         || ns.iter().any(|n| {
@@ -673,13 +770,19 @@ async fn connect_token(
     let secret = app.connect_secret.as_ref().ok_or_else(|| {
         ApiError::new(StatusCode::NOT_IMPLEMENTED, "connect minting not configured")
     })?;
-    const TTL_SECS: usize = 30 * 24 * 60 * 60; // 30 days
+    // MEM-B-008: short-lived and read-only by default. The token's authority is
+    // the intersection of membership and these claims at use time; this
+    // gateway-minted path deliberately asserts only read (a write BYOM token is
+    // minted through the webapp with an explicit `read,propose` scope). Was 30
+    // days + no scope, i.e. a long-lived full-org bearer credential.
+    const TTL_SECS: usize = 15 * 60; // 15 minutes
     let now_secs = (now_ms() / 1000) as usize;
-    let token = mint_connect_token(secret, &sub, now_secs, TTL_SECS)
+    let token = mint_connect_token(secret, &sub, Some("read"), &[], now_secs, TTL_SECS)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "mint failed"))?;
     Ok(Json(json!({
         "connect_token": token,
         "sub": sub,
+        "scope": "read",
         "expires_in": TTL_SECS,
     })))
 }
@@ -698,9 +801,9 @@ async fn byom(
         .as_ref()
         .ok_or_else(|| ApiError::new(StatusCode::NOT_IMPLEMENTED, "BYOM connect not configured"))?;
     let token = bearer(&headers).ok_or_else(|| unauthorized("missing connect token"))?;
-    let token_sub =
+    let claims =
         verify_connect_token(secret, &token).map_err(|_| unauthorized("connect token rejected"))?;
-    if token_sub != sub {
+    if claims.sub != sub {
         return Err(forbidden("connect token sub mismatch"));
     }
 
@@ -713,6 +816,10 @@ async fn byom(
     };
     let now = now_ms();
     let grant = mint_grant(&app.signing_key, &app.issuer, &membership, now, GRANT_TTL_MS);
+    // MEM-B-008: the connect token is an ATTENUATION — intersect the membership
+    // grant with the token's declared scope/tenants so it can never authorize more
+    // than the user was shown (and never write when the token is read-only).
+    let grant = attenuate_grant(&grant, &claims, &app.signing_key);
     // FWA-C10-04: per-principal authorship (see /assert). `sub` is the
     // connect-token-verified principal.
     let asserter = Asserter::for_principal(&app.signing_key, &sub);
@@ -792,4 +899,145 @@ fn build_layout(app: &AppState, org: &str) -> Result<Scene, ApiError> {
     let scene = scene::build_scene(org, inputs, edges);
     *lock(&app.layout_cache) = Some(scene.clone());
     Ok(scene)
+}
+
+// --------------------------------------------------------------------------
+// MEM-B-008 tests: a BYOM connect token is an ATTENUATION of the membership
+// grant, never a silent full-membership credential. These exercise the pure
+// core of the fix (`attenuate_grant`) — the same intersection `byom` applies.
+// --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod byom_attenuation_tests {
+    use super::*;
+    use crate::auth::signing_key_from_seed;
+    use crate::control::{Membership, Role};
+
+    fn owner_membership() -> Membership {
+        Membership {
+            sub: "owner-1".into(),
+            org: "citrate-federation".into(),
+            role: Role::OrgOwner,
+            scopes: vec![],
+            parent: None,
+        }
+    }
+
+    /// MEM-B-008 tripwire: a token minted with `scope:"read"` must NOT authorize a
+    /// write, even for an OrgOwner whose membership is `*` read+write. Before the
+    /// fix the scope was dropped at verify and the owner's full grant was used.
+    #[test]
+    fn read_scope_denies_write_even_for_owner() {
+        let sk = signing_key_from_seed("seed");
+        let now = now_ms();
+        let grant = mint_grant(&sk, "iss", &owner_membership(), now, GRANT_TTL_MS);
+        assert!(
+            grant.check("repo:citrate-chain/memory", Op::Write, now).is_ok(),
+            "precondition: owner membership can write before attenuation"
+        );
+        let claims = ConnectClaims { sub: "owner-1".into(), scope: Some("read".into()), tenants: None };
+        let att = attenuate_grant(&grant, &claims, &sk);
+        assert!(att.check("repo:citrate-chain/memory", Op::Read, now).is_ok(), "read is preserved");
+        assert!(
+            att.check("repo:citrate-chain/memory", Op::Write, now).is_err(),
+            "MEM-B-008: a read-scope token must not authorize write, even for an owner"
+        );
+    }
+
+    /// A token's `tenants` list restricts the owner's `*` wildcard to exactly those
+    /// repos — a tenant the token does not name is denied though membership covered it.
+    #[test]
+    fn tenants_claim_restricts_owner_wildcard() {
+        let sk = signing_key_from_seed("seed");
+        let now = now_ms();
+        let grant = mint_grant(&sk, "iss", &owner_membership(), now, GRANT_TTL_MS);
+        let claims = ConnectClaims {
+            sub: "owner-1".into(),
+            scope: Some("read,propose".into()),
+            tenants: Some(vec!["citrate-landing".into()]),
+        };
+        let att = attenuate_grant(&grant, &claims, &sk);
+        assert!(att.check("repo:citrate-landing/memory", Op::Write, now).is_ok(), "named tenant writable (propose ⇒ write)");
+        assert!(
+            att.check("repo:citrate-chain/memory", Op::Read, now).is_err(),
+            "MEM-B-008: a tenant the token did not name is denied, though the owner membership covered it"
+        );
+    }
+
+    /// A claimless (legacy) token defaults to read-only — least privilege, never a
+    /// silent full-membership grant.
+    #[test]
+    fn absent_scope_defaults_to_read_only() {
+        let sk = signing_key_from_seed("seed");
+        let now = now_ms();
+        let grant = mint_grant(&sk, "iss", &owner_membership(), now, GRANT_TTL_MS);
+        let claims = ConnectClaims { sub: "owner-1".into(), scope: None, tenants: None };
+        let att = attenuate_grant(&grant, &claims, &sk);
+        assert!(att.check("repo:x/memory", Op::Read, now).is_ok());
+        assert!(
+            att.check("repo:x/memory", Op::Write, now).is_err(),
+            "MEM-B-008: absent scope ⇒ least privilege (read-only)"
+        );
+    }
+}
+
+// --------------------------------------------------------------------------
+// MEM-B-007 tests: `resolve_in_tenant` confines the tenant-blind
+// `resolve_prefix` so a caller authorized on one repo cannot resolve (and thus
+// read) a node in another tenant — a cross-tenant IDOR. Cross-tenant reads as
+// 404, never 403, so existence does not leak.
+// --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod resolve_in_tenant_tests {
+    use super::*;
+    use mem_core::{Plane, SourceRef, Status, TrustTier, SCHEMA_VERSION};
+    use mem_store::kv::InMemoryKv;
+
+    fn node(repo: &str, content: &str) -> MemoryNode {
+        MemoryNode {
+            schema_version: SCHEMA_VERSION,
+            plane: Plane::Derived,
+            kind: NodeKind::Rationale,
+            repo: repo.into(),
+            author: "ingest".into(),
+            source_ref: SourceRef::DagNative { key: content.into() },
+            content: content.as_bytes().to_vec(),
+            valid_from: 1,
+            valid_to: None,
+            observed_at: 1,
+            trust_tier: TrustTier::DerivedDeterministic,
+            signature: None,
+            embedding: None,
+            confidence: vec![],
+            anchors: vec![],
+            status: Status::Active,
+        }
+    }
+
+    #[test]
+    fn foreign_tenant_prefix_reads_as_404_not_the_node() {
+        let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        // A node that lives ONLY in citrate-chain.
+        let secret = node("citrate-chain", "the chain's private decision");
+        let id = store.put_node(&secret).unwrap();
+        let prefix = &id.to_hex()[..12];
+        let rc = Recall::new(&store);
+
+        // A caller authorized on citrate-landing resolves the citrate-chain prefix:
+        // MEM-B-007 — must be 404, and must NOT return the foreign node.
+        let cross = resolve_in_tenant(&store, &rc, "citrate-landing", prefix);
+        match cross {
+            Err(e) => assert_eq!(e.status, StatusCode::NOT_FOUND, "cross-tenant hit must be 404 (existence must not leak)"),
+            Ok((_, n)) => panic!("MEM-B-007: cross-tenant resolve leaked node from repo {:?}", n.repo),
+        }
+
+        // The owning tenant still resolves it (no false negative).
+        let same = match resolve_in_tenant(&store, &rc, "citrate-chain", prefix) {
+            Ok(v) => v,
+            Err(e) => panic!("owning tenant must resolve, got status {}", e.status),
+        };
+        assert_eq!(same.0, id);
+        assert_eq!(same.1.repo, "citrate-chain");
+    }
 }
