@@ -238,16 +238,44 @@ mod verify {
         }
     }
 
+    /// The scope/tenant attenuation a BYOM connect token declares. `verify` used
+    /// to read ONLY `sub` and silently drop these, so the gateway minted the
+    /// principal's FULL membership grant regardless of what the token claimed
+    /// (MEM-B-008). They are now surfaced and INTERSECTED with the membership at
+    /// use time (`http::attenuate_grant`).
+    #[derive(Debug, Clone)]
+    pub struct ConnectClaims {
+        pub sub: String,
+        /// Comma-separated scope minted into the token (e.g. `"read,propose"`).
+        /// When present it attenuates the grant; absent → read-only (least
+        /// privilege) so a legacy claimless token cannot silently grant write.
+        pub scope: Option<String>,
+        /// Tenants the token was scoped to; when present the grant is restricted to
+        /// these repos (never widened beyond the membership).
+        pub tenants: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ConnectTokenClaims {
+        sub: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        tenants: Option<Vec<String>>,
+    }
+
     /// Verify a BYOM connect token (HS256, `MEM_CONNECT_SECRET`). Returns the
-    /// token's `sub`, which the caller must match against the path `:sub`.
-    pub fn verify_connect_token(secret: &str, token: &str) -> Result<String, AuthError> {
+    /// token's `sub` AND its declared attenuation (`scope`/`tenants`) — the caller
+    /// matches `sub` against the path `:sub` and intersects the attenuation with
+    /// the principal's membership before using it (MEM-B-008).
+    pub fn verify_connect_token(secret: &str, token: &str) -> Result<ConnectClaims, AuthError> {
         let key = DecodingKey::from_secret(secret.as_bytes());
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
         // Connect tokens are gateway-minted; no iss/aud constraints here.
         validation.validate_aud = false;
-        decode::<Claims>(token, &key, &validation)
-            .map(|d| d.claims.sub)
+        decode::<ConnectTokenClaims>(token, &key, &validation)
+            .map(|d| ConnectClaims { sub: d.claims.sub, scope: d.claims.scope, tenants: d.claims.tenants })
             .map_err(|e| AuthError::Token(e.to_string()))
     }
 
@@ -255,22 +283,32 @@ mod verify {
     struct MintClaims {
         sub: String,
         exp: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tenants: Vec<String>,
     }
 
-    /// Mint an HS256 connect token for `sub`, expiring `ttl_secs` after
-    /// `now_secs`. Symmetric with [`verify_connect_token`] — signed with the same
-    /// `MEM_CONNECT_SECRET`, so a token minted here verifies there. This is what
-    /// lets a client trade a verified OIDC id_token for a long-lived agent token,
-    /// so a user never handles a raw secret.
+    /// Mint an HS256 connect token for `sub`, carrying its declared `scope`/
+    /// `tenants` attenuation, expiring `ttl_secs` after `now_secs`. Symmetric with
+    /// [`verify_connect_token`] — signed with the same `MEM_CONNECT_SECRET`, so a
+    /// token minted here verifies there. This is what lets a client trade a
+    /// verified OIDC id_token for an agent token, so a user never handles a raw
+    /// secret. The attenuation is honored at use time (MEM-B-008), so it is a real
+    /// bound on the token, not a decorative label.
     pub fn mint_connect_token(
         secret: &str,
         sub: &str,
+        scope: Option<&str>,
+        tenants: &[String],
         now_secs: usize,
         ttl_secs: usize,
     ) -> Result<String, AuthError> {
         let claims = MintClaims {
             sub: sub.to_string(),
             exp: now_secs.saturating_add(ttl_secs),
+            scope: scope.map(|s| s.to_string()),
+            tenants: tenants.to_vec(),
         };
         encode(
             &Header::new(Algorithm::HS256),
@@ -282,7 +320,7 @@ mod verify {
 }
 
 #[cfg(feature = "server")]
-pub use verify::{AuthError, OidcVerifier};
+pub use verify::{AuthError, ConnectClaims, OidcVerifier};
 #[cfg(feature = "server")]
 pub use verify::{mint_connect_token, verify_connect_token};
 
@@ -311,11 +349,24 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[test]
-    fn minted_connect_token_verifies_and_carries_sub() {
+    fn minted_connect_token_verifies_and_carries_sub_and_scope() {
         let secret = "connect-secret-xyz";
         // exp in the real future (jsonwebtoken validates exp against system time)
-        let token = mint_connect_token(secret, "user-42", now_secs(), 3600).unwrap();
-        assert_eq!(verify_connect_token(secret, &token).unwrap(), "user-42");
+        let token = mint_connect_token(
+            secret,
+            "user-42",
+            Some("read,propose"),
+            &["citrate-landing".to_string()],
+            now_secs(),
+            3600,
+        )
+        .unwrap();
+        let claims = verify_connect_token(secret, &token).unwrap();
+        assert_eq!(claims.sub, "user-42");
+        // MEM-B-008: the scope/tenants attenuation survives the round-trip (it used
+        // to be silently dropped at verify).
+        assert_eq!(claims.scope.as_deref(), Some("read,propose"));
+        assert_eq!(claims.tenants.as_deref(), Some(&["citrate-landing".to_string()][..]));
         // a different secret rejects it
         assert!(verify_connect_token("wrong-secret", &token).is_err());
     }
@@ -325,7 +376,7 @@ mod tests {
     fn expired_connect_token_is_rejected() {
         let secret = "s";
         // minted well in the past (beyond jsonwebtoken's default 60s leeway)
-        let token = mint_connect_token(secret, "u", now_secs() - 1000, 1).unwrap();
+        let token = mint_connect_token(secret, "u", None, &[], now_secs() - 1000, 1).unwrap();
         assert!(verify_connect_token(secret, &token).is_err());
     }
 

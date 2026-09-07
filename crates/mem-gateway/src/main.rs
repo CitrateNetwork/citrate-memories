@@ -19,7 +19,21 @@ use mem_store::MemoryDagStore;
 const DEFAULT_ORG: &str = "citrate-federation";
 const DEFAULT_STORE: &str = "./data/federation.bge.enc.memdag";
 const DEFAULT_BIND: &str = "127.0.0.1:8799";
-const DEFAULT_SEED: &str = "mem-gateway-dev-seed-CHANGE-ME";
+
+/// MEM-B-006: the asserter seed derives the gateway's ed25519 key, which signs
+/// every capability grant AND every per-principal assertion sub-key. A constant
+/// default is therefore a *published signing key* — anyone reading the (OSS)
+/// source could forge signed Asserted-plane nodes attributed to any principal. So
+/// the gateway REFUSES to start when `MEM_GATEWAY_ASSERTER_SEED` is unset, exactly
+/// as it already does for a rejected audit chain or a missing JWKS — never fail
+/// open. There is deliberately no in-tree default value.
+fn resolve_asserter_seed(env_val: Option<String>) -> Result<String, &'static str> {
+    env_val.ok_or(
+        "MEM_GATEWAY_ASSERTER_SEED unset — refusing to start. It derives the key that signs \
+         every grant and per-principal assertion; a default would be a published signing key. \
+         Set it in the operator EnvironmentFile (/etc/mem-gateway/mem-gateway.env).",
+    )
+}
 
 struct Args {
     org: String,
@@ -183,10 +197,8 @@ async fn main() {
 
     let allow_dev_auth = env_opt("MEM_GATEWAY_ALLOW_DEV_AUTH").as_deref() == Some("1");
     let connect_secret = env_opt("MEM_CONNECT_SECRET").map(Arc::new);
-    let seed = env_opt("MEM_GATEWAY_ASSERTER_SEED").unwrap_or_else(|| {
-        eprintln!("mem-gateway: WARNING MEM_GATEWAY_ASSERTER_SEED unset — using insecure dev seed");
-        DEFAULT_SEED.to_string()
-    });
+    // MEM-B-006: fail closed when the seed is unset — no insecure default.
+    let seed = resolve_asserter_seed(env_opt("MEM_GATEWAY_ASSERTER_SEED")).unwrap_or_else(|m| fail(m));
 
     // --- startup summary + safety checks ---
     eprintln!("mem-gateway: org={} store={} ({node_count} nodes / {edge_count} edges, encrypted_at_rest={encrypted})", args.org, args.store);
@@ -224,5 +236,39 @@ async fn main() {
 
     if let Err(e) = run(state, &args.bind).await {
         fail(&format!("server error: {e}"));
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::resolve_asserter_seed;
+
+    /// MEM-B-006 tripwire: with the seed unset the gateway must refuse to start
+    /// (Err), never silently fall back to a constant key.
+    #[test]
+    fn unset_seed_refuses_to_start() {
+        assert!(resolve_asserter_seed(None).is_err(), "unset seed must refuse to start (MEM-B-006)");
+    }
+
+    /// A set seed is used verbatim (operator-provided key material).
+    #[test]
+    fn set_seed_is_used_verbatim() {
+        assert_eq!(
+            resolve_asserter_seed(Some("operator-chosen-seed".into())).unwrap(),
+            "operator-chosen-seed"
+        );
+    }
+
+    /// MEM-B-006 tripwire: the old published dev seed must not exist anywhere in
+    /// this binary's source. The needle is assembled from fragments so this test's
+    /// own text does not contain the literal it forbids.
+    #[test]
+    fn no_default_seed_constant_in_binary() {
+        let needle: String = ["dev", "seed", "CHANGE", "ME"].join("-");
+        let src = include_str!("main.rs");
+        assert!(
+            !src.contains(&needle),
+            "a hard-coded default asserter seed must not ship in the binary (MEM-B-006)"
+        );
     }
 }
