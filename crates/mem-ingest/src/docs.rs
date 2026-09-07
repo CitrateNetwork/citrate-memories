@@ -124,6 +124,36 @@ pub fn list_md_files(repo: &Path) -> Result<Vec<String>, IngestError> {
     Ok(text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
 }
 
+/// Map each tracked markdown file to its git **blob sha** (from the index), via
+/// `git ls-files -s`. MEM-B-014: a doc node's identity must be a pure function of
+/// git — the blob sha is the same on every machine and immune to worktree
+/// nondeterminism (autocrlf / `.gitattributes` smudge filters / LFS / a dirty
+/// tree), unlike the materialized-file byte length it replaces.
+pub fn list_md_blobs(repo: &Path) -> Result<BTreeMap<String, String>, IngestError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-s", "--", "*.md"])
+        .output()
+        .map_err(|e| IngestError::Git(format!("failed to run git ls-files -s: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(IngestError::Git(format!("git ls-files -s failed: {}", stderr.trim())));
+    }
+    // Each line: `<mode> <sha> <stage>\t<path>` (e.g. `100644 <sha> 0\tdocs/x.md`).
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let Some((meta, path)) = line.split_once('\t') else { continue };
+        let mut cols = meta.split_whitespace();
+        let (_mode, sha) = (cols.next(), cols.next());
+        if let Some(sha) = sha {
+            out.insert(path.trim().to_string(), sha.to_string());
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
