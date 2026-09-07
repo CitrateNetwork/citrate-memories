@@ -29,8 +29,9 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
-use mem_authz::CapabilityGrant;
+use mem_authz::{CapabilityGrant, Op};
 use mem_core::MemoryNode;
 use mem_store::MemoryDagStore;
 
@@ -114,6 +115,10 @@ pub fn serve_one(
     handle_conn(stream, store, grant, trust_root, now_ms)
 }
 
+/// MEM-B-016: a stalled peer must not pin the single-threaded listener forever.
+/// Bounds the time spent blocked on any one read/write of a connection.
+const CONN_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn handle_conn(
     mut stream: TcpStream,
     store: &MemoryDagStore<MemoryNode>,
@@ -121,6 +126,13 @@ fn handle_conn(
     trust_root: &[u8],
     now_ms: u64,
 ) -> Result<Option<String>, SyncError> {
+    // MEM-B-016: without timeouts, one `curl` that opens a connection and stalls
+    // (or lies about Content-Length and never sends the body) blocks `serve_one`
+    // in `read_exact` indefinitely — a trivial unauthenticated DoS on a listener
+    // that serves one connection at a time. The timeouts apply to the underlying
+    // socket, so the cloned `reader` below is bounded too.
+    stream.set_read_timeout(Some(CONN_TIMEOUT)).map_err(io_err)?;
+    stream.set_write_timeout(Some(CONN_TIMEOUT)).map_err(io_err)?;
     let mut reader = BufReader::new(stream.try_clone().map_err(io_err)?);
 
     // Request line.
@@ -151,6 +163,13 @@ fn handle_conn(
     match (method.as_str(), path.as_str()) {
         ("GET", p) if p.starts_with("/bundle/") => {
             let repo = p.trim_start_matches("/bundle/");
+            // MEM-B-016: `/bundle/<repo>` exports a whole tenant; require the peer's
+            // grant to authorize a READ of it, so this route cannot exfiltrate a
+            // tenant with no authorization (the merge path already gates writes).
+            if grant.check(&crate::resource_for(repo), Op::Read, now_ms).is_err() {
+                write_json(&mut stream, 403, "Forbidden", "{\"error\":\"not authorized to read tenant\"}")?;
+                return Ok(Some(format!("GET /bundle/{repo} (403)")));
+            }
             let bundle = export_tenant(store, repo, now_ms)?;
             write_json(&mut stream, 200, "OK", &bundle.to_json()?)?;
             Ok(Some(format!("GET /bundle/{repo}")))
@@ -160,8 +179,16 @@ fn handle_conn(
                 write_json(&mut stream, 413, "Payload Too Large", "{\"error\":\"bundle too large\"}")?;
                 return Ok(Some("POST /merge (rejected: too large)".into()));
             }
-            let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body).map_err(io_err)?;
+            // MEM-B-016: do NOT pre-allocate `content_length` bytes — a lying
+            // header would let a peer reserve 64 MiB per connection. Stream up to
+            // the (already length-checked) bound instead, so memory grows only with
+            // bytes actually received and a stall trips the read timeout above.
+            let mut body = Vec::new();
+            reader
+                .by_ref()
+                .take(content_length as u64)
+                .read_to_end(&mut body)
+                .map_err(io_err)?;
             let text = String::from_utf8(body).map_err(|e| SyncError::Chain(format!("merge body utf8: {e}")))?;
             match SyncBundle::from_json(&text).and_then(|b| merge_bundle(store, &b, grant, trust_root, now_ms)) {
                 Ok(outcome) => {
@@ -284,8 +311,8 @@ mod transport_tests {
         let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
         peer.commit(&[derived_node("citrate-chain", "tip-selection")], &[]).unwrap();
 
-        // GET /bundle is a read/export — the grant is unused on this route, but
-        // serve_one still requires one (no unauthenticated merge path can exist).
+        // GET /bundle is a read/export — MEM-B-016 now requires the grant to
+        // authorize a READ of the tenant (a read-only grant suffices).
         let grant = crate::tests::grant_for(&["citrate-chain"], false);
         let root = crate::tests::trust_root();
         let client = std::thread::spawn(move || pull_bundle(&base, "citrate-chain"));
@@ -295,5 +322,58 @@ mod transport_tests {
         assert_eq!(route, "GET /bundle/citrate-chain");
         assert_eq!(bundle.nodes.len(), 1);
         assert_eq!(bundle.repo, "citrate-chain");
+    }
+
+    /// MEM-B-016: a lying `Content-Length` that promises 64 MiB but sends nothing
+    /// must NOT pre-allocate or hang `serve_one` — the body is streamed with a
+    /// bounded `take`, so an early EOF returns promptly (a rejected merge) instead
+    /// of blocking forever waiting on 64 MiB that never arrives.
+    #[test]
+    fn lying_content_length_does_not_hang_or_preallocate() {
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let grant = crate::tests::grant_for(&["citrate-chain"], true);
+        let root = crate::tests::trust_root();
+
+        // Client: claim a huge body, send no bytes, then close the connection.
+        std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"POST /merge HTTP/1.1\r\nContent-Length: 67108864\r\n\r\n").unwrap();
+            // Drop `s` → EOF, without ever sending the promised 64 MiB.
+        });
+
+        let start = Instant::now();
+        let route = serve_one(&listener, &peer, &grant, &root, 1).expect("serve returns");
+        assert!(
+            start.elapsed() < CONN_TIMEOUT,
+            "serve_one must return promptly on early EOF, not block on the lying length"
+        );
+        assert_eq!(route.as_deref(), Some("POST /merge (rejected)"));
+        assert_eq!(peer.node_count().unwrap(), 0, "no bundle merged");
+    }
+
+    /// MEM-B-016: `GET /bundle/<repo>` must refuse a peer whose grant cannot READ
+    /// that tenant, rather than exporting the whole tenant with no authorization.
+    #[test]
+    fn bundle_export_requires_read_authorization() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        peer.commit(&[derived_node("secret-tenant", "x")], &[]).unwrap();
+
+        // Grant covers a DIFFERENT tenant — no read on `secret-tenant`.
+        let grant = crate::tests::grant_for(&["other-tenant"], false);
+        let root = crate::tests::trust_root();
+        let client = std::thread::spawn(move || pull_bundle(&base, "secret-tenant"));
+        let route = serve_one(&listener, &peer, &grant, &root, 1).expect("serve").unwrap();
+        let pulled = client.join().unwrap();
+
+        assert_eq!(route, "GET /bundle/secret-tenant (403)");
+        assert!(pulled.is_err(), "unauthorized pull must not return a bundle");
     }
 }

@@ -86,7 +86,7 @@ pub enum SyncError {
 /// Map a tenant `repo` to the capability-grant resource id. MUST match the MCP
 /// path's mapping (`mem-mcp` `authorize`: `format!("repo:{repo}/memory")`) so
 /// the two write paths authorize against the SAME resource namespace.
-fn resource_for(repo: &str) -> String {
+pub(crate) fn resource_for(repo: &str) -> String {
     format!("repo:{repo}/memory")
 }
 
@@ -498,7 +498,14 @@ pub fn trusted_local_grant() -> CapabilityGrant {
     // covers every resource for Read+Write. It exists solely so the trusted
     // ingest path flows through the SAME authz gate as the untrusted one (no
     // second, unguarded code path can exist).
-    let sk = SigningKey::from_bytes(&[0xA1u8; 32]);
+    //
+    // MEM-B-018: the key is seeded from the OS CSPRNG per call, not a published
+    // constant (`[0xA1u8; 32]`). The grant is its own trust root, so an ephemeral
+    // key is functionally identical while removing a hardcoded, known signing key
+    // from the tree. Mirrors `mem-mcp`'s ephemeral-identity fallback.
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).expect("OS randomness for trusted-local grant key");
+    let sk = SigningKey::from_bytes(&seed);
     let mut g = CapabilityGrant {
         id: "mem-sync:trusted-local-ingest".into(),
         issuer: "mem-sync".into(),

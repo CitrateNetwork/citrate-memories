@@ -17,6 +17,9 @@ mem-assert = { path = "../mem-assert" }
 mem-authz = { path = "../mem-authz" }
 # Used by `trusted_local_grant` to self-sign the explicit in-process `*`-grant.
 ed25519-dalek = "2"
+# MEM-B-018: seed the process-local trusted-ingest key from the OS CSPRNG rather
+# than a hardcoded constant (a published signing key).
+getrandom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
