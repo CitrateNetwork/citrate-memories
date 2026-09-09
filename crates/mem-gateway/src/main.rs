@@ -252,6 +252,12 @@ async fn main() {
         control: Arc::new(RwLock::new(control)),
         org_id: Arc::new(args.org.clone()),
         store_path: Arc::new(args.store.clone()),
+        // WP-5.3: bind external audit checkpoints to the live 40204 head. Defaults
+        // to the public RPC; set MEM_GATEWAY_CHAIN_RPC to override, or "" to disable.
+        chain_rpc: match env_opt("MEM_GATEWAY_CHAIN_RPC") {
+            Some(u) => Some(Arc::new(u)),
+            None => Some(Arc::new("https://rpc.citrate.ai".to_string())),
+        },
         issuer: Arc::new(issuer.unwrap_or_else(|| "mem-gateway".to_string())),
         oidc,
         connect_secret,

@@ -29,7 +29,7 @@ use axum::{
     Json, Router,
 };
 use std::collections::VecDeque;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -67,6 +67,10 @@ pub struct AppState {
     pub control: Arc<RwLock<Control>>,
     pub org_id: Arc<String>,
     pub store_path: Arc<String>,
+    /// citrate-chain (40204) JSON-RPC URL for binding external audit checkpoints to
+    /// the live chain head (WP-5.3, read-only). `None` disables chain binding — the
+    /// checkpoint routes then return 503 rather than a chain-less checkpoint.
+    pub chain_rpc: Option<Arc<String>>,
     /// Label placed in minted grants' `issuer` field (informational).
     pub issuer: Arc<String>,
     pub oidc: Option<Arc<OidcVerifier>>,
@@ -90,6 +94,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/orgs/:org/verify", get(verify))
         .route("/api/orgs/:org/review", get(review))
         .route("/api/orgs/:org/assert", post(assert))
+        .route("/api/orgs/:org/health", get(org_health))
+        .route(
+            "/api/orgs/:org/checkpoint",
+            post(submit_checkpoint).get(read_checkpoint),
+        )
         .route("/ops", get(ops))
         .route("/mcp/u/:sub", post(byom))
         .route("/webhook/github", post(github_webhook))
@@ -741,6 +750,149 @@ async fn assert(
     })))
 }
 
+/// citrate-chain id the external checkpoints bind against.
+const CHAIN_ID_40204: u64 = 40204;
+
+/// `GET /api/orgs/:org/health` — authenticated per-org liveness (200 for a member
+/// of the org). Distinct from the unauthenticated `/api/health` global liveness.
+async fn org_health(
+    State(app): State<AppState>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    gate(&app, &headers, &org, "*", Op::Read, "health")?;
+    Ok(Json(json!({ "ok": true, "org": org })))
+}
+
+#[derive(Deserialize)]
+struct CheckpointBody {
+    /// Tenant/repo the checkpoint is recorded under (authz scope).
+    repo: String,
+    /// The EXTERNAL audit-chain root to checkpoint (a hash / merkle head).
+    root: String,
+}
+
+#[derive(Deserialize)]
+struct CheckpointQuery {
+    repo: String,
+}
+
+/// Wrap a checkpoint record with a gateway ed25519 signature. ed25519 is
+/// deterministic (RFC 8032), so re-signing the same record on read reproduces the
+/// same signature — the signature need not be persisted separately.
+fn sign_checkpoint(
+    key: &SigningKey,
+    record: &mem_sync::chain::ChainAnchorRecord,
+) -> Result<Value, ApiError> {
+    let bytes = serde_json::to_vec(record).map_err(ise)?;
+    let sig = key.sign(&bytes);
+    Ok(json!({
+        "record": record,
+        "signature": hex::encode(sig.to_bytes()),
+        "gateway_pubkey": hex::encode(key.verifying_key().to_bytes()),
+        "alg": "ed25519",
+        "signed_over": "json(record)",
+    }))
+}
+
+fn map_sync_err(e: mem_sync::SyncError) -> ApiError {
+    match e {
+        // RPC unreachable / malformed / wrong-chain — an upstream failure.
+        mem_sync::SyncError::Chain(m) => {
+            ApiError::new(StatusCode::BAD_GATEWAY, format!("chain checkpoint failed: {m}"))
+        }
+        other => ise(other),
+    }
+}
+
+/// `POST /api/orgs/:org/checkpoint` — submit an EXTERNAL audit root and receive a
+/// hash-chained, gateway-signed checkpoint bound to the live 40204 head (WP-5.3
+/// read-only half). Body: `{ "repo": "<tenant>", "root": "<audit-chain head>" }`.
+/// Fail-closed: an unreachable chain RPC records nothing and returns 502.
+async fn submit_checkpoint(
+    State(app): State<AppState>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CheckpointBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.repo.is_empty() {
+        return Err(bad("repo required"));
+    }
+    let root = body.root.trim().to_string();
+    if root.is_empty() {
+        return Err(bad("root required"));
+    }
+    if root.len() > 256 {
+        return Err(bad("root too long (max 256 chars; submit a hash, not a document)"));
+    }
+    let _sub = gate(
+        &app,
+        &headers,
+        &org,
+        &repo_resource(&body.repo),
+        Op::Write,
+        "checkpoint",
+    )?;
+    let rpc = app
+        .chain_rpc
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "chain RPC not configured — external checkpoint binding is disabled",
+            )
+        })?
+        .clone();
+    let store = app.store.clone();
+    let write_gate = app.write_gate.clone();
+    let repo = body.repo.clone();
+    let now = now_ms();
+    // ureq is blocking; run off the async runtime. Hold the single-writer gate for
+    // the fetch+write so the checkpoint is recorded atomically (fail-closed).
+    let record = tokio::task::spawn_blocking(move || {
+        let _gate = lock(&write_gate);
+        mem_sync::chain::checkpoint_external_root(&store, &repo, &root, &rpc, CHAIN_ID_40204, now)
+    })
+    .await
+    .map_err(ise)?
+    .map_err(map_sync_err)?;
+    Ok(Json(sign_checkpoint(&app.signing_key, &record)?))
+}
+
+/// `GET /api/orgs/:org/checkpoint?repo=<tenant>` — read back the latest signed
+/// external-root checkpoint for a tenant. 204 when the tenant has never
+/// checkpointed (never a fabricated record).
+async fn read_checkpoint(
+    State(app): State<AppState>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<CheckpointQuery>,
+) -> Result<Response, ApiError> {
+    if q.repo.is_empty() {
+        return Err(bad("repo query param required"));
+    }
+    let _sub = gate(
+        &app,
+        &headers,
+        &org,
+        &repo_resource(&q.repo),
+        Op::Read,
+        "checkpoint_read",
+    )?;
+    let store = app.store.clone();
+    let repo = q.repo.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        mem_sync::chain::latest_external_checkpoint(&store, &repo)
+    })
+    .await
+    .map_err(ise)?
+    .map_err(map_sync_err)?;
+    match record {
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        Some(rec) => Ok(Json(sign_checkpoint(&app.signing_key, &rec)?).into_response()),
+    }
+}
+
 async fn ops(State(app): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     let org = app.org_id.as_str().to_string();
     gate(&app, &headers, &org, "*", Op::Read, "ops")?;
@@ -760,10 +912,13 @@ async fn ops(State(app): State<AppState>, headers: HeaderMap) -> Result<Json<Val
     );
     obj.insert("oidc".into(), json!(app.oidc.is_some()));
     obj.insert("dev_auth".into(), json!(app.allow_dev_auth));
-    #[cfg(feature = "chain")]
     obj.insert(
         "chain".into(),
-        json!({ "enabled": true, "note": "on-chain anchor lookup not wired in this build" }),
+        json!({
+            "checkpoint_binding": app.chain_rpc.is_some(),
+            "chain_id": CHAIN_ID_40204,
+            "note": "external-root checkpoints bind to the live 40204 head (read-only); the on-chain WRITE (root → AnchorRegistry) is the deferred WP-5.3 follow-up (needs a funded signer + Rule-8).",
+        }),
     );
     Ok(Json(Value::Object(obj)))
 }

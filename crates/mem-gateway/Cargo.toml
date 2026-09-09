@@ -16,6 +16,10 @@ mem-query = { path = "../mem-query" }
 mem-authz = { path = "../mem-authz" }
 mem-assert = { path = "../mem-assert" }
 mem-mcp = { path = "../mem-mcp" }
+# WP-5.3: external-root audit checkpoints bound to the live 40204 head (read-only
+# JSON-RPC; no signing/money — the gateway signs the record, the on-chain WRITE is
+# the deferred follow-up).
+mem-sync = { path = "../mem-sync", features = ["chain"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

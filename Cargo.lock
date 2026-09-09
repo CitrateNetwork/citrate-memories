@@ -1739,6 +1739,7 @@ dependencies = [
  "mem-mcp",
  "mem-query",
  "mem-store",
+ "mem-sync",
  "serde",
  "serde_json",
  "sha2",

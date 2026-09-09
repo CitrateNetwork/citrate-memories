@@ -150,6 +150,81 @@ pub fn latest_chain_anchor(
     }
 }
 
+fn external_checkpoint_key(repo: &str) -> Vec<u8> {
+    format!("ext_checkpoint:{repo}").into_bytes()
+}
+
+/// Max length of a submitted external root (a hash / merkle head, not a document).
+const MAX_EXTERNAL_ROOT_LEN: usize = 256;
+
+/// Checkpoint an **external** audit root — e.g. a tenant's own hash-chained audit
+/// log head — as opposed to the mem graph root that [`anchor_tenant_to_chain`]
+/// pins. This is the independent-verification primitive an outside service
+/// (citrate-homestead) uses: it submits its audit-chain root `R`, and the gateway
+/// records a hash-chained checkpoint of `R` bound to the live citrate-chain head,
+/// so anyone can later prove "root R was witnessed at chain block N".
+///
+/// The record is stored under `ext_checkpoint:<repo>` (a keyspace DISTINCT from the
+/// graph anchors, so external checkpoints never collide with `anchor_tenant`), and
+/// `prev` hash-chains onto the previous external checkpoint for `repo`. Fail-closed:
+/// the chain checkpoint is fetched + verified FIRST, so an unreachable RPC writes
+/// nothing (no half-recorded checkpoint, no chain advance).
+///
+/// `node_count`/`edge_count` are 0 — this checkpoint is over an external root, not
+/// a graph. The returned record is NOT signed here; the caller (mem-gateway) signs
+/// it with the gateway key for independent verification.
+pub fn checkpoint_external_root(
+    store: &MemoryDagStore<MemoryNode>,
+    repo: &str,
+    external_root: &str,
+    rpc_url: &str,
+    expected_chain_id: u64,
+    now_ms: u64,
+) -> Result<ChainAnchorRecord, SyncError> {
+    let root = external_root.trim();
+    if root.is_empty() {
+        return Err(SyncError::Chain("external root required".into()));
+    }
+    if root.len() > MAX_EXTERNAL_ROOT_LEN {
+        return Err(SyncError::Chain(format!(
+            "external root too long ({} > {MAX_EXTERNAL_ROOT_LEN})",
+            root.len()
+        )));
+    }
+    // Fetch + verify the chain checkpoint FIRST (fail closed on RPC failure or a
+    // wrong-chain RPC), so nothing is written unless we can bind to the head.
+    let checkpoint = fetch_chain_checkpoint(rpc_url, expected_chain_id, now_ms)?;
+    let prev = store
+        .get_meta(&external_checkpoint_key(repo))?
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string());
+    let anchor = AnchorRecord {
+        repo: repo.to_string(),
+        root: root.to_string(),
+        node_count: 0,
+        edge_count: 0,
+        anchored_at_ms: now_ms,
+        prev,
+    };
+    let record = ChainAnchorRecord { anchor, checkpoint };
+    let bytes = serde_json::to_vec(&record).map_err(|e| SyncError::Serde(e.to_string()))?;
+    store.put_meta(repo, &external_checkpoint_key(repo), &bytes)?;
+    Ok(record)
+}
+
+/// Read the latest external-root checkpoint for a tenant (or `None` if never
+/// checkpointed).
+pub fn latest_external_checkpoint(
+    store: &MemoryDagStore<MemoryNode>,
+    repo: &str,
+) -> Result<Option<ChainAnchorRecord>, SyncError> {
+    match store.get_meta(&external_checkpoint_key(repo))? {
+        None => Ok(None),
+        Some(bytes) => {
+            Ok(Some(serde_json::from_slice(&bytes).map_err(|e| SyncError::Serde(e.to_string()))?))
+        }
+    }
+}
+
 #[cfg(test)]
 mod chain_tests {
     use super::*;
@@ -173,5 +248,24 @@ mod chain_tests {
         let j = serde_json::to_string(&cp).unwrap();
         let back: ChainCheckpoint = serde_json::from_str(&j).unwrap();
         assert_eq!(cp, back);
+    }
+
+    // The external-root checkpoint keyspace (`ext_checkpoint:<repo>`) must NOT
+    // collide with the graph anchor keyspace (`anchor:<repo>`): a graph anchor is
+    // never read back as an external audit checkpoint, and vice-versa. (The full
+    // submit path needs a live 40204 RPC and is covered by the mem-gateway e2e.)
+    #[test]
+    fn external_checkpoint_keyspace_is_separate_from_graph_anchor() {
+        use crate::{anchor_tenant, latest_anchor};
+        let store = MemoryDagStore::new(Box::new(mem_store::kv::InMemoryKv::new()));
+        // Fresh store: no external checkpoint for any tenant.
+        assert!(latest_external_checkpoint(&store, "t").unwrap().is_none());
+        // Writing a GRAPH anchor must not surface as an external checkpoint.
+        anchor_tenant(&store, "t", 1).unwrap();
+        assert!(latest_anchor(&store, "t").unwrap().is_some());
+        assert!(
+            latest_external_checkpoint(&store, "t").unwrap().is_none(),
+            "graph anchor leaked into the external-checkpoint keyspace"
+        );
     }
 }
