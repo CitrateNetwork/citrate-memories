@@ -780,6 +780,13 @@ struct CheckpointQuery {
 /// Wrap a checkpoint record with a gateway ed25519 signature. ed25519 is
 /// deterministic (RFC 8032), so re-signing the same record on read reproduces the
 /// same signature — the signature need not be persisted separately.
+///
+/// The response is SELF-VERIFYING: `signed_payload_hex` is the exact byte string
+/// the signature covers, so an offline verifier does
+/// `ed25519_verify(hex(signature), hex(signed_payload_hex), hex(gateway_pubkey))`
+/// with NO JSON re-serialization (avoiding cross-language canonicalization drift).
+/// `signed_payload_hex` decodes to the UTF-8 compact JSON of `record`, so a caller
+/// can independently confirm it matches the `record` object it was handed.
 fn sign_checkpoint(
     key: &SigningKey,
     record: &mem_sync::chain::ChainAnchorRecord,
@@ -791,7 +798,8 @@ fn sign_checkpoint(
         "signature": hex::encode(sig.to_bytes()),
         "gateway_pubkey": hex::encode(key.verifying_key().to_bytes()),
         "alg": "ed25519",
-        "signed_over": "json(record)",
+        "signed_over": "compact-json(record) — the exact bytes are signed_payload_hex",
+        "signed_payload_hex": hex::encode(&bytes),
     }))
 }
 
