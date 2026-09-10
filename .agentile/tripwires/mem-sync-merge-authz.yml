@@ -1,0 +1,66 @@
+# FWA-C10-01/02 tripwire (Class-A "trust-what-is-signed").
+#
+# The federation merge path (`mem_sync::merge_bundle`) MUST authorize a Write to
+# every repo a bundle touches before any node/edge reaches the store, mirroring
+# the MCP `merge_diff` authz loop. These rules fail CI if that invariant is
+# weakened:
+#
+#   1. merge-bundle-must-take-grant   — `merge_bundle` must accept a CapabilityGrant.
+#   2. merge-bundle-must-authorize    — `merge_bundle` must call `authorize_bundle(`.
+#   3. no-unguarded-store-put-in-sync — no `store.put_node` / `add_edge` /
+#        `apply_supersession` in mem-sync OUTSIDE merge_bundle's body without the
+#        gate. (Heuristic backstop; the in-tree `tripwire_*` test is authoritative.)
+#
+# Run:  semgrep --config .agentile/tripwires/mem-sync-merge-authz.yml crates/mem-sync
+rules:
+  - id: merge-bundle-must-take-grant
+    languages: [rust]
+    severity: ERROR
+    message: >
+      mem_sync::merge_bundle must accept a `&CapabilityGrant` — there is no
+      unauthenticated federation merge path (FWA-C10-01/02/03). If you are adding
+      a new merge entry point, route it through merge_bundle or merge_bundle_trusted.
+    patterns:
+      - pattern: "pub fn merge_bundle($STORE: $T1, $BUNDLE: $T2) -> $R { ... }"
+      - pattern-not: "pub fn merge_bundle($STORE: $T1, $BUNDLE: $T2, $GRANT: &CapabilityGrant, $NOW: u64) -> $R { ... }"
+    paths:
+      include: ["crates/mem-sync/src/lib.rs"]
+
+  - id: merge-bundle-must-authorize
+    languages: [rust]
+    severity: ERROR
+    message: >
+      mem_sync::merge_bundle must call authorize_bundle(...) before any store
+      write (FWA-C10-01/02). Removing the gate re-opens cross-tenant Derived-plane
+      poisoning and unsigned supersession injection.
+    patterns:
+      - pattern: |
+          pub fn merge_bundle(...) -> $R {
+            ...
+          }
+      - pattern-not: |
+          pub fn merge_bundle(...) -> $R {
+            ...
+            authorize_bundle(...)?;
+            ...
+          }
+    paths:
+      include: ["crates/mem-sync/src/lib.rs"]
+
+  - id: no-unguarded-store-write-helper-in-sync
+    languages: [rust]
+    severity: ERROR
+    message: >
+      A direct store write (put_node/add_edge/apply_supersession) appears in
+      mem-sync. Confirm it is inside the authorized merge_bundle body (post
+      authorize_bundle), not a new unguarded write path. The in-tree
+      `tripwire_merge_bundle_is_authorized_and_is_the_sole_write_entry` test is
+      the authoritative check.
+    patterns:
+      - pattern-either:
+          - pattern: $STORE.put_node(...)
+          - pattern: $STORE.add_edge(...)
+          - pattern: $STORE.apply_supersession(...)
+    paths:
+      include: ["crates/mem-sync/src/**/*.rs"]
+      exclude: ["crates/mem-sync/src/tests.rs"]
