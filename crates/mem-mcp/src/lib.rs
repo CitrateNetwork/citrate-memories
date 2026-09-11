@@ -957,6 +957,51 @@ fn node_kind_from_str(s: &str) -> NodeKind {
     }
 }
 
+/// Cross-platform local-socket endpoint naming (Windows IPC port).
+///
+/// The daemon and every client must derive the same [`Name`] from the same
+/// positional `<sock-path>` argument, or the two ends bind/connect different
+/// endpoints and IPC silently breaks. The rule is fixed and MUST match the
+/// citrate-core client byte-for-byte:
+///
+/// - **Unix**: the filesystem path `p` is used unchanged (`GenericFilePath`), so
+///   the endpoint is the exact same Unix domain socket file as the old
+///   `std::os::unix::net::UnixListener::bind(p)` — on-wire identical to before.
+/// - **Windows**: named pipes are not filesystem paths, so the endpoint is the
+///   *basename* of `p` (`GenericNamespaced`) with every character outside
+///   `[A-Za-z0-9._-]` replaced by `-`. e.g. `".../memory/memdag.sock"` →
+///   `"memdag.sock"`.
+pub mod endpoint {
+    use interprocess::local_socket::prelude::*;
+    use interprocess::local_socket::Name;
+    use std::io;
+
+    /// Derive the platform-appropriate local-socket [`Name`] for `p` (see the
+    /// [module docs](self) for the exact rule).
+    pub fn endpoint_name(p: &str) -> io::Result<Name<'static>> {
+        #[cfg(unix)]
+        {
+            use interprocess::local_socket::GenericFilePath;
+            p.to_string().to_fs_name::<GenericFilePath>()
+        }
+        #[cfg(windows)]
+        {
+            use interprocess::local_socket::GenericNamespaced;
+            let base = std::path::Path::new(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("citrate.sock");
+            let slug: String = base
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+                .collect();
+            slug.to_ns_name::<GenericNamespaced>()
+        }
+    }
+}
+
+pub use endpoint::endpoint_name;
+
 /// Drive an [`MemoryMcpServer`] over any line-oriented transport: one JSON-RPC
 /// message per line in, one per line out. Returns when the reader reaches EOF
 /// (the client closed its end). This is the unit a multi-session daemon runs

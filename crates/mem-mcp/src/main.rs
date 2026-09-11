@@ -84,8 +84,13 @@
 //! catalog, and a `backfill` re-ingest restores the deterministic Derived plane.
 
 use std::io::BufReader;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
+
+// Cross-platform local IPC: `ListenerOptions`/`incoming` (via `prelude`) replace
+// the old `std::os::unix::net::UnixListener`. On unix the bound endpoint is the
+// same filesystem socket path as before (see `mem_mcp::endpoint_name`).
+use interprocess::local_socket::prelude::*;
+use interprocess::local_socket::ListenerOptions;
 
 use ed25519_dalek::SigningKey;
 
@@ -93,7 +98,7 @@ use mem_assert::Asserter;
 use mem_authz::{CapabilityGrant, PolicyProfile, ResourceScope};
 use mem_core::MemoryNode;
 use mem_index::Embedder;
-use mem_mcp::{serve_connection, MemoryMcpServer};
+use mem_mcp::{endpoint_name, serve_connection, MemoryMcpServer};
 use mem_store::MemoryDagStore;
 
 /// Env var carrying the per-user store wrapping key (hex), set by citrate-core.
@@ -262,7 +267,11 @@ fn main() {
         }
     };
 
-    // Holding the DB lock proves any existing socket file is stale.
+    // Holding the DB lock proves any existing socket file is stale. This is a
+    // Unix-only concern: the socket is a filesystem object there, and bind fails
+    // on a leftover path. On Windows the endpoint is a namespaced pipe with no
+    // stale filesystem object to remove (the OS drops the name with the owner).
+    #[cfg(unix)]
     if std::path::Path::new(&sock).exists() {
         if let Err(e) = std::fs::remove_file(&sock) {
             eprintln!("mem-mcp: cannot remove stale socket {sock}: {e}");
@@ -301,7 +310,16 @@ fn main() {
         }
     };
 
-    let listener = match UnixListener::bind(&sock) {
+    // Same positional `<sock-path>` arg; `endpoint_name` maps it to the
+    // platform endpoint (unix: the same filesystem socket path as before).
+    let name = match endpoint_name(&sock) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("mem-mcp: invalid socket name {sock}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let listener = match ListenerOptions::new().name(name).create_sync() {
         Ok(l) => l,
         Err(e) => {
             eprintln!("mem-mcp: cannot bind {sock}: {e}");
@@ -333,7 +351,7 @@ fn main() {
             });
         }
         for conn in listener.incoming() {
-            let stream: UnixStream = match conn {
+            let stream = match conn {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("mem-mcp: accept failed: {e}");
@@ -355,14 +373,12 @@ fn main() {
                 if let Some(e) = embedder {
                     server = server.with_query_embedder(e);
                 }
-                let reader = match stream.try_clone() {
-                    Ok(r) => BufReader::new(r),
-                    Err(e) => {
-                        eprintln!("mem-mcp: cannot clone stream: {e}");
-                        return;
-                    }
-                };
-                if let Err(e) = serve_connection(reader, stream, &mut server) {
+                // `serve_connection` runs synchronously on this one thread
+                // (read a line, write its response, repeat), so a single
+                // connection borrowed twice suffices — no fd clone needed. The
+                // interprocess `Stream` implements `Read`+`Write` on `&Stream`.
+                let reader = BufReader::new(&stream);
+                if let Err(e) = serve_connection(reader, &stream, &mut server) {
                     eprintln!("mem-mcp: session ended with error: {e}");
                 }
             });
