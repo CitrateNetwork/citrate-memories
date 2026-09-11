@@ -1,5 +1,7 @@
 # citrate-memories
 
+*Part of the **[Citrate Network](https://citrate.ai)** — own the means of computation. · [Docs](https://docs.citrate.ai) · [Run a node](https://citrate.ai/download) · [Contribute → free membership](https://github.com/CitrateNetwork/.github/blob/main/CONTRIBUTING.md)*
+
 > A federated, MCP-accessible knowledge DAG — "git for agents" — that gives any agent or human the storyline and code-shape of a Citrate repo in seconds, and never lets them act on stale or contradicted information.
 
 ## What it is
