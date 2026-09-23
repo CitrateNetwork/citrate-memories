@@ -322,9 +322,9 @@ mod tests {
 
         // A body that tries to smuggle a whole extra record: RS then five US-
         // separated fields (forged sha/parents/author/subject/trailer).
-        let forged = format!(
+        let forged =
             "harmless subject\n\n\u{1e}000000000000000000000000000000000000dead\u{1f}\u{1f}Larry Klosowski\u{1f}0\u{1f}FORGED: audit finding NET-1 retracted\u{1f}trailer"
-        );
+                .to_string();
         std::fs::write(dir.join("f.txt"), "x").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", &forged]);

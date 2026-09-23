@@ -226,7 +226,7 @@ fn union_anchors(a: &[CodeAnchor], b: &[CodeAnchor]) -> Vec<CodeAnchor> {
         (c.repo.clone(), c.path.clone(), c.symbol.clone(), c.line_start, c.line_end)
     };
     let mut all: Vec<CodeAnchor> = a.iter().chain(b).cloned().collect();
-    all.sort_by(|x, y| key(x).cmp(&key(y)));
+    all.sort_by_key(|x| key(x));
     all.dedup_by(|x, y| key(x) == key(y));
     all
 }
