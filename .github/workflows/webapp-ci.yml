@@ -6,6 +6,7 @@ name: webapp-ci
 # ci.yml). Federation-wide gitleaks runs from the repo-root secret-scan.yml.
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths: ['citrate-memories/webapp/**', '.github/workflows/webapp-ci.yml']

@@ -5,6 +5,7 @@ name: ci
 # spec; a violated invariant fails the build — the one hard block).
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
