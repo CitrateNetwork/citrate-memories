@@ -2,7 +2,7 @@
   "name": "memrizz",
   "version": "0.1.0",
   "private": true,
-  "license": "Apache-2.0",
+  "license": "BUSL-1.1",
   "description": "Memrizz — the citrate-memories webapp: a 2.5D memory constellation with grounded RAG and human-in-the-loop stewardship.",
   "scripts": {
     "dev": "next dev",

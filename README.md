@@ -154,4 +154,4 @@ Gateway:
 
 ## License
 
-Source-available (BUSL-1.1) — free for personal/non-commercial; commercial = membership.
+Source-available under the Business Source License 1.1 (see [`LICENSE`](LICENSE)); converts to Apache-2.0 on the Change Date stated in the license. This is the commercial application-layer / core tier of Citrate's open-core model; the infrastructure tier is Apache-2.0. Licensor: Citrate Inc.
