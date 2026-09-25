@@ -13,6 +13,23 @@ import { gateway, GatewayError } from "@/lib/gateway/client";
  */
 const TTL_MINUTES = 15;
 
+/**
+ * PBA-L3c-032: the token is READ-ONLY by default (the connect UI only offers the
+ * read tools). The gateway treats `propose` as write-capable, so a write token is
+ * minted only when the caller explicitly asks for one (`{ "write": true }`); the
+ * gateway still intersects it with the caller's membership. The `org` claim binds
+ * the token to this org — the gateway refuses it anywhere else.
+ */
+async function wantsWrite(req: Request): Promise<boolean> {
+  if (!(req.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")) return false;
+  try {
+    const body = (await req.json()) as { write?: unknown };
+    return body?.write === true;
+  } catch {
+    return false;
+  }
+}
+
 export function POST(req: Request, { params }: { params: Promise<{ org: string }> }): Promise<Response> {
   return withCaller(req, async (c) => {
     const secret = process.env.MEM_CONNECT_SECRET;
@@ -27,7 +44,8 @@ export function POST(req: Request, { params }: { params: Promise<{ org: string }
     } catch {
       /* token still mints; scope is empty until the gateway is reachable */
     }
-    const token = await new SignJWT({ sub: c.sub, org, tenants, scope: "read,propose" })
+    const scope = (await wantsWrite(req)) ? "read,propose" : "read";
+    const token = await new SignJWT({ sub: c.sub, org, tenants, scope })
       .setProtectedHeader({ alg: "HS256" })
       .setIssuedAt()
       .setExpirationTime(`${TTL_MINUTES}m`)
@@ -40,6 +58,7 @@ export function POST(req: Request, { params }: { params: Promise<{ org: string }
       token,
       ttlMinutes: TTL_MINUTES,
       tenants,
+      scope,
     };
   });
 }

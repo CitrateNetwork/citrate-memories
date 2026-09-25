@@ -24,6 +24,7 @@ import {
 } from "@/lib/auth/cookies";
 import { resolveServerAuthMode } from "@/lib/auth/session";
 import { verifySession } from "@/lib/auth/session";
+import { checkSameOriginJson } from "@/lib/security/same-origin";
 
 /** Default cookie lifetime when the token carries no usable `exp` (1h). */
 const DEFAULT_MAX_AGE = 60 * 60;
@@ -53,6 +54,9 @@ function acceptableCredential(token: string): boolean {
 }
 
 export async function POST(req: Request): Promise<Response> {
+  // PBA-L3c-031: login-CSRF — only our own page may set the session cookie.
+  const guard = checkSameOriginJson(req);
+  if (!guard.ok) return Response.json({ error: guard.error }, { status: guard.status });
   let body: { id_token?: unknown; access_token?: unknown };
   try {
     body = (await req.json()) as typeof body;
