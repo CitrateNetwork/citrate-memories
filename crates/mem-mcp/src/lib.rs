@@ -761,7 +761,29 @@ impl<'a> MemoryMcpServer<'a> {
             Ok(guard) => guard,
             Err(deny) => return Ok(deny),
         };
-        match self.store.confirm_edge(&from_id, &to_id, kind) {
+        // PBA-L6b-002 pass 2: a Supersedes that retires ANOTHER principal's node
+        // needs a second party — its author, or a writer other than the proposer
+        // (no self-confirmed cross-author retirement).
+        if kind == EdgeKind::Supersedes {
+            let caller = self.asserter.as_ref().map(|a| a.pubkey_hex().to_string());
+            let proposer = self
+                .store
+                .out_edges(&from_id)
+                .map_err(store_err)?
+                .into_iter()
+                .find(|e| e.to == to_id && e.kind == kind)
+                .map(|e| e.provenance.asserter);
+            let allowed = match caller.as_deref() {
+                None => false,
+                Some(c) => c == to_node.author || proposer.as_deref() != Some(c),
+            };
+            if !allowed {
+                return Ok(tool_error(
+                    "a supersession of another principal's node must be confirmed by that node's author or by a writer other than its proposer".to_string(),
+                ));
+            }
+        }
+        match self.store.confirm_edge(&from_id, &to_id, kind, now_ms()) {
             Ok(mem_store::ConfirmOutcome::Confirmed) => Ok(tool_text(format!(
                 "confirmed {} -{kind_str}-> {} (now load-bearing)",
                 &from_id.to_hex()[..10],
@@ -2402,4 +2424,66 @@ mod tests {
         let c = text_of(&call_json(&mut both, "memory.critique", json!({"repo":"citrate-chain"})));
         assert!(c.contains("unconfirmed proposal"), "{c}");
     }
+
+    /// PBA-L6b-002 pass 2 over MCP: a proposer may not confirm its own Supersedes
+    /// of another principal's node; the author may; a session with no identity
+    /// may not; a proposer confirming a supersession of ITS OWN node may.
+    #[test]
+    fn pba_l6b_002_p2_confirm_cross_author_supersession_needs_a_second_party() {
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let bob = Asserter::new(SigningKey::from_bytes(&[21u8; 32]));
+        let mal = Asserter::new(SigningKey::from_bytes(&[22u8; 32]));
+        let victim = bob.assert_node("citrate-chain", NodeKind::Adr, "bob adr", 1_000);
+        let vid = s.put_node(&victim).unwrap();
+        let mine = mal.assert_node("citrate-chain", NodeKind::Rationale, "mine", 2_000);
+        let mid = s.put_node(&mine).unwrap();
+        let own_old = mal.assert_node("citrate-chain", NodeKind::Rationale, "my old", 1_500);
+        let oid = s.put_node(&own_old).unwrap();
+        s.add_edge(&mal.propose_edge(mid, vid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
+        s.add_edge(&mal.propose_edge(mid, oid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
+        let args = |to: &mem_core::ContentHash| json!({"from_prefix": mid.to_hex()[..16], "to_prefix": to.to_hex()[..16], "kind": "supersedes"});
+
+        let mut as_mal = MemoryMcpServer::new_with_asserter(&s, write_grant(), mal.clone());
+        assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&vid))["isError"], true, "self-confirm refused");
+        let mut anon = MemoryMcpServer::new(&s, write_grant());
+        assert_eq!(call_json(&mut anon, "memory.confirm_edge", args(&vid))["isError"], true, "no identity refused");
+        assert_eq!(s.get_node(&vid).unwrap().unwrap().status, Status::Active);
+        assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&oid))["isError"], false, "own node: fine");
+        let mut as_bob = MemoryMcpServer::new_with_asserter(&s, write_grant(), bob.clone());
+        assert_eq!(call_json(&mut as_bob, "memory.confirm_edge", args(&vid))["isError"], false, "author confirms");
+        assert_eq!(s.get_node(&vid).unwrap().unwrap().status, Status::Superseded);
+    }
+
+    /// Mutation-hardening: the proposer is looked up by the exact (to, kind) key —
+    /// another proposer's edge from the same node must not stand in for it.
+    #[test]
+    fn pba_l6b_002_p2_confirm_proposer_lookup_uses_the_full_key() {
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let bob = Asserter::new(SigningKey::from_bytes(&[23u8; 32]));
+        let mal = Asserter::new(SigningKey::from_bytes(&[24u8; 32]));
+        let carol = Asserter::new(SigningKey::from_bytes(&[25u8; 32]));
+        let victim = bob.assert_node("citrate-chain", NodeKind::Adr, "bob adr", 1_000);
+        let vid = s.put_node(&victim).unwrap();
+        let mid = s.put_node(&mal.assert_node("citrate-chain", NodeKind::Rationale, "mine", 2_000)).unwrap();
+        // A second bob node whose id sorts BEFORE the victim's, carrying carol's proposal.
+        let mut i = 0;
+        let other = loop {
+            let n = bob.assert_node("citrate-chain", NodeKind::Adr, &format!("bob other {i}"), 1_000);
+            if n.compute_id().as_bytes() < vid.as_bytes() {
+                break n;
+            }
+            i += 1;
+        };
+        let xid = s.put_node(&other).unwrap();
+        s.add_edge(&carol.propose_edge(mid, xid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
+        s.add_edge(&mal.propose_edge(mid, vid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
+        let mut as_mal = MemoryMcpServer::new_with_asserter(&s, write_grant(), mal.clone());
+        let r = call_json(&mut as_mal, "memory.confirm_edge", json!({"from_prefix": mid.to_hex()[..16], "to_prefix": vid.to_hex()[..16], "kind": "supersedes"}));
+        assert_eq!(r["isError"], true, "mal's own proposal: self-confirm refused");
+        assert_eq!(s.get_node(&vid).unwrap().unwrap().status, Status::Active);
+        // mal confirming CAROL's proposal is a legitimate second party.
+        let r = call_json(&mut as_mal, "memory.confirm_edge", json!({"from_prefix": mid.to_hex()[..16], "to_prefix": xid.to_hex()[..16], "kind": "supersedes"}));
+        assert_eq!(r["isError"], false, "{r}");
+    }
 }
+
