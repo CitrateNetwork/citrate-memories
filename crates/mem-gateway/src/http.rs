@@ -318,6 +318,21 @@ fn grant_can_read(grant: &CapabilityGrant, repo: &str) -> bool {
     grant.check(&repo_resource(repo), Op::Read, now_ms()).is_ok()
 }
 
+/// PBA-L6b-001: the ONE way an HTTP handler fetches neighbours for a caller —
+/// the anchor's own tenant plus any tenant the caller's grant can READ. Shared by
+/// `/neighbors` and `/verify` (and mirrored by MCP `memory.neighbors`) so the
+/// grant intersection cannot be forgotten on one surface again.
+fn readable_neighbors(
+    rc: &Recall<'_>,
+    grant: &CapabilityGrant,
+    repo: &str,
+    id: &mem_core::ContentHash,
+    budget: usize,
+) -> Result<Vec<NeighborItem>, ApiError> {
+    rc.neighbors_readable(id, budget, |t| t == repo || grant_can_read(grant, t))
+        .map_err(ise)
+}
+
 /// MEM-B-008: intersect a membership grant with the attenuation a BYOM connect
 /// token declares. `verify_connect_token` used to read ONLY `sub`, so the token's
 /// `scope`/`tenants` were silently discarded and `byom` minted the principal's
@@ -576,14 +591,10 @@ async fn neighbors(
     let rc = recaller(&app);
     // MEM-B-007: the anchor must live in the authorized tenant (cross-tenant → 404).
     let (id, _node) = resolve_in_tenant(&app.store, &rc, &repo, &id_prefix)?;
-    let ns = rc.neighbors(&id, budget(&q, 20)).map_err(ise)?;
-    // MEM-B-007 (grant intersection, R3): a neighbour in another tenant is shown
-    // only if this caller's grant can READ that tenant; others are dropped so
-    // neither content nor existence leaks.
-    let ns: Vec<NeighborItem> = ns
-        .into_iter()
-        .filter(|nb| nb.node.as_ref().map(|n| n.repo == repo || grant_can_read(&grant, &n.repo)).unwrap_or(true))
-        .collect();
+    // MEM-B-007 / PBA-L6b-001 (grant intersection, R3): a neighbour in another
+    // tenant is shown only if this caller's grant can READ that tenant; others are
+    // dropped (before the budget) so neither content nor existence leaks.
+    let ns = readable_neighbors(&rc, &grant, &repo, &id, budget(&q, 20))?;
     Ok(Json(json!({
         "id": id.to_hex(),
         "count": ns.len(),
@@ -599,12 +610,17 @@ async fn verify(
 ) -> Result<Json<Value>, ApiError> {
     let repo = qparam(&q, "repo").ok_or_else(|| bad("repo query param required"))?;
     let id_prefix = qparam(&q, "id").ok_or_else(|| bad("id query param required"))?;
-    gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "verify")?;
+    // PBA-L6b-001: hold the caller's grant (not just a yes/no) so the neighbours
+    // this route serializes — and the verdict derived from them — are filtered to
+    // the tenants the caller may read, exactly as `/neighbors` does. `gate()` here
+    // left MEM-B-007 half-fixed: /verify returned cross-tenant neighbour content.
+    let (_sub, grant) =
+        gate_with_grant(&app, &headers, &org, &repo_resource(&repo), Op::Read, "verify")?;
     let rc = recaller(&app);
     // MEM-B-007: resolve within the authorized tenant — a prefix of a node in
     // another tenant reads as 404 (was a cross-tenant IDOR returning its content).
     let (id, node) = resolve_in_tenant(&app.store, &rc, &repo, &id_prefix)?;
-    let ns = rc.neighbors(&id, 64).map_err(ise)?;
+    let ns = readable_neighbors(&rc, &grant, &repo, &id, 64)?;
     let superseded = matches!(node.status, mem_core::Status::Superseded)
         || ns.iter().any(|n| {
             matches!(n.edge_kind, mem_core::EdgeKind::Supersedes)
@@ -1218,3 +1234,9 @@ mod resolve_in_tenant_tests {
         assert_eq!(same.1.repo, "citrate-chain");
     }
 }
+
+// PBA R2 (2026-09-24 pre-bounty audit) regression tests: the lane-L6b PoCs with
+// inverted assertions, driven through the real handlers.
+#[cfg(test)]
+#[path = "http_pba_r2_tests.rs"]
+mod pba_r2_tests;

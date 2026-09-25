@@ -601,6 +601,43 @@ impl<'a> Recall<'a> {
         Ok(out)
     }
 
+    /// Grant-aware blast radius (PBA-L6b-001 / MEM-B-007): like [`neighbors`](Self::neighbors),
+    /// but a neighbour whose node lives in a tenant `can_read` rejects is dropped
+    /// BEFORE it is materialized or counted against `budget`, so neither its
+    /// content nor its existence reaches the caller, and unreadable neighbours
+    /// cannot crowd readable ones out of the budget. A dangling edge (far node
+    /// absent/shredded) carries no content and is kept, as in `neighbors`.
+    ///
+    /// Every surface that serializes neighbours to a caller (HTTP `/neighbors`,
+    /// HTTP `/verify`, MCP `memory.neighbors`) must go through this helper — the
+    /// tenant-blind `neighbors` is for trusted/internal callers only.
+    pub fn neighbors_readable(
+        &self,
+        id: &ContentHash,
+        budget: usize,
+        can_read: impl Fn(&str) -> bool,
+    ) -> Result<Vec<NeighborItem>, StoreError> {
+        let mut out = Vec::new();
+        let edges = self
+            .store
+            .out_edges(id)?
+            .into_iter()
+            .map(|e| (e.to, e, Direction::Out))
+            .chain(self.store.in_edges(id)?.into_iter().map(|e| (e.from, e, Direction::In)));
+        for (far, e, direction) in edges {
+            if out.len() >= budget {
+                break;
+            }
+            let node = match self.store.get_node(&far)? {
+                Some(n) if !can_read(&n.repo) => continue,
+                Some(n) => Some(RecallItem::from_node(&n, None)),
+                None => None,
+            };
+            out.push(NeighborItem { edge_kind: e.kind, direction, quarantined: e.quarantined, node });
+        }
+        Ok(out)
+    }
+
     /// Structural edge-kind signature of a node: a multiset of
     /// (direction, edge-kind) over its **load-bearing** edges. Quarantined
     /// proposals are excluded — an unconfirmed edge must not influence
@@ -1460,6 +1497,55 @@ mod tests {
         let out = Recall::new(&s).neighbors(&a.compute_id(), 10).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].quarantined, "proposal visibly marked in the read path");
+    }
+
+    /// PBA-L6b-001: `neighbors_readable` drops neighbours in unreadable tenants
+    /// before counting them against the budget, keeps both directions, and keeps
+    /// a readable neighbour that an unreadable one would otherwise crowd out.
+    #[test]
+    fn neighbors_readable_filters_unreadable_tenants_before_budget() {
+        let a = node("a", "anchor in a", 1);
+        let secret_out = node("b", "secret out-neighbour in b", 2);
+        let secret_in = node("b", "secret in-neighbour in b", 3);
+        let ok_in = node("a", "readable in-neighbour in a", 4);
+        let s = store_with(&[a.clone(), secret_out.clone(), secret_in.clone(), ok_in.clone()]);
+        s.add_edge(&plain_edge(&a, &secret_out, EdgeKind::References, false)).unwrap();
+        s.add_edge(&plain_edge(&secret_in, &a, EdgeKind::References, true)).unwrap();
+        s.add_edge(&plain_edge(&ok_in, &a, EdgeKind::Implements, false)).unwrap();
+        let r = Recall::new(&s);
+
+        // Only tenant "a" is readable. With budget 1, the unreadable out-neighbour
+        // must not consume the slot: the readable in-neighbour is returned.
+        let only_a = r.neighbors_readable(&a.compute_id(), 1, |t| t == "a").unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].direction, Direction::In);
+        assert_eq!(only_a[0].edge_kind, EdgeKind::Implements);
+        assert_eq!(only_a[0].node.as_ref().map(|n| n.repo.as_str()), Some("a"));
+        let all_a = r.neighbors_readable(&a.compute_id(), 10, |t| t == "a").unwrap();
+        assert_eq!(all_a.len(), 1, "both tenant-b neighbours dropped");
+        assert!(all_a.iter().all(|n| n.node.as_ref().map(|x| x.repo == "a").unwrap_or(true)));
+
+        // Everything readable: same set as the tenant-blind `neighbors`, with the
+        // quarantine mark preserved and the budget honoured.
+        let every = r.neighbors_readable(&a.compute_id(), 10, |_| true).unwrap();
+        assert_eq!(every.len(), 3);
+        assert_eq!(every.iter().filter(|n| n.direction == Direction::Out).count(), 1);
+        assert_eq!(every.iter().filter(|n| n.quarantined).count(), 1);
+        assert_eq!(r.neighbors_readable(&a.compute_id(), 2, |_| true).unwrap().len(), 2, "budget honoured");
+        assert!(r.neighbors_readable(&a.compute_id(), 0, |_| true).unwrap().is_empty());
+    }
+
+    /// A dangling edge (far node absent) carries no content and is kept, matching
+    /// `neighbors` — the predicate is only consulted for real nodes.
+    #[test]
+    fn neighbors_readable_keeps_dangling_edges() {
+        let a = node("a", "anchor", 1);
+        let ghost = node("zzz", "never stored", 2);
+        let s = store_with(&[a.clone()]);
+        s.add_edge(&plain_edge(&a, &ghost, EdgeKind::References, false)).unwrap();
+        let out = Recall::new(&s).neighbors_readable(&a.compute_id(), 10, |_| false).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].node.is_none());
     }
 
     #[test]

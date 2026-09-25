@@ -416,19 +416,16 @@ impl<'a> MemoryMcpServer<'a> {
             Some(n) if n.repo == repo => {}
             _ => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         }
-        let neighbors = recall.neighbors(&id, budget).map_err(store_err)?;
+        // FUA-MEMORIES-01, refined to grant intersection (MEM-S4 WP-4.2, R3) and
+        // shared with the HTTP surface (PBA-L6b-001): a neighbour in another
+        // tenant (e.g. via a cross-DAG AnalogousTo edge) is shown iff this
+        // session's grant can READ that tenant. Unauthorized tenants are dropped
+        // before the budget — neither content nor existence leaks.
+        let neighbors = recall
+            .neighbors_readable(&id, budget, |t| t == repo || self.can_read(t))
+            .map_err(store_err)?;
         let mut text = format!("neighbors of {}:\n", &id.to_hex()[..12]);
         for nb in &neighbors {
-            // FUA-MEMORIES-01, refined to grant intersection (MEM-S4 WP-4.2, R3):
-            // a neighbour in another tenant (e.g. via a cross-DAG AnalogousTo
-            // edge) is shown iff this session's grant can READ that tenant.
-            // Unauthorized tenants are silently dropped — neither content nor
-            // existence leaks.
-            if let Some(n) = nb.node.as_ref() {
-                if n.repo != repo && !self.can_read(&n.repo) {
-                    continue;
-                }
-            }
             let arrow = match nb.direction {
                 Direction::Out => "->",
                 Direction::In => "<-",
