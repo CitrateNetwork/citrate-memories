@@ -16,16 +16,17 @@
 //! Belnap `Both`. **Gossip / peer-discovery is deferred** (a dated note in MEM-S5);
 //! this is point-to-point pull/push, which is enough to retire file-moves.
 //!
-//! **FWA-C10-03 (auth — fail closed by construction).** `merge_bundle` now
-//! requires a [`CapabilityGrant`], and so does this transport: [`serve_one`] takes
-//! the grant the connecting peer is authorized under and passes it to
-//! `merge_bundle`, which authorizes a `Write` to every repo the pushed bundle
-//! touches. The transport therefore CANNOT be wired into a binary without an
-//! explicit authorization decision — the type system enforces it. (A real
-//! deployment binds the grant to the authenticated peer — mTLS / connect-token —
-//! rather than a static operator grant; that binding is the operator/v2 step.
-//! TLS is still expected at the edge; keep the loopback/relay posture until it
-//! lands.)
+//! **FWA-C10-03 / PBA-L6b-019 (auth — per peer, fail closed).** The listener no
+//! longer authorizes every TCP connection with one static operator grant (that
+//! made any peer that could reach the port a full-authority client). Each
+//! request must carry its OWN credential — a [`CapabilityGrant`] issued by the
+//! trust root, sent as `Authorization: Bearer <hex(json(grant))>` (see
+//! [`encode_credential`]). [`serve_one`] verifies it (signature, issuer ==
+//! `trust_root`, not revoked, not expired) and authorizes that request with THAT
+//! grant: `GET /bundle/<repo>` needs Read on the tenant, `POST /merge` goes
+//! through `merge_bundle`, which needs Write on every repo it touches. A request
+//! without a valid credential gets 401. The grant is a bearer credential: keep
+//! TLS (or the loopback/relay posture) at the edge so it cannot be sniffed.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -42,6 +43,32 @@ use crate::{export_tenant, merge_bundle, MergeOutcome, SyncBundle, SyncError};
 /// store). 64 MiB comfortably holds the whole federation graph as JSON.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// PBA-L6b-019: cap on the request line + headers (a peer cannot stream an
+/// endless header line into memory).
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+
+/// Encode a grant as the transport's bearer credential (`hex(json(grant))`).
+pub fn encode_credential(grant: &CapabilityGrant) -> Result<String, SyncError> {
+    serde_json::to_vec(grant).map(hex::encode).map_err(|e| SyncError::Serde(e.to_string()))
+}
+
+/// Decode + verify a presented credential: well-formed, validly signed, issued by
+/// `trust_root`, not revoked, not expired. `None` on any failure (fail closed).
+fn verify_credential(header_value: &str, trust_root: &[u8], now_ms: u64) -> Option<CapabilityGrant> {
+    let raw = header_value.trim();
+    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?.trim();
+    let bytes = hex::decode(token).ok()?;
+    let grant: CapabilityGrant = serde_json::from_slice(&bytes).ok()?;
+    if grant.verify_signature().is_err()
+        || grant.issuer_pubkey.as_slice() != trust_root
+        || grant.revoked
+        || grant.expires_at_ms <= now_ms
+    {
+        return None;
+    }
+    Some(grant)
+}
+
 fn io_err(e: std::io::Error) -> SyncError {
     SyncError::Chain(format!("transport io: {e}"))
 }
@@ -50,10 +77,12 @@ fn io_err(e: std::io::Error) -> SyncError {
 
 /// Pull a tenant's bundle from a peer and return it (does not merge — caller
 /// decides). `base_url` is the peer's root, e.g. `http://10.0.0.5:8088`.
-pub fn pull_bundle(base_url: &str, repo: &str) -> Result<SyncBundle, SyncError> {
+/// `credential` is the grant this client presents to the peer (PBA-L6b-019).
+pub fn pull_bundle(base_url: &str, repo: &str, credential: &CapabilityGrant) -> Result<SyncBundle, SyncError> {
     let url = format!("{}/bundle/{repo}", base_url.trim_end_matches('/'));
     let body = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(30))
+        .set("authorization", &format!("Bearer {}", encode_credential(credential)?))
         .call()
         .map_err(|e| SyncError::Chain(format!("pull {url} failed: {e}")))?
         .into_string()
@@ -62,11 +91,12 @@ pub fn pull_bundle(base_url: &str, repo: &str) -> Result<SyncBundle, SyncError> 
 }
 
 /// Push a local bundle to a peer, which merges it and returns the outcome.
-pub fn push_bundle(base_url: &str, bundle: &SyncBundle) -> Result<MergeOutcome, SyncError> {
+pub fn push_bundle(base_url: &str, bundle: &SyncBundle, credential: &CapabilityGrant) -> Result<MergeOutcome, SyncError> {
     let url = format!("{}/merge", base_url.trim_end_matches('/'));
     let json = bundle.to_json()?;
     let resp = ureq::post(&url)
         .timeout(std::time::Duration::from_secs(30))
+        .set("authorization", &format!("Bearer {}", encode_credential(credential)?))
         .set("content-type", "application/json")
         .send_string(&json)
         .map_err(|e| SyncError::Chain(format!("push {url} failed: {e}")))?
@@ -83,11 +113,12 @@ pub fn pull_and_merge(
     store: &MemoryDagStore<MemoryNode>,
     base_url: &str,
     repo: &str,
+    credential: &CapabilityGrant,
     grant: &CapabilityGrant,
     trust_root: &[u8],
     now_ms: u64,
 ) -> Result<MergeOutcome, SyncError> {
-    let bundle = pull_bundle(base_url, repo)?;
+    let bundle = pull_bundle(base_url, repo, credential)?;
     merge_bundle(store, &bundle, grant, trust_root, now_ms)
 }
 
@@ -98,21 +129,18 @@ pub fn pull_and_merge(
 /// or `None` if the connection carried no parseable request. Loop over this for
 /// a long-running server: `loop { serve_one(&listener, &store, now)?; }`.
 ///
-/// FWA-C10-03 + MEM-B-004: `grant` is the capability the connecting peer is
-/// authorized under and `trust_root` is the ed25519 public key that legitimately
-/// issues grants (the operator/gateway key). Both are handed to `merge_bundle`,
-/// which requires the grant to be issued by `trust_root` (a self-signed grant is
-/// refused) and to authorize a `Write` to every repo a pushed bundle touches.
-/// There is no unauthenticated merge path — the signature requires a grant.
+/// FWA-C10-03 + MEM-B-004 + PBA-L6b-019: there is no server-side grant. Each
+/// request is authorized with the credential the PEER presents, which must be
+/// issued by `trust_root` (the ed25519 key that legitimately issues grants).
+/// No credential, or an invalid/expired/foreign one → 401, nothing served.
 pub fn serve_one(
     listener: &TcpListener,
     store: &MemoryDagStore<MemoryNode>,
-    grant: &CapabilityGrant,
     trust_root: &[u8],
     now_ms: u64,
 ) -> Result<Option<String>, SyncError> {
     let (stream, _peer) = listener.accept().map_err(io_err)?;
-    handle_conn(stream, store, grant, trust_root, now_ms)
+    handle_conn(stream, store, trust_root, now_ms)
 }
 
 /// MEM-B-016: a stalled peer must not pin the single-threaded listener forever.
@@ -122,7 +150,6 @@ const CONN_TIMEOUT: Duration = Duration::from_secs(30);
 fn handle_conn(
     mut stream: TcpStream,
     store: &MemoryDagStore<MemoryNode>,
-    grant: &CapabilityGrant,
     trust_root: &[u8],
     now_ms: u64,
 ) -> Result<Option<String>, SyncError> {
@@ -135,30 +162,60 @@ fn handle_conn(
     stream.set_write_timeout(Some(CONN_TIMEOUT)).map_err(io_err)?;
     let mut reader = BufReader::new(stream.try_clone().map_err(io_err)?);
 
-    // Request line.
+    // Request line + headers, bounded in total (PBA-L6b-019).
+    let mut budget = MAX_HEADER_BYTES;
+    let mut read_bounded = |reader: &mut BufReader<TcpStream>, line: &mut String| -> Result<Option<usize>, SyncError> {
+        let n = reader.by_ref().take(budget as u64).read_line(line).map_err(io_err)?;
+        budget = budget.saturating_sub(n);
+        if n > 0 && !line.ends_with('\n') && budget == 0 {
+            return Ok(None); // header section too large
+        }
+        Ok(Some(n))
+    };
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).map_err(io_err)? == 0 {
-        return Ok(None);
+    match read_bounded(&mut reader, &mut request_line)? {
+        Some(0) => return Ok(None),
+        Some(_) => {}
+        None => {
+            write_json(&mut stream, 431, "Request Header Fields Too Large", "{\"error\":\"headers too large\"}")?;
+            return Ok(Some("(rejected: headers too large)".into()));
+        }
     }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
 
-    // Headers (we only need Content-Length).
+    // Headers: Content-Length and the peer credential.
     let mut content_length = 0usize;
+    let mut credential: Option<String> = None;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).map_err(io_err)? == 0 {
-            break;
+        match read_bounded(&mut reader, &mut line)? {
+            Some(0) => break,
+            Some(_) => {}
+            None => {
+                write_json(&mut stream, 431, "Request Header Fields Too Large", "{\"error\":\"headers too large\"}")?;
+                return Ok(Some(format!("{method} {path} (rejected: headers too large)")));
+            }
         }
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
             break;
         }
-        if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
+        } else if lower.starts_with("authorization:") {
+            credential = Some(trimmed["authorization:".len()..].trim().to_string());
         }
     }
+
+    // PBA-L6b-019: authenticate THIS peer before routing anything.
+    let Some(grant) = credential.as_deref().and_then(|c| verify_credential(c, trust_root, now_ms)) else {
+        write_json(&mut stream, 401, "Unauthorized", "{\"error\":\"missing or invalid peer credential\"}")?;
+        return Ok(Some(format!("{method} {path} (401)")));
+    };
+    let grant = &grant;
 
     match (method.as_str(), path.as_str()) {
         ("GET", p) if p.starts_with("/bundle/") => {
@@ -291,8 +348,9 @@ mod transport_tests {
         // The peer authorizes this connecting client to Write the pushed repo.
         let grant = crate::tests::grant_for(&["citrate-chain"], true);
         let root = crate::tests::trust_root();
-        let client = std::thread::spawn(move || push_bundle(&base, &bundle));
-        let route = serve_one(&listener, &peer, &grant, &root, 1).expect("serve").unwrap();
+        let cred = grant.clone();
+        let client = std::thread::spawn(move || push_bundle(&base, &bundle, &cred));
+        let route = serve_one(&listener, &peer, &root, 1).expect("serve").unwrap();
         let outcome = client.join().unwrap().expect("push ok");
 
         assert_eq!(route, "POST /merge");
@@ -315,8 +373,9 @@ mod transport_tests {
         // authorize a READ of the tenant (a read-only grant suffices).
         let grant = crate::tests::grant_for(&["citrate-chain"], false);
         let root = crate::tests::trust_root();
-        let client = std::thread::spawn(move || pull_bundle(&base, "citrate-chain"));
-        let route = serve_one(&listener, &peer, &grant, &root, 1).expect("serve").unwrap();
+        let cred = grant.clone();
+        let client = std::thread::spawn(move || pull_bundle(&base, "citrate-chain", &cred));
+        let route = serve_one(&listener, &peer, &root, 1).expect("serve").unwrap();
         let bundle = client.join().unwrap().expect("pull ok");
 
         assert_eq!(route, "GET /bundle/citrate-chain");
@@ -340,14 +399,15 @@ mod transport_tests {
         let root = crate::tests::trust_root();
 
         // Client: claim a huge body, send no bytes, then close the connection.
+        let cred = encode_credential(&grant).unwrap();
         std::thread::spawn(move || {
             let mut s = TcpStream::connect(addr).unwrap();
-            s.write_all(b"POST /merge HTTP/1.1\r\nContent-Length: 67108864\r\n\r\n").unwrap();
+            s.write_all(format!("POST /merge HTTP/1.1\r\nAuthorization: Bearer {cred}\r\nContent-Length: 67108864\r\n\r\n").as_bytes()).unwrap();
             // Drop `s` → EOF, without ever sending the promised 64 MiB.
         });
 
         let start = Instant::now();
-        let route = serve_one(&listener, &peer, &grant, &root, 1).expect("serve returns");
+        let route = serve_one(&listener, &peer, &root, 1).expect("serve returns");
         assert!(
             start.elapsed() < CONN_TIMEOUT,
             "serve_one must return promptly on early EOF, not block on the lying length"
@@ -369,11 +429,102 @@ mod transport_tests {
         // Grant covers a DIFFERENT tenant — no read on `secret-tenant`.
         let grant = crate::tests::grant_for(&["other-tenant"], false);
         let root = crate::tests::trust_root();
-        let client = std::thread::spawn(move || pull_bundle(&base, "secret-tenant"));
-        let route = serve_one(&listener, &peer, &grant, &root, 1).expect("serve").unwrap();
+        let cred = grant.clone();
+        let client = std::thread::spawn(move || pull_bundle(&base, "secret-tenant", &cred));
+        let route = serve_one(&listener, &peer, &root, 1).expect("serve").unwrap();
         let pulled = client.join().unwrap();
 
         assert_eq!(route, "GET /bundle/secret-tenant (403)");
         assert!(pulled.is_err(), "unauthorized pull must not return a bundle");
+    }
+
+    /// Send a raw HTTP request to `addr` and return the full response text.
+    fn raw_request(addr: std::net::SocketAddr, req: String) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(req.as_bytes()).unwrap();
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out);
+            out
+        })
+    }
+
+    /// PBA-L6b-019 (CIT-MEM-02): an UNAUTHENTICATED TCP peer — no credential at
+    /// all — must not be served under a static operator grant. Before the fix the
+    /// listener authorized every connection with the grant handed to `serve_one`.
+    #[test]
+    fn pba_l6b_019_unauthenticated_peer_cannot_pull_or_push() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        peer.commit(&[derived_node("citrate-chain", "private tip")], &[]).unwrap();
+        let root = crate::tests::trust_root();
+
+        let c = raw_request(addr, "GET /bundle/citrate-chain HTTP/1.1\r\n\r\n".into());
+        serve_one(&listener, &peer, &root, 1).expect("serve");
+        let resp = c.join().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 401"), "PBA-L6b-019: unauthenticated pull served: {resp}");
+        assert!(!resp.contains("private tip"), "PBA-L6b-019: tenant content leaked");
+
+        let bundle = SyncBundle { repo: "citrate-chain".into(), exported_at_ms: 1, nodes: vec![derived_node("citrate-chain", "injected")], edges: vec![] }.to_json().unwrap();
+        let c = raw_request(addr, format!("POST /merge HTTP/1.1\r\nContent-Length: {}\r\n\r\n{bundle}", bundle.len()));
+        serve_one(&listener, &peer, &root, 1).expect("serve");
+        let resp = c.join().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 401"), "PBA-L6b-019: unauthenticated push served: {resp}");
+        assert_eq!(peer.node_count().unwrap(), 1, "nothing merged");
+    }
+
+    /// PBA-L6b-019: a credential that is self-signed (not the trust root),
+    /// expired, revoked, or garbage is refused; the trust-root grant is served.
+    #[test]
+    fn pba_l6b_019_only_trust_root_credentials_are_accepted() {
+        use ed25519_dalek::SigningKey;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        peer.commit(&[derived_node("citrate-chain", "private tip")], &[]).unwrap();
+        let root = crate::tests::trust_root();
+        let good = crate::tests::grant_for(&["citrate-chain"], false);
+        let mut forged = good.clone();
+        forged.sign_with(&SigningKey::from_bytes(&[7u8; 32]));
+        let mut expired = good.clone();
+        expired.expires_at_ms = 1;
+        expired.sign_with(&SigningKey::from_bytes(&[42u8; 32]));
+        let mut revoked = good.clone();
+        revoked.revoked = true;
+        let enc = |g: &CapabilityGrant| encode_credential(g).unwrap();
+        let get = |auth: String| format!("GET /bundle/citrate-chain HTTP/1.1\r\nAuthorization: {auth}\r\n\r\n");
+
+        for (label, auth) in [
+            ("self-signed", format!("Bearer {}", enc(&forged))),
+            ("expired", format!("Bearer {}", enc(&expired))),
+            ("revoked", format!("Bearer {}", enc(&revoked))),
+            ("garbage", "Bearer zz-not-hex".to_string()),
+            ("no scheme", enc(&good)),
+        ] {
+            let c = raw_request(addr, get(auth));
+            serve_one(&listener, &peer, &root, 10).expect("serve");
+            let resp = c.join().unwrap();
+            assert!(resp.starts_with("HTTP/1.1 401"), "PBA-L6b-019: {label} credential served: {resp}");
+        }
+        let c = raw_request(addr, get(format!("Bearer {}", enc(&good))));
+        serve_one(&listener, &peer, &root, 10).expect("serve");
+        let resp = c.join().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200") && resp.contains("private tip"), "valid credential served: {resp}");
+    }
+
+    /// PBA-L6b-019 variant: an endless header line is cut off (431), not buffered.
+    #[test]
+    fn pba_l6b_019_oversized_headers_are_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let root = crate::tests::trust_root();
+        let c = raw_request(addr, format!("GET /bundle/x HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "a".repeat(MAX_HEADER_BYTES * 2)));
+        let route = serve_one(&listener, &peer, &root, 1).expect("serve").unwrap();
+        let resp = c.join().unwrap();
+        assert!(route.contains("headers too large"), "{route}");
+        assert!(resp.starts_with("HTTP/1.1 431"), "{resp}");
     }
 }
