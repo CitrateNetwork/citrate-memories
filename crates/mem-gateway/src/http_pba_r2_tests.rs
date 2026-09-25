@@ -488,3 +488,39 @@ async fn pba_l3c_032_byom_refuses_token_for_another_org() {
     let ok = hs256(secret, json!({"sub": "mallory", "exp": exp, "scope": "read", "org": ORG}));
     assert!(byom(State(app), Path("mallory".into()), ok, recall_line(1)).await.is_ok(), "own-org token works");
 }
+
+/// PBA-L6b-018 mutation-hardening: the line cap is inclusive (exactly
+/// BYOM_MAX_LINES calls are served).
+#[tokio::test]
+async fn pba_l6b_018_byom_line_cap_is_inclusive() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("mallory", &["tenant-a"], false)], Some(secret));
+    let body: Vec<String> = (0..BYOM_MAX_LINES).map(recall_line).collect();
+    let r = byom(State(app.clone()), Path("mallory".into()), byom_headers(secret, "mallory", "read"), body.join("\n")).await;
+    assert!(r.is_ok(), "exactly BYOM_MAX_LINES calls must be served");
+    let body: Vec<String> = (0..=BYOM_MAX_LINES).map(recall_line).collect();
+    let r = byom(State(app), Path("mallory".into()), byom_headers(secret, "mallory", "read"), body.join("\n")).await;
+    assert_eq!(r.err().map(|e| e.status), Some(StatusCode::PAYLOAD_TOO_LARGE));
+}
+
+/// PBA-L6b-018 mutation-hardening: token-bucket arithmetic (burst inclusive,
+/// exact refill rate, spend subtracts, cap at burst, per-principal buckets).
+#[test]
+fn pba_l6b_018_try_spend_bucket_math() {
+    let l = ByomLimits::default();
+    let t0 = 1_000_000u64;
+    assert!(l.try_spend("a", BYOM_BURST_CALLS as usize, t0), "a full burst is allowed (inclusive)");
+    assert!(!l.try_spend("a", 1, t0), "bucket empty");
+    // 500 ms at 2 calls/s refills exactly one call.
+    assert!(l.try_spend("a", 1, t0 + 500), "one call refilled after 500 ms");
+    assert!(!l.try_spend("a", 1, t0 + 500), "…and only one");
+    // A failed spend spends nothing.
+    assert!(!l.try_spend("a", 2, t0 + 1_000), "only 1 token after another 500 ms");
+    assert!(l.try_spend("a", 1, t0 + 1_000), "the failed spend left the token in place");
+    // Refill caps at the burst.
+    assert!(!l.try_spend("a", BYOM_BURST_CALLS as usize + 1, t0 + 10_000_000), "never more than a burst");
+    assert!(l.try_spend("a", BYOM_BURST_CALLS as usize, t0 + 10_000_000));
+    // Buckets are per principal.
+    assert!(l.try_spend("b", BYOM_BURST_CALLS as usize, t0));
+}

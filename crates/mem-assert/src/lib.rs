@@ -797,4 +797,32 @@ mod tests {
             "PBA-L6b-002: memory.merge_diff must pass the caller's author identity to apply_diff"
         );
     }
+
+    /// Mutation-hardening: the stored-edge lookup matches on BOTH `to` and
+    /// `kind` — a different edge from the same node (same kind, other target) is
+    /// not "the stored copy" of a new edge.
+    #[test]
+    fn pba_l6b_002_edge_lookup_is_by_full_key() {
+        let bob = asserter(23);
+        let mallory = asserter(24);
+        let a = bob.assert_node("r", NodeKind::Rationale, "a", 1);
+        let b = bob.assert_node("r", NodeKind::Rationale, "b", 1);
+        let c = bob.assert_node("r", NodeKind::Rationale, "c", 1);
+        let store = stored_with(&a);
+        store.put_node(&b).unwrap();
+        store.put_node(&c).unwrap();
+        let p = bob.propose_edge(a.compute_id(), b.compute_id(), EdgeKind::References, EdgeMethod::Nlp, None, 2);
+        store.add_edge(&p).unwrap();
+        // A NEW load-bearing edge a->c (same kind, other target) by someone else.
+        let e = mallory.assert_edge(a.compute_id(), c.compute_id(), EdgeKind::References, 3);
+        let mut d = MemoryDiff::new(mallory.pubkey_hex(), 3);
+        d.add_edge(e);
+        apply_diff(&store, &d, Some(mallory.pubkey_hex())).unwrap();
+        // And a->b with another kind is also a new edge.
+        let e2 = mallory.assert_edge(a.compute_id(), b.compute_id(), EdgeKind::Implements, 3);
+        let mut d2 = MemoryDiff::new(mallory.pubkey_hex(), 3);
+        d2.add_edge(e2);
+        apply_diff(&store, &d2, Some(mallory.pubkey_hex())).unwrap();
+        assert_eq!(store.out_edges(&a.compute_id()).unwrap().len(), 3);
+    }
 }

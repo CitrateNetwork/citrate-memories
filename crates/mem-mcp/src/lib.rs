@@ -2315,4 +2315,55 @@ mod tests {
         let again = text_of(&call_json(&mut srv, "memory.neighbors", json!({"repo": "citrate-chain", "id_prefix": prefix})));
         assert!(again.contains("siwe login"));
     }
+
+    /// PBA-L6b-002 over MCP: memory.merge_diff hands apply_diff the SESSION
+    /// asserter as caller — the author can update their own node (monotone), a
+    /// different session cannot; a node-only diff is not "empty".
+    #[test]
+    fn pba_l6b_002_mcp_merge_diff_is_author_gated() {
+        let s = store();
+        let me = asserter();
+        let mine = me.assert_node("citrate-chain", NodeKind::Rationale, "my note", 1);
+        let mut d = MemoryDiff::new(me.pubkey_hex(), 1);
+        d.add_node(mine.clone());
+        let args = json!({"diff": d.to_json().unwrap()});
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), me.clone());
+        let r = call_json(&mut srv, "memory.merge_diff", args);
+        assert_eq!(r["isError"], false, "a node-only diff merges: {r}");
+        assert!(text_of(&r).contains("merged 1 nodes, 0 edges"));
+
+        let mut retired = mine.clone();
+        retired.status = Status::Archived;
+        let mut d2 = MemoryDiff::new(me.pubkey_hex(), 2);
+        d2.add_node(retired);
+        let args2 = json!({"diff": d2.to_json().unwrap()});
+        let mut other = MemoryMcpServer::new_with_asserter(&s, write_grant(), Asserter::new(SigningKey::from_bytes(&[9u8; 32])));
+        let r = call_json(&mut other, "memory.merge_diff", args2.clone());
+        assert_eq!(r["isError"], true, "another session may not retire my node: {r}");
+        assert_eq!(s.get_node(&mine.compute_id()).unwrap().unwrap().status, Status::Active);
+        let mut reader = MemoryMcpServer::new(&s, write_grant());
+        assert_eq!(call_json(&mut reader, "memory.merge_diff", args2.clone())["isError"], true, "no identity, no change");
+
+        let r = call_json(&mut srv, "memory.merge_diff", args2);
+        assert_eq!(r["isError"], false, "the author may: {r}");
+        assert_eq!(s.get_node(&mine.compute_id()).unwrap().unwrap().status, Status::Archived);
+    }
+
+    /// merge_diff byte cap boundary (FUA-MEMORIES-05): exactly 4 MiB is parsed
+    /// (and rejected as malformed), one byte more is refused as too large.
+    #[test]
+    fn merge_diff_byte_cap_is_inclusive() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        let at = "x".repeat(4 * 1024 * 1024);
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": at}));
+        assert!(text_of(&r).starts_with("malformed diff"), "{}", text_of(&r));
+        let over = "x".repeat(4 * 1024 * 1024 + 1);
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": over}));
+        assert!(text_of(&r).starts_with("diff too large"), "{}", text_of(&r));
+        let empty = MemoryDiff::new(asserter().pubkey_hex(), 1).to_json().unwrap();
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": empty}));
+        assert!(text_of(&r).starts_with("empty diff"));
+    }
 }
+

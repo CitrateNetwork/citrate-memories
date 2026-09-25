@@ -1592,6 +1592,7 @@ mod tests {
         let s = store_with(&[a.clone(), b.clone()]);
         let r = Recall::new(&s);
         assert_eq!(r.resolve_prefix(p).unwrap(), None, "blind: ambiguous across tenants");
+        assert_eq!(r.resolve_prefix(&a_hex).unwrap(), Some(a.compute_id()), "blind: a full id resolves");
         assert_eq!(r.resolve_prefix_in("a", p).unwrap(), Some(a.compute_id()));
         assert_eq!(r.resolve_prefix_in("b", p).unwrap(), Some(b.compute_id()));
         assert_eq!(r.resolve_prefix_in("c", p).unwrap(), None, "no match in an empty tenant");

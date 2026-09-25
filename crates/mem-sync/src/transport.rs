@@ -444,6 +444,8 @@ mod transport_tests {
             use std::io::{Read as _, Write as _};
             let mut s = TcpStream::connect(addr).unwrap();
             s.write_all(req.as_bytes()).unwrap();
+            // Half-close so the server sees EOF after the request bytes.
+            let _ = s.shutdown(std::net::Shutdown::Write);
             let mut out = String::new();
             let _ = s.read_to_string(&mut out);
             out
@@ -526,5 +528,37 @@ mod transport_tests {
         let resp = c.join().unwrap();
         assert!(route.contains("headers too large"), "{route}");
         assert!(resp.starts_with("HTTP/1.1 431"), "{resp}");
+    }
+
+    /// PBA-L6b-019 mutation-hardening: a header section that ends exactly at the
+    /// byte budget (then EOF) is not "too large", a final line without a newline
+    /// is a normal (unauthenticated → 401) request, and an unknown GET route with
+    /// a valid credential is 404, not routed to the bundle export.
+    #[test]
+    fn pba_l6b_019_header_budget_edges_and_routing() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let root = crate::tests::trust_root();
+
+        // Exactly MAX_HEADER_BYTES of complete lines, then EOF (no blank line).
+        let head = "GET /bundle/x HTTP/1.1\r\n";
+        let pad_len = MAX_HEADER_BYTES - head.len() - "X-Pad: \r\n".len();
+        let exact = format!("{head}X-Pad: {}\r\n", "a".repeat(pad_len));
+        assert_eq!(exact.len(), MAX_HEADER_BYTES);
+        let c = raw_request(addr, exact);
+        serve_one(&listener, &peer, &root, 1).expect("serve");
+        assert!(c.join().unwrap().starts_with("HTTP/1.1 401"), "exact-budget headers are not 431");
+
+        // Request line with no trailing newline, then EOF.
+        let c = raw_request(addr, "GET /bundle/x HTTP/1.1".into());
+        serve_one(&listener, &peer, &root, 1).expect("serve");
+        assert!(c.join().unwrap().starts_with("HTTP/1.1 401"), "unterminated last line is not 431");
+
+        // Unknown route, valid credential → 404.
+        let cred = encode_credential(&crate::tests::grant_for(&["x"], false)).unwrap();
+        let c = raw_request(addr, format!("GET /nope HTTP/1.1\r\nAuthorization: Bearer {cred}\r\n\r\n"));
+        serve_one(&listener, &peer, &root, 1).expect("serve");
+        assert!(c.join().unwrap().starts_with("HTTP/1.1 404"), "unknown route is 404");
     }
 }

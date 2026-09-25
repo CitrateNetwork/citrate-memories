@@ -141,3 +141,74 @@ pub fn merge_node(local: &MemoryNode, remote: &MemoryNode) -> (MemoryNode, bool,
     let changed = merged != *local;
     (merged, changed, contradictions)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mem_core::{NodeKind, Plane, SourceRef, SCHEMA_VERSION};
+
+    fn node() -> MemoryNode {
+        MemoryNode {
+            schema_version: SCHEMA_VERSION,
+            plane: Plane::Derived,
+            kind: NodeKind::Rationale,
+            repo: "r".into(),
+            author: "t".into(),
+            source_ref: SourceRef::DagNative { key: "k".into() },
+            content: b"c".to_vec(),
+            valid_from: 5,
+            valid_to: None,
+            observed_at: 5,
+            trust_tier: TrustTier::DerivedDeterministic,
+            signature: None,
+            embedding: None,
+            confidence: vec![],
+            anchors: vec![],
+            status: Status::Active,
+        }
+    }
+
+    /// Same status rank: the earliest valid_to wins, from either side.
+    #[test]
+    fn same_rank_keeps_earliest_valid_to() {
+        let mut l = node();
+        let mut r = node();
+        l.valid_to = Some(3);
+        r.valid_to = Some(5);
+        assert_eq!(merge_node(&l, &r).0.valid_to, Some(3));
+        assert_eq!(merge_node(&r, &l).0.valid_to, Some(3));
+        // A higher rank brings its own valid_to.
+        r.status = Status::Superseded;
+        assert_eq!(merge_node(&l, &r).0.valid_to, Some(5));
+        assert_eq!(merge_node(&l, &r).0.status, Status::Superseded);
+    }
+
+    /// Signature / embedding tiebreaks pick the smallest, order-independently.
+    #[test]
+    fn tiebreaks_pick_the_minimum_in_both_orders() {
+        let (lo, hi) = (Some(vec![1u8, 2]), Some(vec![9u8, 9]));
+        assert_eq!(min_opt_bytes(&lo, &hi), lo);
+        assert_eq!(min_opt_bytes(&hi, &lo), lo);
+        assert_eq!(min_opt_bytes(&None, &hi), hi);
+        let a = Some(VersionedVector { model: "m".into(), data: vec![0.1] });
+        let b = Some(VersionedVector { model: "m".into(), data: vec![0.9] });
+        assert_eq!(min_embedding(&a, &b), a);
+        assert_eq!(min_embedding(&b, &a), a);
+        assert_eq!(min_embedding(&None, &b), b);
+    }
+
+    /// Anchors are a grow-only, deduplicated union.
+    #[test]
+    fn anchors_union_dedups() {
+        let an = |p: &str| CodeAnchor { repo: "r".into(), path: p.into(), symbol: None, line_start: 1, line_end: 2 };
+        let u = union_anchors(&[an("a"), an("b")], &[an("b"), an("c")]);
+        assert_eq!(u.iter().map(|x| x.path.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        let mut l = node();
+        l.anchors = vec![an("a")];
+        let mut r = node();
+        r.anchors = vec![an("z")];
+        let (m, changed, _) = merge_node(&l, &r);
+        assert!(changed);
+        assert_eq!(m.anchors.len(), 2);
+    }
+}
