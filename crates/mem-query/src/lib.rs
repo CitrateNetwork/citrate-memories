@@ -1721,4 +1721,25 @@ mod tests {
         assert!(r.storyline("a", 5).unwrap().items.is_empty());
         assert!(r.neighbors(&b.compute_id(), 10).unwrap().is_empty(), "sealed edges die with their tenant");
     }
+
+    /// PBA-L6b-001 follow-up: verify_readable counts supersession/refutation
+    /// edges only from readable tenants (absent far nodes never count), while the
+    /// tenant-blind verify still counts them all.
+    #[test]
+    fn verify_readable_counts_only_readable_edges() {
+        let target = node("a", "the claim", 1);
+        let ok_ref = node("a", "readable rebuttal", 2);
+        let hidden = node("b", "hidden rebuttal", 3);
+        let ghost = node("c", "never stored", 4);
+        let s = store_with(&[target.clone(), ok_ref.clone(), hidden.clone()]);
+        s.add_edge(&plain_edge(&ok_ref, &target, EdgeKind::Refutes, false)).unwrap();
+        s.add_edge(&plain_edge(&hidden, &target, EdgeKind::Contradicts, false)).unwrap();
+        s.add_edge(&plain_edge(&ghost, &target, EdgeKind::Refutes, false)).unwrap();
+        let r = Recall::new(&s);
+        let v = r.verify_readable(&target.compute_id(), |t| t == "a").unwrap().expect("exists");
+        assert_eq!(v.refuted_by, vec![ok_ref.compute_id()]);
+        assert!(v.superseded_by.is_empty());
+        assert_eq!(r.verify(&target.compute_id()).unwrap().expect("exists").refuted_by.len(), 3, "blind verify unchanged");
+        assert!(r.verify_readable(&ghost.compute_id(), |_| true).unwrap().is_none());
+    }
 }

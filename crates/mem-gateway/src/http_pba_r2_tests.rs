@@ -620,3 +620,14 @@ fn pba_l6b_018_per_principal_concurrency_cap() {
     assert!(l.try_enter("m").is_some(), "released on drop");
     assert!(lock(&l.inflight).get("m").copied().unwrap_or(0) <= 1);
 }
+
+/// Mutation-hardening: releasing one of two held slots frees exactly one.
+#[test]
+fn pba_l6b_018_inflight_release_is_exact() {
+    let l = ByomLimits::default();
+    let a = l.try_enter("m").expect("1");
+    let _b = l.try_enter("m").expect("2");
+    drop(a);
+    let _c = l.try_enter("m").expect("one slot freed");
+    assert!(l.try_enter("m").is_none(), "still capped at BYOM_MAX_CONCURRENT_PER_PRINCIPAL");
+}

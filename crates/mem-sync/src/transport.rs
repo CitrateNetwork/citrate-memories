@@ -701,4 +701,11 @@ mod transport_tests {
             assert!(c.join().unwrap().starts_with("HTTP/1.1 401"), "PBA-L6b-019: {label} served");
         }
     }
+
+    /// The audience scope is part of the wire contract issuers mint against.
+    #[test]
+    fn audience_resource_wire_format() {
+        assert_eq!(audience_resource("peer-C"), "peer:peer-C");
+        assert_ne!(audience_resource("a"), audience_resource("b"));
+    }
 }
