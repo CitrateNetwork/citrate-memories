@@ -913,6 +913,10 @@ impl<'a> MemoryMcpServer<'a> {
         // node/edge can only be changed by its own author (never LWW-overwritten).
         let caller = self.asserter.as_ref().map(|a| a.pubkey_hex().to_string());
         match apply_diff(self.store, &diff, caller.as_deref()) {
+            Ok(report) if report.unembedded > 0 => Ok(tool_text(format!(
+                "merged {} nodes, {} edges — {} relayed node(s) stored WITHOUT their embedding (only the author may set it); not findable by memory.search until the author merges it or a backfill runs",
+                report.nodes, report.edges, report.unembedded
+            ))),
             Ok(report) => Ok(tool_text(format!("merged {} nodes, {} edges", report.nodes, report.edges))),
             Err(e) => Ok(tool_error(format!("merge rejected: {e}"))),
         }

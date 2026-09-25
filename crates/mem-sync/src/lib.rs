@@ -248,6 +248,15 @@ fn authorize_bundle(
 /// items must still carry a valid signature (per-item), unchanged. Use
 /// [`merge_bundle_trusted`] only for in-process, already-trusted ingest (it grants
 /// `*` and is its own trust root), never across a federation boundary.
+///
+/// **Trust assumption (no author gate, by design).** Unlike
+/// `mem_assert::apply_diff` (the MCP / BYOM path, which lets only an item's
+/// author change its advisory state), this is a REPLICA merge: any peer holding a
+/// trust-root `Write` grant on a repo can move its nodes' advisory state along
+/// the monotone join (retire, contradict, downgrade trust, pick the smaller
+/// embedding). Replicas must converge on confirmed cross-author supersessions
+/// too, so an author gate here would break convergence. Issue sync grants only
+/// to replicas you trust as much as the tenant's writers.
 pub fn merge_bundle(
     store: &MemoryDagStore<MemoryNode>,
     bundle: &SyncBundle,

@@ -524,3 +524,67 @@ fn pba_l6b_018_try_spend_bucket_math() {
     // Buckets are per principal.
     assert!(l.try_spend("b", BYOM_BURST_CALLS as usize, t0));
 }
+
+// ---------------------------------------------------------------------------
+// R2 verifier follow-ups (verify.json, 2026-09-25)
+// ---------------------------------------------------------------------------
+
+/// PBA-L6b-002 follow-up (verifier probe `v_l6b002_supersedes_edge_bypass`,
+/// inverted): a non-author may not retire another principal's node by adding her
+/// own node plus a NEW signed Supersedes edge (backdated to t=1).
+#[tokio::test]
+async fn pba_l6b_002_byom_cannot_supersede_another_principals_node() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let victim = bob.assert_node("tenant-a", NodeKind::Adr, "ADR: 2-of-3 approvals for treasury", 1_000);
+    let vid = store.put_node(&victim).unwrap();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("bob", &["tenant-a"], true), member("mallory", &["tenant-a"], true)], Some(secret));
+    let mal = Asserter::for_principal(&gw, "mallory");
+    let mine = mal.assert_node("tenant-a", NodeKind::Rationale, "throwaway", 2_000);
+    let e = mal.assert_edge(mine.compute_id(), vid, EdgeKind::Supersedes, 1);
+    let diff = mem_assert::MemoryDiff { author: mal.pubkey_hex().into(), created_at_ms: 1, nodes: vec![mine.clone()], edges: vec![e] };
+    let body = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), merge_rpc(&diff)).await;
+    assert!(body.contains("\"isError\":true"), "PBA-L6b-002: cross-author supersession accepted: {body}");
+    let after = app.store.get_node(&vid).unwrap().unwrap();
+    assert_eq!((after.status, after.valid_to), (Status::Active, None), "PBA-L6b-002: bob's node was retired/backdated");
+    assert!(app.store.get_node(&mine.compute_id()).unwrap().is_none(), "refused diff writes nothing");
+
+    // No regression: bob supersedes his OWN node through BYOM.
+    let newer = bob.assert_node("tenant-a", NodeKind::Adr, "ADR v2: 3-of-5", 3_000);
+    let e2 = bob.assert_edge(newer.compute_id(), vid, EdgeKind::Supersedes, 3_000);
+    let d2 = mem_assert::MemoryDiff { author: bob.pubkey_hex().into(), created_at_ms: 3, nodes: vec![newer], edges: vec![e2] };
+    let body = byom_call(&app, "bob", byom_headers(secret, "bob", "read,propose"), merge_rpc(&d2)).await;
+    assert!(body.contains("\"isError\":false"), "author supersession must work: {body}");
+    let after = app.store.get_node(&vid).unwrap().unwrap();
+    assert_eq!((after.status, after.valid_to), (Status::Superseded, Some(3_000)));
+}
+
+/// PBA-L6b-002 follow-up (verifier probe `v_l6b002_frontrun_new_node_forged_fields`,
+/// inverted): a copy of bob's signed node that is not yet stored may not be
+/// inserted by someone else with forged advisory state.
+#[tokio::test]
+async fn pba_l6b_002_byom_cannot_front_run_new_node_with_forged_fields() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let victim = bob.assert_node("tenant-a", NodeKind::Adr, "ADR: bob's pending handoff", 1_000);
+    let vid = victim.compute_id();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("bob", &["tenant-a"], true), member("mallory", &["tenant-a"], true)], Some(secret));
+    let mut forged = victim.clone();
+    forged.status = Status::Archived;
+    forged.valid_to = Some(1);
+    forged.confidence = vec![BelnapValue::False];
+    let diff = mem_assert::MemoryDiff { author: "x".into(), created_at_ms: 1, nodes: vec![forged], edges: vec![] };
+    let body = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), merge_rpc(&diff)).await;
+    assert!(body.contains("\"isError\":true"), "PBA-L6b-002: forged front-run accepted: {body}");
+    assert!(app.store.get_node(&vid).unwrap().is_none(), "PBA-L6b-002: forged copy landed");
+    // Bob's own merge then lands his real state.
+    let d2 = mem_assert::MemoryDiff { author: bob.pubkey_hex().into(), created_at_ms: 2, nodes: vec![victim.clone()], edges: vec![] };
+    let body = byom_call(&app, "bob", byom_headers(secret, "bob", "read,propose"), merge_rpc(&d2)).await;
+    assert!(body.contains("\"isError\":false"), "{body}");
+    let a = app.store.get_node(&vid).unwrap().unwrap();
+    assert_eq!((a.status, a.valid_to, a.confidence.clone()), (Status::Active, None, vec![BelnapValue::True]));
+}
