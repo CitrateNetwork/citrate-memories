@@ -582,8 +582,16 @@ impl<'a> MemoryMcpServer<'a> {
 
     /// Grant-intersection read check (R3): no audit record, used for filtering
     /// individual cross-tenant items inside an already-audited call.
+    ///
+    /// PBA-L6b-036: the effective authority is the session grant INTERSECTED with
+    /// any per-request `_meta` attenuation — exactly as [`authorize`](Self::authorize)
+    /// computes it — so a narrowed request cannot see items in tenants its
+    /// attenuation dropped.
     fn can_read(&self, repo: &str) -> bool {
-        self.grant.check(&format!("repo:{repo}/memory"), Op::Read, now_ms()).is_ok()
+        let resource = format!("repo:{repo}/memory");
+        let now = now_ms();
+        self.grant.check(&resource, Op::Read, now).is_ok()
+            && self.req_grant.as_ref().is_none_or(|rg| rg.check(&resource, Op::Read, now).is_ok())
     }
 
     /// Resolve an id prefix to a node, requiring the session to be able to read
@@ -2267,5 +2275,44 @@ mod tests {
                 assert_eq!(r["isError"], false, "PBA-L6b-017: {tool} differs by foreign existence ({with_foreign})");
             }
         }
+    }
+
+    /// PBA-L6b-036: the per-request `_meta` attenuation must also narrow the
+    /// per-ITEM cross-tenant filter (`can_read`), not just the anchor authz. A
+    /// session that reads both tenants, narrowed per request to citrate-chain,
+    /// must not see the citrate-identity neighbour in that request.
+    #[test]
+    fn pba_l6b_036_meta_attenuation_narrows_cross_tenant_neighbors() {
+        let s = store();
+        let nodes = s.all_nodes().unwrap();
+        let chain = nodes.iter().find(|n| n.repo == "citrate-chain").unwrap().clone();
+        let ident = nodes.iter().find(|n| n.repo == "citrate-identity").unwrap().clone();
+        let mut edge = Asserter::new(trust_key()).assert_edge(chain.compute_id(), ident.compute_id(), EdgeKind::AnalogousTo, 1);
+        edge.quarantined = false;
+        s.add_edge(&edge).unwrap();
+        let prefix = chain.compute_id().to_hex()[..12].to_string();
+        let mut srv = MemoryMcpServer::new(&s, session_grant_all());
+
+        // Control: the wildcard session sees the cross-tenant neighbour.
+        let open = text_of(&call_json(&mut srv, "memory.neighbors", json!({"repo": "citrate-chain", "id_prefix": prefix})));
+        assert!(open.contains("siwe login"), "control: session grant reads citrate-identity");
+
+        let narrowed = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "memory.neighbors",
+                "arguments": { "repo": "citrate-chain", "id_prefix": prefix },
+                "_meta": { "ai.citrate/grant": grant_scoped("repo:citrate-chain/memory", "agent:test", &trust_key()) }
+            }
+        })
+        .to_string();
+        let resp: Value = serde_json::from_str(&srv.handle_line(&narrowed).unwrap()).unwrap();
+        let text = text_of(&resp["result"]);
+        assert!(!text.contains("siwe"), "PBA-L6b-036: _meta-narrowed request still saw citrate-identity: {text}");
+        assert!(!text.contains("citrate-identity"), "PBA-L6b-036: existence leaked: {text}");
+
+        // The attenuation is per-request: the next plain call sees it again.
+        let again = text_of(&call_json(&mut srv, "memory.neighbors", json!({"repo": "citrate-chain", "id_prefix": prefix})));
+        assert!(again.contains("siwe login"));
     }
 }
