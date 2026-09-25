@@ -728,6 +728,14 @@ impl<'a> MemoryMcpServer<'a> {
             )));
         }
         self.store.add_edge(&edge).map_err(store_err)?;
+        // GHSA-p545: record this session as the proposal's inserting principal.
+        if kind == EdgeKind::Supersedes {
+            if let Some(a) = self.asserter.as_ref() {
+                self.store
+                    .put_meta(&to_node.repo, &mem_assert::inserted_by_key(&edge), a.pubkey_hex().as_bytes())
+                    .map_err(store_err)?;
+            }
+        }
         Ok(tool_text(format!(
             "proposed (quarantined) {} -{kind_str}-> {} — promote with memory.confirm_edge",
             &from_id.to_hex()[..10],
@@ -766,16 +774,31 @@ impl<'a> MemoryMcpServer<'a> {
         // (no self-confirmed cross-author retirement).
         if kind == EdgeKind::Supersedes {
             let caller = self.asserter.as_ref().map(|a| a.pubkey_hex().to_string());
-            let proposer = self
+            let proposal = self
                 .store
                 .out_edges(&from_id)
                 .map_err(store_err)?
                 .into_iter()
-                .find(|e| e.to == to_id && e.kind == kind)
-                .map(|e| e.provenance.asserter);
+                .find(|e| e.to == to_id && e.kind == kind);
+            // GHSA-p545: compare against the principal that INSERTED the proposal
+            // (recorded at insert time), not only the key that signed it. With no
+            // recorded inserter (legacy / replica-merged) only the author may.
+            let inserter = match &proposal {
+                Some(p) => self
+                    .store
+                    .get_meta(&mem_assert::inserted_by_key(p))
+                    .map_err(store_err)?
+                    .and_then(|b| String::from_utf8(b).ok()),
+                None => None,
+            };
+            let proposer = proposal.as_ref().map(|e| e.provenance.asserter.clone());
             let allowed = match caller.as_deref() {
                 None => false,
-                Some(c) => c == to_node.author || proposer.as_deref() != Some(c),
+                Some(c) => {
+                    c == to_node.author
+                        || proposal.is_none() // NotFound is reported below
+                        || (inserter.as_deref().is_some_and(|i| i != c) && proposer.as_deref() != Some(c))
+                }
             };
             if !allowed {
                 return Ok(tool_error(
@@ -2475,8 +2498,12 @@ mod tests {
             i += 1;
         };
         let xid = s.put_node(&other).unwrap();
-        s.add_edge(&carol.propose_edge(mid, xid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
-        s.add_edge(&mal.propose_edge(mid, vid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
+        // Proposals inserted by their signers (GHSA-p545: inserter recorded).
+        for (who, to) in [(&carol, xid), (&mal, vid)] {
+            let p = who.propose_edge(mid, to, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms());
+            s.add_edge(&p).unwrap();
+            s.put_meta("citrate-chain", &mem_assert::inserted_by_key(&p), who.pubkey_hex().as_bytes()).unwrap();
+        }
         let mut as_mal = MemoryMcpServer::new_with_asserter(&s, write_grant(), mal.clone());
         let r = call_json(&mut as_mal, "memory.confirm_edge", json!({"from_prefix": mid.to_hex()[..16], "to_prefix": vid.to_hex()[..16], "kind": "supersedes"}));
         assert_eq!(r["isError"], true, "mal's own proposal: self-confirm refused");
@@ -2485,5 +2512,40 @@ mod tests {
         let r = call_json(&mut as_mal, "memory.confirm_edge", json!({"from_prefix": mid.to_hex()[..16], "to_prefix": xid.to_hex()[..16], "kind": "supersedes"}));
         assert_eq!(r["isError"], false, "{r}");
     }
-}
 
+    /// GHSA-p545: confirmation compares the confirmer with the principal that
+    /// INSERTED the proposal (recorded at insert time), not only with the key that
+    /// signed it; a proposal with no recorded inserter needs the target's author.
+    #[test]
+    fn ghsa_p545_confirm_compares_the_inserting_principal() {
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let bob = Asserter::new(SigningKey::from_bytes(&[31u8; 32]));
+        let mal = Asserter::new(SigningKey::from_bytes(&[32u8; 32]));
+        let carol = Asserter::new(SigningKey::from_bytes(&[33u8; 32]));
+        let puppet = Asserter::new(SigningKey::from_bytes(&[34u8; 32]));
+        let vid = s.put_node(&bob.assert_node("citrate-chain", NodeKind::Adr, "bob adr", 1_000)).unwrap();
+        let v2 = s.put_node(&bob.assert_node("citrate-chain", NodeKind::Adr, "bob adr 2", 1_000)).unwrap();
+        let mid = s.put_node(&mal.assert_node("citrate-chain", NodeKind::Rationale, "mine", 2_000)).unwrap();
+        let key = |e: &mem_core::Edge| [b"edge-inserted-by:".as_slice(), &e.key()].concat();
+        // A puppet-signed proposal that MAL inserted (e.g. before this fix).
+        let pp = puppet.propose_edge(mid, vid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms());
+        s.add_edge(&pp).unwrap();
+        s.put_meta("citrate-chain", &key(&pp), mal.pubkey_hex().as_bytes()).unwrap();
+        let args = |to: &mem_core::ContentHash| json!({"from_prefix": mid.to_hex()[..16], "to_prefix": to.to_hex()[..16], "kind": "supersedes"});
+        let mut as_mal = MemoryMcpServer::new_with_asserter(&s, write_grant(), mal.clone());
+        assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&vid))["isError"], true, "GHSA-p545: inserter self-confirmed");
+        assert_eq!(s.get_node(&vid).unwrap().unwrap().status, Status::Active);
+        let mut as_carol = MemoryMcpServer::new_with_asserter(&s, write_grant(), carol.clone());
+        assert_eq!(call_json(&mut as_carol, "memory.confirm_edge", args(&vid))["isError"], false, "a distinct writer may");
+        // No recorded inserter (legacy / replica-merged): only the target's author.
+        s.add_edge(&puppet.propose_edge(mid, v2, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
+        assert_eq!(call_json(&mut as_carol, "memory.confirm_edge", args(&v2))["isError"], true, "unattributed proposal: not carol");
+        let mut as_bob = MemoryMcpServer::new_with_asserter(&s, write_grant(), bob.clone());
+        assert_eq!(call_json(&mut as_bob, "memory.confirm_edge", args(&v2))["isError"], false, "the author may");
+        // propose_edge over MCP records the session as inserter.
+        let v3 = s.put_node(&bob.assert_node("citrate-chain", NodeKind::Adr, "bob adr 3", 1_000)).unwrap();
+        assert_eq!(call_json(&mut as_mal, "memory.propose_edge", args(&v3))["isError"], false);
+        assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&v3))["isError"], true);
+        assert_eq!(call_json(&mut as_carol, "memory.confirm_edge", args(&v3))["isError"], false);
+    }
+}

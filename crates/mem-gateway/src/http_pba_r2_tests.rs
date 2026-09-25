@@ -681,7 +681,10 @@ async fn pba_l6b_002_p2_distinct_confirmer_retires_at_confirm_time() {
     let mine = mal.assert_node("tenant-a", NodeKind::Rationale, "override", 2_000);
     let mid = store.put_node(&mine).unwrap();
     // A stored proposal carrying an old (unsigned) timestamp.
-    store.add_edge(&mal.propose_edge(mid, vid, EdgeKind::Supersedes, mem_core::EdgeMethod::Nlp, None, 1)).unwrap();
+    let p = mal.propose_edge(mid, vid, EdgeKind::Supersedes, mem_core::EdgeMethod::Nlp, None, 1);
+    store.add_edge(&p).unwrap();
+    // Inserted by mallory (GHSA-p545: the inserter is recorded at insert time).
+    store.put_meta("tenant-a", &mem_assert::inserted_by_key(&p), mal.pubkey_hex().as_bytes()).unwrap();
     let secret = "connect-secret";
     let app = app_with(store, vec![member("carol", &["tenant-a"], true)], Some(secret));
     let before = now_ms();
@@ -716,4 +719,37 @@ async fn pba_l6b_002_p2_proposer_cannot_self_confirm_cross_author_supersession()
     let body = byom_call(&app, "bob", byom_headers(secret, "bob", "read,propose"), tool_rpc("memory.confirm_edge", args)).await;
     assert!(body.contains("\"isError\":false"), "the target's author may confirm: {body}");
     assert_eq!(app.store.get_node(&vid).unwrap().unwrap().status, Status::Superseded);
+}
+
+/// GHSA-p545 (verifier pass-3 probe `p3_all` §3, inverted): a relay may not carry
+/// a Supersedes proposal on another principal's node signed by a key other than
+/// its own (a throwaway key would let one principal satisfy the two-party
+/// confirmation rule alone).
+#[tokio::test]
+async fn ghsa_p545_puppet_signed_proposal_cannot_be_self_confirmed() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let mal = Asserter::for_principal(&gw, "mallory");
+    let puppet = Asserter::new(ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]));
+    let mid = store.put_node(&mal.assert_node("tenant-a", NodeKind::Rationale, "mal override", now_ms())).unwrap();
+    let v2id = store.put_node(&bob.assert_node("tenant-a", NodeKind::Adr, "bob v2", 1_000)).unwrap();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("bob", &["tenant-a"], true), member("mallory", &["tenant-a"], true)], Some(secret));
+    let pp = puppet.propose_edge(mid, v2id, EdgeKind::Supersedes, mem_core::EdgeMethod::Nlp, None, now_ms());
+    let diff = mem_assert::MemoryDiff { author: mal.pubkey_hex().into(), created_at_ms: 1, nodes: vec![], edges: vec![pp] };
+    let _ = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), merge_rpc(&diff)).await;
+    let _ = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"),
+        tool_rpc("memory.confirm_edge", json!({"from_prefix": mid.to_hex()[..16], "to_prefix": v2id.to_hex()[..16], "kind": "supersedes"}))).await;
+    assert_eq!(app.store.get_node(&v2id).unwrap().unwrap().status, Status::Active, "GHSA-p545: one principal retired another's node alone");
+
+    // Variant: puppet-authored from-node + puppet proposal in one relay.
+    let pnode = puppet.assert_node("tenant-a", NodeKind::Rationale, "puppet override", now_ms());
+    let v3id = app.store.put_node(&bob.assert_node("tenant-a", NodeKind::Adr, "bob v3", 1_000)).unwrap();
+    let pp2 = puppet.propose_edge(pnode.compute_id(), v3id, EdgeKind::Supersedes, mem_core::EdgeMethod::Nlp, None, now_ms());
+    let diff = mem_assert::MemoryDiff { author: "x".into(), created_at_ms: 1, nodes: vec![pnode.clone()], edges: vec![pp2] };
+    let _ = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), merge_rpc(&diff)).await;
+    let _ = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"),
+        tool_rpc("memory.confirm_edge", json!({"from_prefix": pnode.compute_id().to_hex()[..16], "to_prefix": v3id.to_hex()[..16], "kind": "supersedes"}))).await;
+    assert_eq!(app.store.get_node(&v3id).unwrap().unwrap().status, Status::Active, "GHSA-p545 variant: puppet node + proposal");
 }
