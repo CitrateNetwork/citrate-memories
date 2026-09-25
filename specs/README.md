@@ -1,10 +1,3 @@
----
-created: 2026-06-08T00:00:00Z
-branch: main
-author: Saul Loveman + Claude Opus 4.8 (1M context)
-status: active
----
-
 # TLA+ specifications (WP-0.5)
 
 Formal models of the safety-critical cores of citrate-memories. See
