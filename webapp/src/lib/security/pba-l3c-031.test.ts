@@ -83,4 +83,27 @@ describe("PBA-L3c-031 — session login-CSRF", () => {
     );
     expect(res.status).toBe(200);
   });
+
+  it("mutation-hardening: Sec-Fetch-Site none (user navigation) and configured origins are accepted", async () => {
+    process.env.MEMRIZZ_APP_ORIGINS = " https://app.memrizz.example/ , https://alt.memrizz.example";
+    const { POST } = await import("../../app/api/auth/session/route");
+    const mk = (headers: Record<string, string>) =>
+      POST(new Request("https://internal-host/api/auth/session", { method: "POST", headers: { "content-type": "application/json", ...headers }, body: body() }));
+    expect((await mk({ "sec-fetch-site": "none" })).status).toBe(200);
+    expect((await mk({ origin: "https://app.memrizz.example" })).status, "trailing slash + spaces trimmed").toBe(200);
+    expect((await mk({ origin: "https://alt.memrizz.example" })).status).toBe(200);
+    expect((await mk({ origin: "https://evil.example" })).status).toBe(403);
+    expect((await mk({ "sec-fetch-site": "same-site" })).status, "same-SITE is not same-origin").toBe(403);
+    expect((await mk({ "content-type": "Application/JSON" })).status, "media type is case-insensitive").toBe(200);
+  });
+
+  it("mutation-hardening: guard verdicts carry the right status and message", async () => {
+    const { checkSameOriginJson } = await import("./same-origin");
+    const r = (h: Record<string, string>) => checkSameOriginJson(new Request("https://a.example/x", { method: "POST", headers: h }));
+    expect(r({ "sec-fetch-site": "cross-site", "content-type": "application/json" })).toEqual({ ok: false, status: 403, error: "cross-site request refused" });
+    expect(r({ origin: "https://b.example", "content-type": "application/json" })).toEqual({ ok: false, status: 403, error: "cross-origin request refused" });
+    expect(r({ "content-type": "text/plain" })).toEqual({ ok: false, status: 415, error: "content-type must be application/json" });
+    expect(r({})).toEqual({ ok: false, status: 415, error: "content-type must be application/json" });
+    expect(r({ origin: "https://a.example", "content-type": "application/json" })).toEqual({ ok: true });
+  });
 });

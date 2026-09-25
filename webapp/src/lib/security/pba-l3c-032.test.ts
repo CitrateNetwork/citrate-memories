@@ -57,4 +57,19 @@ describe("PBA-L3c-032 — BYOM connect token", () => {
     expect(decodeJwt(body.token).scope).toBe("read,propose");
     expect(body.scope).toBe("read,propose");
   });
+
+  it("mutation-hardening: write opt-in needs a JSON body with write === true", async () => {
+    process.env.MEM_CONNECT_SECRET = "test-secret";
+    const { POST } = await import("../../app/api/orgs/[org]/connect/token/route");
+    const mint = async (headers: Record<string, string>, body?: string) => {
+      const res = await POST(new Request(url, { method: "POST", headers: { ...auth("did:citrate:a"), ...headers }, body }), params);
+      return (await res.json()) as { token: string; scope: string; tenants: string[] };
+    };
+    expect((await mint({ "content-type": "application/json; charset=utf-8" }, JSON.stringify({ write: true }))).scope).toBe("read,propose");
+    expect((await mint({ "content-type": "text/plain" }, JSON.stringify({ write: true }))).scope, "undeclared body ignored").toBe("read");
+    expect((await mint({ "content-type": "application/json" }, JSON.stringify({ write: "yes" }))).scope, "truthy is not true").toBe("read");
+    expect((await mint({ "content-type": "application/json" }, "{not json")).scope).toBe("read");
+    const d = await mint({});
+    expect(d.tenants, "no gateway reachable: empty tenant scope").toEqual([]);
+  });
 });
