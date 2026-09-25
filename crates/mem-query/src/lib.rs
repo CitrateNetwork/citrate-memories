@@ -833,6 +833,27 @@ impl<'a> Recall<'a> {
     /// points at a canonical artifact and is rebuildable); an `Asserted` node
     /// verifies iff its signature over the content id holds.
     pub fn verify(&self, id: &ContentHash) -> Result<Option<Verification>, StoreError> {
+        self.verify_where(id, |_| true)
+    }
+
+    /// Grant-aware [`verify`](Self::verify) (PBA-L6b-001 follow-up): only edges
+    /// whose far node lives in a tenant `can_read` admits count towards
+    /// `superseded_by` / `refuted_by`; an edge from an unreadable (or absent)
+    /// node is ignored, so neither its existence nor its kind leaks. Caller-facing
+    /// surfaces must use this, never the tenant-blind `verify`.
+    pub fn verify_readable(
+        &self,
+        id: &ContentHash,
+        can_read: impl Fn(&str) -> bool,
+    ) -> Result<Option<Verification>, StoreError> {
+        self.verify_where(id, |far| far.is_some_and(&can_read))
+    }
+
+    fn verify_where(
+        &self,
+        id: &ContentHash,
+        visible: impl Fn(Option<&str>) -> bool,
+    ) -> Result<Option<Verification>, StoreError> {
         let node = match self.store.get_node(id)? {
             Some(n) => n,
             None => return Ok(None),
@@ -858,6 +879,10 @@ impl<'a> Recall<'a> {
         for e in self.store.in_edges(id)? {
             if e.quarantined {
                 continue; // a proposal is advisory, never load-bearing
+            }
+            let far = self.store.get_node(&e.from)?;
+            if !visible(far.as_ref().map(|n| n.repo.as_str())) {
+                continue;
             }
             match e.kind {
                 mem_core::EdgeKind::Supersedes => superseded_by.push(e.from),
@@ -892,6 +917,27 @@ impl<'a> Recall<'a> {
     /// An optional LLM elaboration over these gaps is a v2 follow-up (it would
     /// land as a quarantined assertion, never load-bearing).
     pub fn critique(&self, result: &RecallResult, now_ms: Timestamp) -> Result<Critique, StoreError> {
+        self.critique_where(result, now_ms, |_| true)
+    }
+
+    /// Grant-aware [`critique`](Self::critique) (PBA-L6b-001 follow-up): an
+    /// adjacent proposal only counts if its far node is in a tenant `can_read`
+    /// admits, so the critic cannot reveal unreadable neighbours.
+    pub fn critique_readable(
+        &self,
+        result: &RecallResult,
+        now_ms: Timestamp,
+        can_read: impl Fn(&str) -> bool,
+    ) -> Result<Critique, StoreError> {
+        self.critique_where(result, now_ms, |far| far.is_some_and(&can_read))
+    }
+
+    fn critique_where(
+        &self,
+        result: &RecallResult,
+        now_ms: Timestamp,
+        visible: impl Fn(Option<&str>) -> bool,
+    ) -> Result<Critique, StoreError> {
         let mut gaps = Vec::new();
 
         // 1. Truncated coverage: the budget hid part of the tenant.
@@ -921,12 +967,22 @@ impl<'a> Recall<'a> {
                 }
                 // 4. Adjacent unconfirmed knowledge: a returned node has a
                 //    quarantined (proposed, advisory) edge the answer didn't show.
-                let has_quarantined = self
+                let mut has_quarantined = false;
+                let adjacent = self
                     .store
                     .out_edges(&i.id)?
                     .into_iter()
-                    .chain(self.store.in_edges(&i.id)?)
-                    .any(|e| e.quarantined);
+                    .map(|e| (e.to, e.quarantined))
+                    .chain(self.store.in_edges(&i.id)?.into_iter().map(|e| (e.from, e.quarantined)));
+                for (far, quarantined) in adjacent {
+                    if quarantined {
+                        let far = self.store.get_node(&far)?;
+                        if visible(far.as_ref().map(|n| n.repo.as_str())) {
+                            has_quarantined = true;
+                            break;
+                        }
+                    }
+                }
                 if has_quarantined {
                     gaps.push(Gap::AdjacentProposal(i.id));
                 }

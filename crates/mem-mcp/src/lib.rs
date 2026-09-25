@@ -495,7 +495,8 @@ impl<'a> MemoryMcpServer<'a> {
             Some(n) if n.repo == repo => {}
             _ => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         }
-        let v = match recall.verify(&id).map_err(store_err)? {
+        // PBA-L6b-001 follow-up: only edges from readable tenants count.
+        let v = match recall.verify_readable(&id, |t| self.can_read(t)).map_err(store_err)? {
             Some(v) => v,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
@@ -553,7 +554,10 @@ impl<'a> MemoryMcpServer<'a> {
             }
             None => Recall::new(self.store).storyline(&repo, budget).map_err(store_err)?,
         };
-        let critique = Recall::new(self.store).critique(&result, now_ms()).map_err(store_err)?;
+        // PBA-L6b-001 follow-up: adjacent proposals only from readable tenants.
+        let critique = Recall::new(self.store)
+            .critique_readable(&result, now_ms(), |t| self.can_read(t))
+            .map_err(store_err)?;
         let mut text = format!("self-critic over '{repo}' (completeness {:.2}):\n", critique.completeness);
         if let Some(age) = critique.watermark_age_ms {
             text.push_str(&format!("  freshness: index is {}ms behind now\n", age));
@@ -2369,5 +2373,33 @@ mod tests {
         let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": empty}));
         assert!(text_of(&r).starts_with("empty diff"));
     }
-}
 
+    /// PBA-L6b-001 follow-up (verifier probe `v_l6b001_mcp_verify_counts_foreign_edges`):
+    /// MCP `memory.verify` / `memory.critique` must not count or flag edges whose
+    /// far end lives in a tenant the session cannot read (existence + edge-kind leak).
+    #[test]
+    fn pba_l6b_001_mcp_verify_and_critique_ignore_unreadable_edges() {
+        let s = store();
+        let nodes = s.all_nodes().unwrap();
+        let chain = nodes.iter().find(|n| n.repo == "citrate-chain").unwrap().clone();
+        let ident = nodes.iter().find(|n| n.repo == "citrate-identity").unwrap().clone();
+        let a = Asserter::new(trust_key());
+        s.add_edge(&a.assert_edge(ident.compute_id(), chain.compute_id(), EdgeKind::Refutes, 2)).unwrap();
+        s.add_edge(&a.propose_edge(ident.compute_id(), chain.compute_id(), EdgeKind::AnalogousTo, EdgeMethod::Nlp, None, 3)).unwrap();
+        let prefix = chain.compute_id().to_hex()[..12].to_string();
+
+        let mut only_chain = MemoryMcpServer::new(&s, grant());
+        let v = text_of(&call_json(&mut only_chain, "memory.verify", json!({"repo":"citrate-chain","id_prefix":prefix})));
+        assert!(v.contains("trustworthy: true"), "PBA-L6b-001: unreadable refutation counted: {v}");
+        assert!(!v.contains("refuted"), "{v}");
+        let c = text_of(&call_json(&mut only_chain, "memory.critique", json!({"repo":"citrate-chain"})));
+        assert!(!c.contains("unconfirmed proposal"), "PBA-L6b-001: unreadable proposal flagged: {c}");
+
+        // A session that reads both tenants still sees both.
+        let mut both = MemoryMcpServer::new(&s, grant_both(false));
+        let v = text_of(&call_json(&mut both, "memory.verify", json!({"repo":"citrate-chain","id_prefix":prefix})));
+        assert!(v.contains("refuted/contradicted by 1 node(s)"), "{v}");
+        let c = text_of(&call_json(&mut both, "memory.critique", json!({"repo":"citrate-chain"})));
+        assert!(c.contains("unconfirmed proposal"), "{c}");
+    }
+}
