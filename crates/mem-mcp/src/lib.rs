@@ -403,7 +403,7 @@ impl<'a> MemoryMcpServer<'a> {
             return Ok(deny);
         }
         let recall = Recall::new(self.store);
-        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
+        let id = match recall.resolve_prefix_in(&repo, &prefix).map_err(store_err)? { // PBA-L6b-017
             Some(id) => id,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
@@ -486,7 +486,7 @@ impl<'a> MemoryMcpServer<'a> {
             return Ok(deny);
         }
         let recall = Recall::new(self.store);
-        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
+        let id = match recall.resolve_prefix_in(&repo, &prefix).map_err(store_err)? { // PBA-L6b-017
             Some(id) => id,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
@@ -591,7 +591,11 @@ impl<'a> MemoryMcpServer<'a> {
     /// (FUA-MEMORIES-01: existence must not leak).
     fn resolve_readable(&self, prefix: &str) -> Result<Option<(mem_core::ContentHash, MemoryNode)>, (i64, String)> {
         let recall = Recall::new(self.store);
-        let Some(id) = recall.resolve_prefix(prefix).map_err(store_err)? else {
+        // PBA-L6b-017: only readable tenants participate in matching/ambiguity.
+        let Some(id) = recall
+            .resolve_prefix_where(prefix, |n| self.can_read(&n.repo))
+            .map_err(store_err)?
+        else {
             return Ok(None);
         };
         match self.store.get_node(&id).map_err(store_err)? {
@@ -610,7 +614,7 @@ impl<'a> MemoryMcpServer<'a> {
             return Ok(deny);
         }
         let recall = Recall::new(self.store);
-        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
+        let id = match recall.resolve_prefix_in(&repo, &prefix).map_err(store_err)? { // PBA-L6b-017
             Some(id) => id,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
@@ -2233,5 +2237,35 @@ mod tests {
             }
         });
         assert_eq!(s.node_count().unwrap(), before + 2, "both sessions' assertions landed");
+    }
+
+    /// PBA-L6b-017 over MCP: an own-tenant prefix that collides with a node in a
+    /// tenant the session cannot read resolves the same whether or not that
+    /// foreign node exists (no existence oracle).
+    #[test]
+    fn pba_l6b_017_mcp_prefix_is_not_a_cross_tenant_oracle() {
+        let own = node("citrate-chain", "own chain note");
+        let own_hex = own.compute_id().to_hex();
+        let mut i = 0;
+        let foreign = loop {
+            let n = node("citrate-identity", &format!("foreign identity note {i}"));
+            if n.compute_id().to_hex()[..3] == own_hex[..3] {
+                break n;
+            }
+            i += 1;
+        };
+        let prefix = &own_hex[..3];
+        for with_foreign in [false, true] {
+            let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+            s.put_node(&own).unwrap();
+            if with_foreign {
+                s.put_node(&foreign).unwrap();
+            }
+            for tool in ["memory.verify", "memory.neighbors", "memory.analogy"] {
+                let mut srv = MemoryMcpServer::new(&s, grant());
+                let r = call_json(&mut srv, tool, json!({"repo": "citrate-chain", "id_prefix": prefix}));
+                assert_eq!(r["isError"], false, "PBA-L6b-017: {tool} differs by foreign existence ({with_foreign})");
+            }
+        }
     }
 }

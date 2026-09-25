@@ -300,8 +300,11 @@ fn resolve_in_tenant(
     repo: &str,
     prefix: &str,
 ) -> Result<(mem_core::ContentHash, MemoryNode), ApiError> {
+    // PBA-L6b-017: resolve among THIS tenant's nodes only, so a foreign node
+    // sharing the prefix can neither match nor make it ambiguous (a 404-vs-200
+    // existence oracle). The repo re-check below stays as defence in depth.
     let id = rc
-        .resolve_prefix(prefix)
+        .resolve_prefix_in(repo, prefix)
         .map_err(ise)?
         .ok_or_else(|| not_found("node id prefix did not resolve"))?;
     match store.get_node(&id).map_err(ise)? {

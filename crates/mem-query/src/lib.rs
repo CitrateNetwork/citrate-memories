@@ -739,9 +739,34 @@ impl<'a> Recall<'a> {
 
     /// Resolve a (possibly short) hex id prefix to a full node id. Returns `None`
     /// if zero or more than one node matches (ambiguous).
+    ///
+    /// **Tenant-blind** — trusted/internal callers only. A caller-facing surface
+    /// must use [`resolve_prefix_in`](Self::resolve_prefix_in) /
+    /// [`resolve_prefix_where`](Self::resolve_prefix_where): ambiguity computed
+    /// across all tenants is a cross-tenant existence oracle (PBA-L6b-017).
     pub fn resolve_prefix(&self, prefix: &str) -> Result<Option<ContentHash>, StoreError> {
+        self.resolve_prefix_where(prefix, |_| true)
+    }
+
+    /// Resolve a prefix among the nodes of ONE tenant (PBA-L6b-017). Nodes in
+    /// other tenants neither match nor make the prefix ambiguous, so the answer
+    /// is independent of what exists in tenants the caller cannot read.
+    pub fn resolve_prefix_in(&self, repo: &str, prefix: &str) -> Result<Option<ContentHash>, StoreError> {
+        self.resolve_prefix_where(prefix, |n| n.repo == repo)
+    }
+
+    /// Resolve a prefix among the nodes `visible` admits (e.g. the tenants a
+    /// grant can read). `None` if zero or more than one VISIBLE node matches.
+    pub fn resolve_prefix_where(
+        &self,
+        prefix: &str,
+        visible: impl Fn(&MemoryNode) -> bool,
+    ) -> Result<Option<ContentHash>, StoreError> {
         let mut found: Option<ContentHash> = None;
         for n in self.store.all_nodes()? {
+            if !visible(&n) {
+                continue;
+            }
             let id = n.compute_id();
             if id.to_hex().starts_with(prefix) {
                 if found.is_some() {
@@ -1546,6 +1571,44 @@ mod tests {
         let out = Recall::new(&s).neighbors_readable(&a.compute_id(), 10, |_| false).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].node.is_none());
+    }
+
+    /// PBA-L6b-017: tenant-scoped prefix resolution ignores other tenants for
+    /// both matching and ambiguity; the blind variant still sees everything.
+    #[test]
+    fn resolve_prefix_in_is_tenant_scoped() {
+        // Find two nodes in different tenants sharing a 1-hex-char id prefix.
+        let a = node("a", "tenant a note", 1);
+        let a_hex = a.compute_id().to_hex();
+        let mut i = 0;
+        let b = loop {
+            let n = node("b", &format!("tenant b note {i}"), 1);
+            if n.compute_id().to_hex()[..1] == a_hex[..1] {
+                break n;
+            }
+            i += 1;
+        };
+        let p = &a_hex[..1];
+        let s = store_with(&[a.clone(), b.clone()]);
+        let r = Recall::new(&s);
+        assert_eq!(r.resolve_prefix(p).unwrap(), None, "blind: ambiguous across tenants");
+        assert_eq!(r.resolve_prefix_in("a", p).unwrap(), Some(a.compute_id()));
+        assert_eq!(r.resolve_prefix_in("b", p).unwrap(), Some(b.compute_id()));
+        assert_eq!(r.resolve_prefix_in("c", p).unwrap(), None, "no match in an empty tenant");
+        assert_eq!(r.resolve_prefix_where(p, |n| n.repo != "b").unwrap(), Some(a.compute_id()));
+        assert_eq!(r.resolve_prefix_where(p, |_| false).unwrap(), None);
+        // Same-tenant ambiguity is still ambiguity.
+        let mut j = 0;
+        let a2 = loop {
+            let n = node("a", &format!("second a note {j}"), 1);
+            if n.compute_id().to_hex()[..1] == a_hex[..1] {
+                break n;
+            }
+            j += 1;
+        };
+        let s2 = store_with(&[a.clone(), a2, b]);
+        assert_eq!(Recall::new(&s2).resolve_prefix_in("a", p).unwrap(), None);
+        assert_eq!(Recall::new(&s2).resolve_prefix_in("a", &a_hex).unwrap(), Some(a.compute_id()), "full id is unique");
     }
 
     #[test]

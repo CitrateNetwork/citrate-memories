@@ -313,3 +313,63 @@ async fn pba_l6b_002_byom_identical_remerge_still_succeeds() {
     assert!(app.store.get_node(&fresh.compute_id()).unwrap().is_some(), "the new node landed");
 }
 
+
+// ---------------------------------------------------------------------------
+// PBA-L6b-017 — prefix resolution must not be a cross-tenant existence oracle
+// ---------------------------------------------------------------------------
+
+/// PBA-L6b-017 (inverted PoC `l6b_prefix_ambiguity_is_cross_tenant_existence_oracle`):
+/// Mallory grinds an own-tenant node sharing a 4-hex prefix with a guessed id in a
+/// tenant she cannot read. With tenant-scoped resolution the response is the SAME
+/// (200, her node) whether or not the foreign target exists.
+#[tokio::test]
+async fn pba_l6b_017_prefix_resolution_is_not_a_cross_tenant_oracle() {
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let owner = Asserter::for_principal(&gw, "owner");
+    let target = owner.assert_node("tenant-b", NodeKind::Rationale, "we are laying off the infra team", 1);
+    let target_hex = target.compute_id().to_hex();
+    let mallory = Asserter::for_principal(&gw, "mallory");
+    let mut i = 0u64;
+    let own = loop {
+        let n = mallory.assert_node("tenant-a", NodeKind::Rationale, &format!("note {i}"), 1);
+        if n.compute_id().to_hex()[..4] == target_hex[..4] {
+            break n;
+        }
+        i += 1;
+    };
+    let own_hex = own.compute_id().to_hex();
+    let prefix = own_hex[..4].to_string();
+
+    let probe = |with_target: bool| {
+        let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        store.put_node(&own).unwrap();
+        if with_target {
+            store.put_node(&target).unwrap();
+        }
+        app_with(store, vec![member("mallory", &["tenant-a"], false)], None)
+    };
+    for with_target in [false, true] {
+        let v = verify(State(probe(with_target)), Path(ORG.into()), q(&[("repo", "tenant-a"), ("id", &prefix)]), dev("mallory")).await;
+        match v {
+            Ok(j) => assert_eq!(j.0["id"], own_hex.as_str(), "resolves to her own node (target present={with_target})"),
+            Err(e) => panic!("PBA-L6b-017: response differs by foreign existence (present={with_target}) -> {}", e.status),
+        }
+        let n = neighbors(State(probe(with_target)), Path(ORG.into()), q(&[("repo", "tenant-a"), ("id", &prefix)]), dev("mallory")).await;
+        assert!(n.is_ok(), "PBA-L6b-017: /neighbors differs by foreign existence (present={with_target})");
+    }
+}
+
+/// PBA-L6b-017 class tripwire: caller-facing surfaces never use the tenant-blind
+/// `Recall::resolve_prefix` (ambiguity across tenants = existence oracle).
+#[test]
+fn pba_l6b_017_tripwire_no_tenant_blind_prefix_resolution_on_caller_surfaces() {
+    let needle = concat!(".resolve_", "prefix(");
+    for (name, src) in [
+        ("mem-gateway/src/http.rs", include_str!("http.rs")),
+        ("mem-mcp/src/lib.rs", include_str!("../../mem-mcp/src/lib.rs")),
+    ] {
+        let hits: Vec<(usize, &str)> =
+            src.lines().enumerate().filter(|(_, l)| l.contains(needle)).map(|(i, l)| (i + 1, l.trim())).collect();
+        assert!(hits.is_empty(), "PBA-L6b-017: {name} uses tenant-blind resolve_prefix: {hits:?}");
+    }
+}
