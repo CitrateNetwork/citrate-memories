@@ -1265,8 +1265,21 @@ mod tests {
         let own = bob.propose_edge(victim.compute_id(), victim.compute_id(), EdgeKind::References, EdgeMethod::Nlp, None, 1);
         let mut d2 = MemoryDiff::new("x", 1);
         d2.add_edge(own.clone());
-        apply_diff(&store2, &d2, None).unwrap();
+        apply_diff(&store2, &d2, Some(bob.pubkey_hex())).unwrap();
         assert_eq!(store2.get_meta(&inserted_by_key(&own)).unwrap(), None, "only Supersedes proposals are recorded");
     }
-}
 
+    /// GHSA-p545: the inserter key is per edge (prefix + the edge's identity key).
+    #[test]
+    fn ghsa_p545_inserted_by_key_is_per_edge() {
+        let a = asserter(55);
+        let n1 = a.assert_node("r", NodeKind::Rationale, "n1", 1);
+        let n2 = a.assert_node("r", NodeKind::Rationale, "n2", 1);
+        let e1 = a.propose_edge(n1.compute_id(), n2.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, 1);
+        let e2 = a.propose_edge(n2.compute_id(), n1.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, 1);
+        let k1 = inserted_by_key(&e1);
+        assert!(k1.starts_with(b"edge-inserted-by:") && k1.ends_with(&e1.key()));
+        assert_eq!(k1.len(), b"edge-inserted-by:".len() + e1.key().len());
+        assert_ne!(k1, inserted_by_key(&e2));
+    }
+}

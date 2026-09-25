@@ -2548,4 +2548,23 @@ mod tests {
         assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&v3))["isError"], true);
         assert_eq!(call_json(&mut as_carol, "memory.confirm_edge", args(&v3))["isError"], false);
     }
+
+    /// Mutation-hardening (propose_edge MEM-B-009 guard): re-proposing an existing
+    /// PROPOSAL is allowed, and a load-bearing edge to a DIFFERENT target does not
+    /// block a new proposal.
+    #[test]
+    fn propose_edge_existing_guard_matches_load_bearing_same_key_only() {
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let a = Asserter::new(SigningKey::from_bytes(&[35u8; 32]));
+        let x = s.put_node(&a.assert_node("citrate-chain", NodeKind::Rationale, "x", 1)).unwrap();
+        let y = s.put_node(&a.assert_node("citrate-chain", NodeKind::Rationale, "y", 1)).unwrap();
+        let z = s.put_node(&a.assert_node("citrate-chain", NodeKind::Rationale, "z", 1)).unwrap();
+        s.add_edge(&a.assert_edge(x, z, EdgeKind::References, 1)).unwrap();
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), a.clone());
+        let args = json!({"from_prefix": x.to_hex()[..16], "to_prefix": y.to_hex()[..16], "kind": "references"});
+        assert!(text_of(&call_json(&mut srv, "memory.propose_edge", args.clone())).starts_with("proposed"), "other target's load-bearing edge does not block");
+        assert!(text_of(&call_json(&mut srv, "memory.propose_edge", args)).starts_with("proposed"), "re-proposing a proposal is allowed");
+        let r = call_json(&mut srv, "memory.propose_edge", json!({"from_prefix": x.to_hex()[..16], "to_prefix": z.to_hex()[..16], "kind": "references"}));
+        assert!(text_of(&r).contains("already exists"), "same-key load-bearing edge is left intact");
+    }
 }
