@@ -152,7 +152,7 @@ Browser (OIDC RP) ──auth'd HTTP/JSON + SSE──▶ mem-gateway (Rust/axum) 
    Next.js app                                  • Org-resolve → CapabilityGrant
    • constellation (2.5D canvas)                • read API (recall/search/as_of/node/
    • Ask (AI SDK RAG)                             verify/neighbors/analogy/layout)
-   • HITL review / inspect                      • WRITE API (assert/propose/confirm/    ← BUILD (§3)
+   • HIC review / inspect                       • WRITE API (assert/propose/confirm/    ← BUILD (§3)
    • admin / audit / connect                      merge_diff)  [today: MCP-only]
                                                 • SSE deltas + audit tail              ← BUILD
                                                 • MCP-over-HTTP (BYOM)                  ← BUILD (M2)
@@ -424,7 +424,7 @@ them.**
   heads-up, freshness banner.
 - **WP-7.7 (G-1,G-5,G-6)** Gateway **write routes** (assert, propose, confirm) bound to
   OIDC `sub` (F-5); audit-tail SSE. Red-test-first per row.
-- **WP-7.8** HITL Review Center (proposals/contradictions/supersession/critic) + Add-a-
+- **WP-7.8** HIC Review Center (proposals/contradictions/supersession/critic) + Add-a-
   memory + time-scrubber as_of + audit toast with seq#.
 - **K1** crypto **C1**: QSSP DEK-wrap.
 
@@ -464,7 +464,7 @@ them.**
 - Gateway-blindness tier for C2 (Tier-E default vs Tier-Z opt-in per repo).
 - DEK custody for K1 QSSP wrap: HSM / cloud KMS / software keyring.
 - ControlPlane durable backend: RocksDB (engine-local) vs Postgres/Neon (SaaS-native).
-- Whether `Operator` members may self-confirm proposals or always HITL-to-admin.
+- Whether `Operator` members may self-confirm proposals or always HIC-to-admin.
 
 ## 9. Traceability
 - 1:1 design contract → `webapp/design-prototype/UI_IMPLEMENTATION_SPEC.md` (+ source).

@@ -1,7 +1,7 @@
 import { withCaller } from "@/lib/gateway/bff";
 import { gateway } from "@/lib/gateway/client";
 
-/** Promote a quarantined proposal to load-bearing (HITL confirm). */
+/** Promote a quarantined proposal to load-bearing (HIC confirm). */
 export function POST(
   req: Request,
   { params }: { params: Promise<{ org: string }> },

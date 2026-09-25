@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "BUSL-1.1",
-  "description": "Memrizz — the citrate-memories webapp: a 2.5D memory constellation with grounded RAG and human-in-the-loop stewardship.",
+  "description": "Memrizz — the citrate-memories webapp: a 2.5D memory constellation with grounded RAG and HIC (Human In Control) stewardship.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",

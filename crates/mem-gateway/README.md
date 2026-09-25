@@ -83,8 +83,8 @@ GET  /api/orgs/:org/nodes/:id/neighbors?budget=
 GET  /api/orgs/:org/analogy?id=&budget=
 POST /api/orgs/:org/tenants/:tenant/assert      # signed assertion        (write)
 POST /api/orgs/:org/edges/propose               # quarantined proposal    (write)
-POST /api/orgs/:org/edges/confirm               # HITL promote            (admin)
-GET  /api/orgs/:org/review                       # HITL queues (proposals/contradictions/...)
+POST /api/orgs/:org/edges/confirm               # HIC promote             (admin)
+GET  /api/orgs/:org/review                       # HIC queues  (proposals/contradictions/...)
 GET  /api/orgs/:org/layout                       # cached 3D positions (UMAP/PCA) for the constellation
 GET  /api/orgs/:org/audit                        # hash-chained audit (integrity-verified)
 GET  /api/orgs/:org/stream                        # SSE: graph deltas + audit tail + notifications
