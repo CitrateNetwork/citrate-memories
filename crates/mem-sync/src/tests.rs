@@ -4,7 +4,8 @@ use ed25519_dalek::SigningKey;
 use mem_assert::Asserter;
 use mem_authz::{CapabilityGrant, PolicyProfile, ResourceScope};
 use mem_core::{
-    BelnapValue, EdgeMethod, EdgeProvenance, NodeKind, SourceRef, TrustTier, SCHEMA_VERSION,
+    BelnapValue, CodeAnchor, EdgeMethod, EdgeProvenance, NodeKind, SourceRef, Status, TrustTier,
+    VersionedVector, SCHEMA_VERSION,
 };
 use mem_store::kv::InMemoryKv;
 

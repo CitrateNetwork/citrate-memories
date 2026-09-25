@@ -192,3 +192,124 @@ fn pba_l6b_001_tripwire_no_tenant_blind_neighbors_on_caller_surfaces() {
         "PBA-L6b-001: /verify must hold the caller's grant and filter neighbours through readable_neighbors"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PBA-L6b-002 — BYOM merge_diff must not overwrite another principal's node
+// ---------------------------------------------------------------------------
+
+use mem_core::{BelnapValue, Status, VersionedVector};
+
+fn byom_headers(secret: &str, sub: &str, scope: &str) -> HeaderMap {
+    let now_s = (now_ms() / 1000) as usize;
+    let tok = mint_connect_token(secret, sub, Some(scope), &[], now_s, 900).unwrap();
+    let mut h = HeaderMap::new();
+    h.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {tok}")).unwrap());
+    h
+}
+
+async fn byom_call(app: &AppState, sub: &str, h: HeaderMap, rpc: Value) -> String {
+    let resp = match byom(State(app.clone()), Path(sub.into()), h, rpc.to_string()).await {
+        Ok(r) => r,
+        Err(e) => panic!("byom returned HTTP {}", e.status),
+    };
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn merge_rpc(diff: &mem_assert::MemoryDiff) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"memory.merge_diff","arguments":{"diff": diff.to_json().unwrap()}}})
+}
+
+/// PBA-L6b-002 (inverted PoC `l6b_byom_merge_diff_overwrites_victims_signed_node`):
+/// Mallory (Member write on tenant-a, connect token `read,propose`) re-submits
+/// Bob's signed ADR with the unsigned advisory fields rewritten. The merge must be
+/// refused and Bob's stored node must be byte-for-byte unchanged.
+#[tokio::test]
+async fn pba_l6b_002_byom_merge_diff_cannot_overwrite_victims_signed_node() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let victim = bob.assert_node_with(
+        "tenant-a",
+        NodeKind::Adr,
+        "ADR: we will require 2-of-3 approvals for treasury moves",
+        1_000,
+        1_000,
+        Some(VersionedVector { model: "hash".into(), data: vec![0.5; 4] }),
+    );
+    let vid = store.put_node(&victim).unwrap();
+    let before = store.get_node(&vid).unwrap().unwrap();
+
+    let secret = "connect-secret";
+    let app = app_with(
+        store,
+        vec![member("bob", &["tenant-a"], true), member("mallory", &["tenant-a"], true)],
+        Some(secret),
+    );
+
+    let mut forged = victim.clone();
+    forged.status = Status::Archived;
+    forged.valid_to = Some(1);
+    forged.valid_from = 0;
+    forged.confidence = vec![BelnapValue::False];
+    forged.embedding = Some(VersionedVector { model: "hash".into(), data: vec![0.0; 4] });
+    let diff = mem_assert::MemoryDiff { author: "bob".into(), created_at_ms: 1, nodes: vec![forged], edges: vec![] };
+    let body = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), merge_rpc(&diff)).await;
+
+    assert!(body.contains("\"isError\":true"), "PBA-L6b-002: the overwrite must be refused, got {body}");
+    let after = app.store.get_node(&vid).unwrap().unwrap();
+    assert_eq!(after, before, "PBA-L6b-002: mallory rewrote bob's signed node");
+    assert_eq!(after.status, Status::Active);
+    assert_eq!(after.valid_to, None);
+}
+
+/// PBA-L6b-002 edge half: a quarantined proposal may not be laundered into a
+/// load-bearing edge by re-submitting it with `quarantined=false` in a diff (the
+/// edge signature covers only from‖to‖kind). Promotion goes through
+/// `memory.confirm_edge`, never a diff.
+#[tokio::test]
+async fn pba_l6b_002_byom_merge_diff_cannot_launder_quarantined_edge() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let a = bob.assert_node("tenant-a", NodeKind::Rationale, "old claim", 1);
+    let b = bob.assert_node("tenant-a", NodeKind::Rationale, "new claim", 2);
+    let a_id = store.put_node(&a).unwrap();
+    let b_id = store.put_node(&b).unwrap();
+    let proposal = bob.propose_edge(b_id, a_id, EdgeKind::AnalogousTo, mem_core::EdgeMethod::Nlp, None, 3);
+    assert!(proposal.quarantined);
+    store.add_edge(&proposal).unwrap();
+
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("mallory", &["tenant-a"], true)], Some(secret));
+    let mut laundered = proposal.clone();
+    laundered.quarantined = false;
+    let diff = mem_assert::MemoryDiff { author: "bob".into(), created_at_ms: 1, nodes: vec![], edges: vec![laundered] };
+    let body = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), merge_rpc(&diff)).await;
+
+    assert!(body.contains("\"isError\":true"), "PBA-L6b-002: quarantine laundering must be refused, got {body}");
+    let stored = app.store.out_edges(&b_id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].quarantined, "PBA-L6b-002: the proposal was promoted by a diff");
+}
+
+/// PBA-L6b-002 no-regression: re-merging an IDENTICAL copy of another principal's
+/// node (the normal "git for agents" handoff/idempotent re-merge) still succeeds.
+#[tokio::test]
+async fn pba_l6b_002_byom_identical_remerge_still_succeeds() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let n = bob.assert_node("tenant-a", NodeKind::Rationale, "bob's handoff note", 1);
+    store.put_node(&n).unwrap();
+    let fresh = bob.assert_node("tenant-a", NodeKind::Rationale, "bob's second note", 2);
+
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("mallory", &["tenant-a"], true)], Some(secret));
+    let diff = mem_assert::MemoryDiff { author: "bob".into(), created_at_ms: 1, nodes: vec![n, fresh.clone()], edges: vec![] };
+    let body = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), merge_rpc(&diff)).await;
+    assert!(body.contains("\"isError\":false"), "an identical re-merge + new node must be accepted, got {body}");
+    assert!(app.store.get_node(&fresh.compute_id()).unwrap().is_some(), "the new node landed");
+}
+

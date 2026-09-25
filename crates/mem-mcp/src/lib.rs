@@ -897,7 +897,10 @@ impl<'a> MemoryMcpServer<'a> {
             Ok(guard) => guard,
             Err(deny) => return Ok(deny),
         };
-        match apply_diff(self.store, &diff) {
+        // PBA-L6b-002: the merging principal's author identity, so an existing
+        // node/edge can only be changed by its own author (never LWW-overwritten).
+        let caller = self.asserter.as_ref().map(|a| a.pubkey_hex().to_string());
+        match apply_diff(self.store, &diff, caller.as_deref()) {
             Ok(report) => Ok(tool_text(format!("merged {} nodes, {} edges", report.nodes, report.edges))),
             Err(e) => Ok(tool_error(format!("merge rejected: {e}"))),
         }

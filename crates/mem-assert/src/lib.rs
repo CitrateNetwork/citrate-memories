@@ -18,6 +18,8 @@ use mem_core::{
 };
 use mem_store::{MemoryDagStore, StoreError, SupersessionError};
 
+pub mod join;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AssertError {
     #[error("assertion is unsigned")]
@@ -37,6 +39,18 @@ pub enum AssertError {
     /// DerivedDeterministic / HumanConfirmed tiers).
     #[error("not assertable: {0}")]
     NotAssertable(String),
+    /// PBA-L6b-002: a diff would change the stored state of an existing node or
+    /// edge that the merging principal did not author. Signatures cover only the
+    /// content id (node) or `from‖to‖kind` (edge), so a non-author could otherwise
+    /// rewrite status / valid_to / confidence / embedding / provenance while the
+    /// item stays attributed to — and verifying as — the original author.
+    #[error("not the author of existing {0}; refusing to change another principal's signed state")]
+    NotAuthor(String),
+    /// PBA-L6b-002: a diff tried to promote a stored quarantined proposal to a
+    /// load-bearing edge. The quarantine flag is not signed; promotion goes
+    /// through `confirm_edge`, never a diff.
+    #[error("diff may not promote quarantined edge {0}; use confirm_edge")]
+    EdgePromotion(String),
 }
 
 /// A signing identity for assertions. The author is the hex of the ed25519
@@ -326,7 +340,29 @@ pub struct MergeReport {
 }
 
 /// Verify, then append a diff to a store. Rejected wholesale if any signature
-/// fails (no partial poison). Append-only + content-addressed → idempotent.
+/// fails (no partial poison). Content-addressed → idempotent.
+///
+/// `caller` is the author identity (ed25519 pubkey hex, i.e. the value an
+/// [`Asserter`] writes into `author` / `provenance.asserter`) of the principal
+/// performing the merge, or `None` for a caller with no signing identity.
+///
+/// **Existing ids are never overwritten last-writer-wins (PBA-L6b-002).** The
+/// signature over a node covers only its content id, and over an edge only
+/// `from‖to‖kind`, so the advisory fields (status, valid_to, confidence,
+/// embedding, trust tier, anchors; edge quarantine / provenance) are unsigned.
+/// For an id already in the store:
+///   * a node is folded with the monotone CRDT join ([`join::merge_node`], the
+///     same rule federation sync uses). If the join changes nothing (identical or
+///     stale copy) it is a no-op; if it WOULD change the stored node, the caller
+///     must be the node's author, else the whole diff is refused
+///     ([`AssertError::NotAuthor`]). An author can therefore retire their own
+///     claim but never resurrect a superseded one.
+///   * an edge may never be promoted from quarantined to load-bearing by a diff
+///     ([`AssertError::EdgePromotion`]; use `confirm_edge`), and any other change
+///     to a stored edge requires the caller to be its asserter. A quarantined
+///     copy over a confirmed edge stays a no-op (MEM-B-009).
+///
+/// All checks run before any write, so a refused diff writes nothing.
 ///
 /// Non-quarantined `Supersedes` edges are *applied*, not just stored (WP-1.4):
 /// each one atomically writes the edge and transitions its target, guarded by
@@ -337,14 +373,52 @@ pub struct MergeReport {
 pub fn apply_diff(
     store: &MemoryDagStore<MemoryNode>,
     diff: &MemoryDiff,
+    caller: Option<&str>,
 ) -> Result<MergeReport, AssertError> {
     diff.verify()?;
+    let is_caller = |who: &str| caller == Some(who);
+
+    // ---- nodes: new ids land as-is; existing ids take the monotone join ----
+    let mut to_write: Vec<MemoryNode> = Vec::with_capacity(diff.nodes.len());
+    for n in &diff.nodes {
+        let id = n.compute_id();
+        match store.get_node(&id)? {
+            None => to_write.push(n.clone()),
+            Some(stored) => {
+                let (joined, changed, _) = join::merge_node(&stored, n);
+                if !changed {
+                    continue; // identical or stale copy — nothing to do
+                }
+                if !is_caller(&stored.author) {
+                    return Err(AssertError::NotAuthor(format!("node {}", &id.to_hex()[..12])));
+                }
+                to_write.push(joined);
+            }
+        }
+    }
+
+    // ---- edges: no promotion by diff; changes only by the asserter ----
+    for e in &diff.edges {
+        let stored = store.out_edges(&e.from)?.into_iter().find(|x| x.to == e.to && x.kind == e.kind);
+        let Some(stored) = stored else { continue };
+        let label = || format!("edge {}->{} {:?}", &e.from.to_hex()[..10], &e.to.to_hex()[..10], e.kind);
+        if stored.quarantined && !e.quarantined {
+            return Err(AssertError::EdgePromotion(label()));
+        }
+        if e.quarantined && !stored.quarantined {
+            continue; // MEM-B-009: the store no-ops a demoting write
+        }
+        if stored != *e && !is_caller(&stored.provenance.asserter) {
+            return Err(AssertError::NotAuthor(label()));
+        }
+    }
+
     let (supersessions, plain): (Vec<&Edge>, Vec<&Edge>) = diff
         .edges
         .iter()
         .partition(|e| e.kind == EdgeKind::Supersedes && !e.quarantined);
     let plain: Vec<Edge> = plain.into_iter().cloned().collect();
-    store.commit(&diff.nodes, &plain)?;
+    store.commit(&to_write, &plain)?;
     let mut superseded = 0;
     for e in supersessions {
         if store.apply_supersession(e)?.transitioned {
@@ -462,13 +536,13 @@ mod tests {
 
         // merge into a fresh store
         let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
-        let report = apply_diff(&store, &restored).unwrap();
+        let report = apply_diff(&store, &restored, None).unwrap();
         assert_eq!(report.nodes, 2);
         assert_eq!(report.edges, 1);
         assert_eq!(store.node_count().unwrap(), 2);
 
         // idempotent re-merge
-        apply_diff(&store, &restored).unwrap();
+        apply_diff(&store, &restored, None).unwrap();
         assert_eq!(store.node_count().unwrap(), 2);
     }
 
@@ -501,7 +575,7 @@ mod tests {
         let old_id = old.compute_id();
         let mut d1 = MemoryDiff::new(a.pubkey_hex(), 1);
         d1.add_node(old);
-        apply_diff(&store, &d1).unwrap();
+        apply_diff(&store, &d1, None).unwrap();
 
         // Session 2 supersedes it.
         let new = a.assert_node("r", NodeKind::Rationale, "X was wrong; it is Z", 2);
@@ -509,7 +583,7 @@ mod tests {
         let mut d2 = MemoryDiff::new(a.pubkey_hex(), 2);
         d2.add_node(new);
         d2.add_edge(e);
-        let report = apply_diff(&store, &d2).unwrap();
+        let report = apply_diff(&store, &d2, None).unwrap();
         assert_eq!(report.superseded, 1);
 
         let old_now = store.get_node(&old_id).unwrap().unwrap();
@@ -517,7 +591,7 @@ mod tests {
         assert_eq!(old_now.valid_to, Some(2));
 
         // Idempotent re-merge: no second transition.
-        assert_eq!(apply_diff(&store, &d2).unwrap().superseded, 0);
+        assert_eq!(apply_diff(&store, &d2, None).unwrap().superseded, 0);
     }
 
     #[test]
@@ -534,7 +608,7 @@ mod tests {
         diff.add_edge(e12);
         diff.add_edge(e21);
 
-        let err = apply_diff(&store, &diff).unwrap_err();
+        let err = apply_diff(&store, &diff, None).unwrap_err();
         assert!(matches!(err, AssertError::Supersession(SupersessionError::Cycle)));
         // The first supersession applied; the cycle-closing one is rejected forever
         // — Acyclic holds.
@@ -550,7 +624,176 @@ mod tests {
         diff.add_node(n);
 
         let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
-        assert!(apply_diff(&store, &diff).is_err());
+        assert!(apply_diff(&store, &diff, None).is_err());
         assert_eq!(store.node_count().unwrap(), 0, "no partial application of a forged diff");
+    }
+
+    // ---- PBA-L6b-002: existing ids are joined monotonically, author-gated ----
+
+    fn stored_with(n: &MemoryNode) -> MemoryDagStore<MemoryNode> {
+        let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        store.put_node(n).unwrap();
+        store
+    }
+
+    /// A non-author cannot change ANY unsigned advisory field of another
+    /// principal's stored node; the diff is refused and nothing is written.
+    #[test]
+    fn pba_l6b_002_non_author_cannot_change_existing_node() {
+        let bob = asserter(10);
+        let mallory = asserter(11);
+        let victim = bob.assert_node("r", NodeKind::Adr, "bob's ADR", 5);
+        let tweaks: Vec<Box<dyn Fn(&mut MemoryNode)>> = vec![
+            Box::new(|n| n.status = Status::Archived),
+            Box::new(|n| n.confidence = vec![BelnapValue::False]),
+            Box::new(|n| n.valid_to = Some(1)),
+            Box::new(|n| n.embedding = Some(mem_core::VersionedVector { model: "m".into(), data: vec![0.0] })),
+            Box::new(|n| n.trust_tier = TrustTier::InferredAdvisory),
+        ];
+        for (i, tweak) in tweaks.iter().enumerate() {
+            let store = stored_with(&victim);
+            let mut forged = victim.clone();
+            tweak(&mut forged);
+            let fresh = mallory.assert_node("r", NodeKind::Rationale, &format!("mallory's own note {i}"), 6);
+            let mut diff = MemoryDiff::new(mallory.pubkey_hex(), 6);
+            diff.add_node(fresh.clone());
+            diff.add_node(forged);
+            let err = apply_diff(&store, &diff, Some(mallory.pubkey_hex())).unwrap_err();
+            assert!(matches!(err, AssertError::NotAuthor(_)), "tweak {i}: got {err:?}");
+            assert_eq!(store.get_node(&victim.compute_id()).unwrap().unwrap(), victim, "tweak {i}: victim unchanged");
+            assert!(store.get_node(&fresh.compute_id()).unwrap().is_none(), "tweak {i}: refused diff writes nothing");
+            // No signing identity at all is not the author either.
+            assert!(matches!(apply_diff(&store, &diff, None), Err(AssertError::NotAuthor(_))));
+        }
+    }
+
+    /// The author may retire their own claim (monotone), and the stored node is
+    /// the JOIN — a later stale copy cannot resurrect it (no LWW, even for the author).
+    #[test]
+    fn pba_l6b_002_author_update_is_a_monotone_join() {
+        let bob = asserter(12);
+        let n = bob.assert_node("r", NodeKind::Adr, "bob's ADR", 5);
+        let store = stored_with(&n);
+        let mut retired = n.clone();
+        retired.status = Status::Archived;
+        retired.valid_to = Some(9);
+        let mut d = MemoryDiff::new(bob.pubkey_hex(), 9);
+        d.add_node(retired);
+        apply_diff(&store, &d, Some(bob.pubkey_hex())).unwrap();
+        let now = store.get_node(&n.compute_id()).unwrap().unwrap();
+        assert_eq!(now.status, Status::Archived);
+        assert_eq!(now.valid_to, Some(9));
+
+        // Author re-submits the original Active copy: the join keeps Archived.
+        let mut stale = MemoryDiff::new(bob.pubkey_hex(), 10);
+        stale.add_node(n.clone());
+        apply_diff(&store, &stale, Some(bob.pubkey_hex())).unwrap();
+        assert_eq!(store.get_node(&n.compute_id()).unwrap().unwrap().status, Status::Archived, "no resurrection");
+        // …and so is a NON-author's stale copy: a no-op, not an error.
+        apply_diff(&store, &stale, Some(asserter(13).pubkey_hex())).unwrap();
+        assert_eq!(store.get_node(&n.compute_id()).unwrap().unwrap().status, Status::Archived);
+    }
+
+    /// Identical re-merge by anyone is a no-op success (the handoff flow).
+    #[test]
+    fn pba_l6b_002_identical_remerge_by_non_author_is_ok() {
+        let bob = asserter(14);
+        let n = bob.assert_node("r", NodeKind::Rationale, "handoff", 1);
+        let store = stored_with(&n);
+        let mut d = MemoryDiff::new(bob.pubkey_hex(), 1);
+        d.add_node(n.clone());
+        assert!(apply_diff(&store, &d, Some(asserter(15).pubkey_hex())).is_ok());
+        assert!(apply_diff(&store, &d, None).is_ok());
+        assert_eq!(store.get_node(&n.compute_id()).unwrap().unwrap(), n);
+    }
+
+    /// Edge quarantine is unsigned: a diff can never promote a stored proposal —
+    /// not even one re-submitted by its own asserter (confirm_edge is the path).
+    #[test]
+    fn pba_l6b_002_diff_cannot_promote_quarantined_edge() {
+        let bob = asserter(16);
+        let a = bob.assert_node("r", NodeKind::Rationale, "a", 1);
+        let b = bob.assert_node("r", NodeKind::Rationale, "b", 1);
+        let store = stored_with(&a);
+        store.put_node(&b).unwrap();
+        let p = bob.propose_edge(a.compute_id(), b.compute_id(), EdgeKind::AnalogousTo, EdgeMethod::Nlp, None, 2);
+        store.add_edge(&p).unwrap();
+        let mut promoted = p.clone();
+        promoted.quarantined = false;
+        let mut d = MemoryDiff::new(bob.pubkey_hex(), 3);
+        d.add_edge(promoted);
+        for who in [Some(bob.pubkey_hex()), Some(asserter(17).pubkey_hex()), None] {
+            assert!(matches!(apply_diff(&store, &d, who), Err(AssertError::EdgePromotion(_))));
+        }
+        assert!(store.out_edges(&a.compute_id()).unwrap()[0].quarantined, "still a proposal");
+
+        // Re-submitting the proposal unchanged is fine for anyone.
+        let mut same = MemoryDiff::new(bob.pubkey_hex(), 3);
+        same.add_edge(p.clone());
+        assert!(apply_diff(&store, &same, Some(asserter(18).pubkey_hex())).is_ok());
+    }
+
+    /// A non-author cannot re-attribute (re-sign / re-provenance) a stored edge;
+    /// its asserter can re-state it.
+    #[test]
+    fn pba_l6b_002_non_asserter_cannot_change_stored_edge() {
+        let bob = asserter(19);
+        let mallory = asserter(20);
+        let a = bob.assert_node("r", NodeKind::Rationale, "a", 1);
+        let b = bob.assert_node("r", NodeKind::Rationale, "b", 1);
+        let store = stored_with(&a);
+        store.put_node(&b).unwrap();
+        let e = bob.assert_edge(a.compute_id(), b.compute_id(), EdgeKind::References, 2);
+        store.add_edge(&e).unwrap();
+        let hers = mallory.assert_edge(a.compute_id(), b.compute_id(), EdgeKind::References, 3);
+        let mut d = MemoryDiff::new(mallory.pubkey_hex(), 3);
+        d.add_edge(hers);
+        assert!(matches!(apply_diff(&store, &d, Some(mallory.pubkey_hex())), Err(AssertError::NotAuthor(_))));
+        assert_eq!(store.out_edges(&a.compute_id()).unwrap()[0], e, "bob's edge intact");
+
+        let restated = bob.assert_edge(a.compute_id(), b.compute_id(), EdgeKind::References, 4);
+        let mut d2 = MemoryDiff::new(bob.pubkey_hex(), 4);
+        d2.add_edge(restated.clone());
+        apply_diff(&store, &d2, Some(bob.pubkey_hex())).unwrap();
+        assert_eq!(store.out_edges(&a.compute_id()).unwrap()[0], restated);
+    }
+
+    /// A quarantined copy over a confirmed edge stays a silent no-op (MEM-B-009),
+    /// not a NotAuthor error — a stale proposal must not fail a handoff.
+    #[test]
+    fn pba_l6b_002_stale_quarantined_copy_over_confirmed_edge_is_noop() {
+        let bob = asserter(21);
+        let a = bob.assert_node("r", NodeKind::Rationale, "a", 1);
+        let b = bob.assert_node("r", NodeKind::Rationale, "b", 1);
+        let store = stored_with(&a);
+        store.put_node(&b).unwrap();
+        let confirmed = bob.assert_edge(a.compute_id(), b.compute_id(), EdgeKind::References, 2);
+        store.add_edge(&confirmed).unwrap();
+        let p = asserter(22).propose_edge(a.compute_id(), b.compute_id(), EdgeKind::References, EdgeMethod::Nlp, None, 3);
+        let mut d = MemoryDiff::new(asserter(22).pubkey_hex(), 3);
+        d.add_edge(p);
+        apply_diff(&store, &d, Some(asserter(22).pubkey_hex())).unwrap();
+        assert_eq!(store.out_edges(&a.compute_id()).unwrap()[0], confirmed);
+    }
+
+    /// PBA-L6b-002 class tripwire: the diff write path must never commit the
+    /// diff's raw nodes (last-writer-wins over an existing id), must fold existing
+    /// ids through the shared monotone join and the author gate, and the MCP
+    /// merge_diff tool must hand apply_diff the caller's real identity.
+    #[test]
+    fn pba_l6b_002_tripwire_apply_diff_is_join_and_author_gated() {
+        let src = include_str!("lib.rs");
+        let raw_commit = concat!("commit(&diff", ".nodes");
+        assert!(!src.contains(raw_commit), "PBA-L6b-002: apply_diff commits raw diff nodes (LWW overwrite)");
+        let start = src.find("pub fn apply_diff(").expect("apply_diff");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end of apply_diff")];
+        for must in ["caller: Option<&str>", "join::merge_node(", "AssertError::NotAuthor", "AssertError::EdgePromotion"] {
+            assert!(body.contains(must), "PBA-L6b-002: apply_diff lost `{must}`");
+        }
+        let mcp = include_str!("../../mem-mcp/src/lib.rs");
+        assert!(
+            mcp.contains("apply_diff(self.store, &diff, caller.as_deref())"),
+            "PBA-L6b-002: memory.merge_diff must pass the caller's author identity to apply_diff"
+        );
     }
 }
