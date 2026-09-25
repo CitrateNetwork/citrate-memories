@@ -80,6 +80,91 @@ pub struct AppState {
     /// MEM-S7 WP-7.2: verified, in-scope push events awaiting incremental ingest.
     /// The receiver only enqueues; the single-writer worker (WP-7.3) drains it.
     pub ingest_queue: Arc<Mutex<VecDeque<crate::webhook::PushEvent>>>,
+    /// PBA-L6b-018: BYOM work bounds (per-principal call budget + a gateway-wide
+    /// cap on concurrent blocking MCP executions).
+    pub byom_limits: Arc<ByomLimits>,
+}
+
+/// PBA-L6b-018: most JSON-RPC calls one BYOM POST may carry. Each call can be a
+/// full-store decrypt scan, so an uncapped 2 MB body (~20k calls) was a cheap
+/// DoS. Real MCP clients send one call per request.
+pub const BYOM_MAX_LINES: usize = 32;
+/// PBA-L6b-018: per-principal BYOM call budget — a token bucket of this many
+/// calls, refilled at [`BYOM_REFILL_PER_SEC`].
+pub const BYOM_BURST_CALLS: f64 = 128.0;
+/// PBA-L6b-018: sustained BYOM calls per second per principal.
+pub const BYOM_REFILL_PER_SEC: f64 = 2.0;
+/// PBA-L6b-018: BYOM executions allowed on the blocking pool at once.
+pub const BYOM_MAX_CONCURRENT: usize = 4;
+/// PBA-L6b-018 follow-up: of those, how many ONE principal may hold at once (so a
+/// single member cannot occupy every slot and stall everyone else).
+pub const BYOM_MAX_CONCURRENT_PER_PRINCIPAL: usize = 2;
+
+/// PBA-L6b-018: BYOM work bounds. Buckets are keyed by the verified principal
+/// and only created after the membership check, so the map is bounded by the
+/// org's membership.
+pub struct ByomLimits {
+    slots: Arc<tokio::sync::Semaphore>,
+    buckets: Mutex<HashMap<String, (f64, u64)>>,
+    inflight: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Default for ByomLimits {
+    fn default() -> Self {
+        ByomLimits {
+            slots: Arc::new(tokio::sync::Semaphore::new(BYOM_MAX_CONCURRENT)),
+            buckets: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// Releases one of a principal's in-flight BYOM executions on drop.
+struct InflightGuard {
+    map: Arc<Mutex<HashMap<String, usize>>>,
+    sub: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut m = lock(&self.map);
+        if let Some(n) = m.get_mut(&self.sub) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.sub);
+            }
+        }
+    }
+}
+
+impl ByomLimits {
+    /// Claim one of `sub`'s per-principal execution slots, or `None` if it
+    /// already holds [`BYOM_MAX_CONCURRENT_PER_PRINCIPAL`].
+    fn try_enter(&self, sub: &str) -> Option<InflightGuard> {
+        let mut m = lock(&self.inflight);
+        let n = m.entry(sub.to_string()).or_insert(0);
+        if *n >= BYOM_MAX_CONCURRENT_PER_PRINCIPAL {
+            return None;
+        }
+        *n += 1;
+        Some(InflightGuard { map: self.inflight.clone(), sub: sub.to_string() })
+    }
+
+    /// Spend `calls` from `sub`'s bucket at `now_ms`; `false` (and nothing spent)
+    /// if the bucket cannot cover them.
+    fn try_spend(&self, sub: &str, calls: usize, now_ms: u64) -> bool {
+        let mut buckets = lock(&self.buckets);
+        let (tokens, last) = buckets.entry(sub.to_string()).or_insert((BYOM_BURST_CALLS, now_ms));
+        let elapsed_s = now_ms.saturating_sub(*last) as f64 / 1000.0;
+        *tokens = (*tokens + elapsed_s * BYOM_REFILL_PER_SEC).min(BYOM_BURST_CALLS);
+        *last = now_ms;
+        let need = calls as f64;
+        if *tokens < need {
+            return false;
+        }
+        *tokens -= need;
+        true
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -300,8 +385,11 @@ fn resolve_in_tenant(
     repo: &str,
     prefix: &str,
 ) -> Result<(mem_core::ContentHash, MemoryNode), ApiError> {
+    // PBA-L6b-017: resolve among THIS tenant's nodes only, so a foreign node
+    // sharing the prefix can neither match nor make it ambiguous (a 404-vs-200
+    // existence oracle). The repo re-check below stays as defence in depth.
     let id = rc
-        .resolve_prefix(prefix)
+        .resolve_prefix_in(repo, prefix)
         .map_err(ise)?
         .ok_or_else(|| not_found("node id prefix did not resolve"))?;
     match store.get_node(&id).map_err(ise)? {
@@ -318,6 +406,21 @@ fn grant_can_read(grant: &CapabilityGrant, repo: &str) -> bool {
     grant.check(&repo_resource(repo), Op::Read, now_ms()).is_ok()
 }
 
+/// PBA-L6b-001: the ONE way an HTTP handler fetches neighbours for a caller —
+/// the anchor's own tenant plus any tenant the caller's grant can READ. Shared by
+/// `/neighbors` and `/verify` (and mirrored by MCP `memory.neighbors`) so the
+/// grant intersection cannot be forgotten on one surface again.
+fn readable_neighbors(
+    rc: &Recall<'_>,
+    grant: &CapabilityGrant,
+    repo: &str,
+    id: &mem_core::ContentHash,
+    budget: usize,
+) -> Result<Vec<NeighborItem>, ApiError> {
+    rc.neighbors_readable(id, budget, |t| t == repo || grant_can_read(grant, t))
+        .map_err(ise)
+}
+
 /// MEM-B-008: intersect a membership grant with the attenuation a BYOM connect
 /// token declares. `verify_connect_token` used to read ONLY `sub`, so the token's
 /// `scope`/`tenants` were silently discarded and `byom` minted the principal's
@@ -330,6 +433,7 @@ fn grant_can_read(grant: &CapabilityGrant, repo: &str) -> bool {
 ///   * write is allowed only when the token's `scope` names a write-y capability
 ///     (`write` or `propose`); an absent scope defaults to read-only (least
 ///     privilege) so a legacy claimless token cannot silently escalate.
+///
 /// The narrowed grant is re-signed with the gateway key so it still verifies.
 fn attenuate_grant(grant: &CapabilityGrant, claims: &ConnectClaims, sk: &SigningKey) -> CapabilityGrant {
     let token_allows_write = claims
@@ -575,14 +679,10 @@ async fn neighbors(
     let rc = recaller(&app);
     // MEM-B-007: the anchor must live in the authorized tenant (cross-tenant → 404).
     let (id, _node) = resolve_in_tenant(&app.store, &rc, &repo, &id_prefix)?;
-    let ns = rc.neighbors(&id, budget(&q, 20)).map_err(ise)?;
-    // MEM-B-007 (grant intersection, R3): a neighbour in another tenant is shown
-    // only if this caller's grant can READ that tenant; others are dropped so
-    // neither content nor existence leaks.
-    let ns: Vec<NeighborItem> = ns
-        .into_iter()
-        .filter(|nb| nb.node.as_ref().map(|n| n.repo == repo || grant_can_read(&grant, &n.repo)).unwrap_or(true))
-        .collect();
+    // MEM-B-007 / PBA-L6b-001 (grant intersection, R3): a neighbour in another
+    // tenant is shown only if this caller's grant can READ that tenant; others are
+    // dropped (before the budget) so neither content nor existence leaks.
+    let ns = readable_neighbors(&rc, &grant, &repo, &id, budget(&q, 20))?;
     Ok(Json(json!({
         "id": id.to_hex(),
         "count": ns.len(),
@@ -598,12 +698,17 @@ async fn verify(
 ) -> Result<Json<Value>, ApiError> {
     let repo = qparam(&q, "repo").ok_or_else(|| bad("repo query param required"))?;
     let id_prefix = qparam(&q, "id").ok_or_else(|| bad("id query param required"))?;
-    gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "verify")?;
+    // PBA-L6b-001: hold the caller's grant (not just a yes/no) so the neighbours
+    // this route serializes — and the verdict derived from them — are filtered to
+    // the tenants the caller may read, exactly as `/neighbors` does. `gate()` here
+    // left MEM-B-007 half-fixed: /verify returned cross-tenant neighbour content.
+    let (_sub, grant) =
+        gate_with_grant(&app, &headers, &org, &repo_resource(&repo), Op::Read, "verify")?;
     let rc = recaller(&app);
     // MEM-B-007: resolve within the authorized tenant — a prefix of a node in
     // another tenant reads as 404 (was a cross-tenant IDOR returning its content).
     let (id, node) = resolve_in_tenant(&app.store, &rc, &repo, &id_prefix)?;
-    let ns = rc.neighbors(&id, 64).map_err(ise)?;
+    let ns = readable_neighbors(&rc, &grant, &repo, &id, 64)?;
     let superseded = matches!(node.status, mem_core::Status::Superseded)
         || ns.iter().any(|n| {
             matches!(n.edge_kind, mem_core::EdgeKind::Supersedes)
@@ -953,7 +1058,7 @@ async fn connect_token(
     // days + no scope, i.e. a long-lived full-org bearer credential.
     const TTL_SECS: usize = 15 * 60; // 15 minutes
     let now_secs = (now_ms() / 1000) as usize;
-    let token = mint_connect_token(secret, &sub, Some("read"), &[], now_secs, TTL_SECS)
+    let token = mint_connect_token(secret, app.org_id.as_str(), &sub, Some("read"), &[], now_secs, TTL_SECS)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "mint failed"))?;
     Ok(Json(json!({
         "connect_token": token,
@@ -982,6 +1087,11 @@ async fn byom(
     if claims.sub != sub {
         return Err(forbidden("connect token sub mismatch"));
     }
+    // PBA-L3c-032: a connect token is bound to the org it was minted for; one
+    // minted for another org (or with no org at all — fail closed) is refused.
+    if claims.org.as_deref() != Some(app.org_id.as_str()) {
+        return Err(forbidden("connect token not issued for this org"));
+    }
 
     let membership = {
         let control = rlock(&app.control);
@@ -996,30 +1106,76 @@ async fn byom(
     // grant with the token's declared scope/tenants so it can never authorize more
     // than the user was shown (and never write when the token is read-only).
     let grant = attenuate_grant(&grant, &claims, &app.signing_key);
-    // FWA-C10-04: per-principal authorship (see /assert). `sub` is the
-    // connect-token-verified principal.
-    let asserter = Asserter::for_principal(&app.signing_key, &sub);
-    let mut server = MemoryMcpServer::new_with_asserter(&app.store, grant, asserter)
-        .with_write_gate(app.write_gate.clone())
-        .with_index_cache(app.index_cache.clone())
-        .with_audit_chain(app.audit.clone());
-    if let Some(e) = &app.embedder {
-        server = server.with_query_embedder(e.clone());
-    }
 
-    let mut out = String::new();
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(resp) = server.handle_line(line) {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&resp);
-        }
+    // PBA-L6b-018: bound the work one request can force BEFORE doing any of it —
+    // a line cap, a per-principal call budget, and execution on the blocking pool
+    // under a gateway-wide concurrency cap (each call may be a full-store decrypt
+    // scan; running them inline starved the async runtime).
+    let lines: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.len() > BYOM_MAX_LINES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("too many JSON-RPC calls in one request (max {BYOM_MAX_LINES})"),
+        ));
     }
+    // Only tool calls do store work; ping / notifications / initialize /
+    // tools/list are free (they would otherwise eat a multi-agent user's budget).
+    let calls = lines
+        .iter()
+        .filter(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|m| m == "tools/call"))
+                .unwrap_or(true) // unparseable lines count (fail closed)
+        })
+        .count();
+    if !app.byom_limits.try_spend(&sub, calls, now_ms()) {
+        return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "BYOM call budget exhausted; retry later"));
+    }
+    let inflight = app
+        .byom_limits
+        .try_enter(&sub)
+        .ok_or_else(|| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too many concurrent BYOM requests for this principal"))?;
+    let permit = app
+        .byom_limits
+        .slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ise("BYOM executor closed"))?;
+
+    let app2 = app.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _inflight = inflight;
+        // FWA-C10-04: per-principal authorship (see /assert). `sub` is the
+        // connect-token-verified principal.
+        let asserter = Asserter::for_principal(&app2.signing_key, &sub);
+        let mut server = MemoryMcpServer::new_with_asserter(&app2.store, grant, asserter)
+            .with_write_gate(app2.write_gate.clone())
+            .with_index_cache(app2.index_cache.clone())
+            .with_audit_chain(app2.audit.clone());
+        if let Some(e) = &app2.embedder {
+            server = server.with_query_embedder(e.clone());
+        }
+        let mut out = String::new();
+        for line in &lines {
+            if let Some(resp) = server.handle_line(line) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&resp);
+            }
+        }
+        out
+    })
+    .await
+    .map_err(ise)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], out).into_response())
 }
 
@@ -1111,7 +1267,7 @@ mod byom_attenuation_tests {
             grant.check("repo:citrate-chain/memory", Op::Write, now).is_ok(),
             "precondition: owner membership can write before attenuation"
         );
-        let claims = ConnectClaims { sub: "owner-1".into(), scope: Some("read".into()), tenants: None };
+        let claims = ConnectClaims { sub: "owner-1".into(), scope: Some("read".into()), tenants: None, org: None };
         let att = attenuate_grant(&grant, &claims, &sk);
         assert!(att.check("repo:citrate-chain/memory", Op::Read, now).is_ok(), "read is preserved");
         assert!(
@@ -1131,6 +1287,7 @@ mod byom_attenuation_tests {
             sub: "owner-1".into(),
             scope: Some("read,propose".into()),
             tenants: Some(vec!["citrate-landing".into()]),
+            org: None,
         };
         let att = attenuate_grant(&grant, &claims, &sk);
         assert!(att.check("repo:citrate-landing/memory", Op::Write, now).is_ok(), "named tenant writable (propose ⇒ write)");
@@ -1147,7 +1304,7 @@ mod byom_attenuation_tests {
         let sk = signing_key_from_seed("seed");
         let now = now_ms();
         let grant = mint_grant(&sk, "iss", &owner_membership(), now, GRANT_TTL_MS);
-        let claims = ConnectClaims { sub: "owner-1".into(), scope: None, tenants: None };
+        let claims = ConnectClaims { sub: "owner-1".into(), scope: None, tenants: None, org: None };
         let att = attenuate_grant(&grant, &claims, &sk);
         assert!(att.check("repo:x/memory", Op::Read, now).is_ok());
         assert!(
@@ -1217,3 +1374,9 @@ mod resolve_in_tenant_tests {
         assert_eq!(same.1.repo, "citrate-chain");
     }
 }
+
+// PBA R2 (2026-09-24 pre-bounty audit) regression tests: the lane-L6b PoCs with
+// inverted assertions, driven through the real handlers.
+#[cfg(test)]
+#[path = "http_pba_r2_tests.rs"]
+mod pba_r2_tests;

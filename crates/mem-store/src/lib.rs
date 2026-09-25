@@ -797,7 +797,10 @@ impl MemoryDagStore<MemoryNode> {
         let mut ops: Vec<KvOp> = self.edge_put_ops(edge, &HashMap::new())?.into();
         if transitioned {
             target.status = mem_core::Status::Superseded;
-            target.valid_to = Some(edge.provenance.at);
+            // PBA-L6b-002 follow-up: the edge time is unsigned and caller-chosen;
+            // never let it end the target's validity before it began (a backdated
+            // edge would drop the node from as_of snapshots it was valid in).
+            target.valid_to = Some(edge.provenance.at.max(target.valid_from));
             // status/valid_to are excluded from compute_id, so this overwrites in
             // place (sealed under the tenant's key when encrypting at rest).
             let node_bytes = self.encode_node(&target)?;
@@ -1488,5 +1491,27 @@ mod tests {
         e.quarantined = true;
         assert!(matches!(s.apply_supersession(&e).unwrap_err(), SupersessionError::Quarantined));
         assert_eq!(s.get_node(&b.compute_id()).unwrap().unwrap().status, Status::Active);
+    }
+
+    /// PBA-L6b-002 follow-up: a supersession can never stamp a `valid_to` earlier
+    /// than the target's own `valid_from` (a backdated edge used to push the node
+    /// out of every `as_of` snapshot, including ones it was valid in).
+    #[test]
+    fn supersession_valid_to_is_clamped_to_target_valid_from() {
+        let s = store();
+        let new = node("newer");
+        let mut old = node("older");
+        old.valid_from = 1_000;
+        s.put_node(&new).unwrap();
+        s.put_node(&old).unwrap();
+        s.apply_supersession(&supersedes_at(&new, &old, 1)).unwrap();
+        assert_eq!(s.get_node(&old.compute_id()).unwrap().unwrap().valid_to, Some(1_000));
+        // A later edge time is kept as-is.
+        let (a, mut b) = (node("a2"), node("b2"));
+        b.valid_from = 10;
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+        s.apply_supersession(&supersedes_at(&a, &b, 11)).unwrap();
+        assert_eq!(s.get_node(&b.compute_id()).unwrap().unwrap().valid_to, Some(11));
     }
 }

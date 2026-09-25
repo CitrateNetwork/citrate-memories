@@ -601,6 +601,43 @@ impl<'a> Recall<'a> {
         Ok(out)
     }
 
+    /// Grant-aware blast radius (PBA-L6b-001 / MEM-B-007): like [`neighbors`](Self::neighbors),
+    /// but a neighbour whose node lives in a tenant `can_read` rejects is dropped
+    /// BEFORE it is materialized or counted against `budget`, so neither its
+    /// content nor its existence reaches the caller, and unreadable neighbours
+    /// cannot crowd readable ones out of the budget. A dangling edge (far node
+    /// absent/shredded) carries no content and is kept, as in `neighbors`.
+    ///
+    /// Every surface that serializes neighbours to a caller (HTTP `/neighbors`,
+    /// HTTP `/verify`, MCP `memory.neighbors`) must go through this helper — the
+    /// tenant-blind `neighbors` is for trusted/internal callers only.
+    pub fn neighbors_readable(
+        &self,
+        id: &ContentHash,
+        budget: usize,
+        can_read: impl Fn(&str) -> bool,
+    ) -> Result<Vec<NeighborItem>, StoreError> {
+        let mut out = Vec::new();
+        let edges = self
+            .store
+            .out_edges(id)?
+            .into_iter()
+            .map(|e| (e.to, e, Direction::Out))
+            .chain(self.store.in_edges(id)?.into_iter().map(|e| (e.from, e, Direction::In)));
+        for (far, e, direction) in edges {
+            if out.len() >= budget {
+                break;
+            }
+            let node = match self.store.get_node(&far)? {
+                Some(n) if !can_read(&n.repo) => continue,
+                Some(n) => Some(RecallItem::from_node(&n, None)),
+                None => None,
+            };
+            out.push(NeighborItem { edge_kind: e.kind, direction, quarantined: e.quarantined, node });
+        }
+        Ok(out)
+    }
+
     /// Structural edge-kind signature of a node: a multiset of
     /// (direction, edge-kind) over its **load-bearing** edges. Quarantined
     /// proposals are excluded — an unconfirmed edge must not influence
@@ -702,9 +739,34 @@ impl<'a> Recall<'a> {
 
     /// Resolve a (possibly short) hex id prefix to a full node id. Returns `None`
     /// if zero or more than one node matches (ambiguous).
+    ///
+    /// **Tenant-blind** — trusted/internal callers only. A caller-facing surface
+    /// must use [`resolve_prefix_in`](Self::resolve_prefix_in) /
+    /// [`resolve_prefix_where`](Self::resolve_prefix_where): ambiguity computed
+    /// across all tenants is a cross-tenant existence oracle (PBA-L6b-017).
     pub fn resolve_prefix(&self, prefix: &str) -> Result<Option<ContentHash>, StoreError> {
+        self.resolve_prefix_where(prefix, |_| true)
+    }
+
+    /// Resolve a prefix among the nodes of ONE tenant (PBA-L6b-017). Nodes in
+    /// other tenants neither match nor make the prefix ambiguous, so the answer
+    /// is independent of what exists in tenants the caller cannot read.
+    pub fn resolve_prefix_in(&self, repo: &str, prefix: &str) -> Result<Option<ContentHash>, StoreError> {
+        self.resolve_prefix_where(prefix, |n| n.repo == repo)
+    }
+
+    /// Resolve a prefix among the nodes `visible` admits (e.g. the tenants a
+    /// grant can read). `None` if zero or more than one VISIBLE node matches.
+    pub fn resolve_prefix_where(
+        &self,
+        prefix: &str,
+        visible: impl Fn(&MemoryNode) -> bool,
+    ) -> Result<Option<ContentHash>, StoreError> {
         let mut found: Option<ContentHash> = None;
         for n in self.store.all_nodes()? {
+            if !visible(&n) {
+                continue;
+            }
             let id = n.compute_id();
             if id.to_hex().starts_with(prefix) {
                 if found.is_some() {
@@ -771,6 +833,27 @@ impl<'a> Recall<'a> {
     /// points at a canonical artifact and is rebuildable); an `Asserted` node
     /// verifies iff its signature over the content id holds.
     pub fn verify(&self, id: &ContentHash) -> Result<Option<Verification>, StoreError> {
+        self.verify_where(id, |_| true)
+    }
+
+    /// Grant-aware [`verify`](Self::verify) (PBA-L6b-001 follow-up): only edges
+    /// whose far node lives in a tenant `can_read` admits count towards
+    /// `superseded_by` / `refuted_by`; an edge from an unreadable (or absent)
+    /// node is ignored, so neither its existence nor its kind leaks. Caller-facing
+    /// surfaces must use this, never the tenant-blind `verify`.
+    pub fn verify_readable(
+        &self,
+        id: &ContentHash,
+        can_read: impl Fn(&str) -> bool,
+    ) -> Result<Option<Verification>, StoreError> {
+        self.verify_where(id, |far| far.is_some_and(&can_read))
+    }
+
+    fn verify_where(
+        &self,
+        id: &ContentHash,
+        visible: impl Fn(Option<&str>) -> bool,
+    ) -> Result<Option<Verification>, StoreError> {
         let node = match self.store.get_node(id)? {
             Some(n) => n,
             None => return Ok(None),
@@ -796,6 +879,10 @@ impl<'a> Recall<'a> {
         for e in self.store.in_edges(id)? {
             if e.quarantined {
                 continue; // a proposal is advisory, never load-bearing
+            }
+            let far = self.store.get_node(&e.from)?;
+            if !visible(far.as_ref().map(|n| n.repo.as_str())) {
+                continue;
             }
             match e.kind {
                 mem_core::EdgeKind::Supersedes => superseded_by.push(e.from),
@@ -830,6 +917,27 @@ impl<'a> Recall<'a> {
     /// An optional LLM elaboration over these gaps is a v2 follow-up (it would
     /// land as a quarantined assertion, never load-bearing).
     pub fn critique(&self, result: &RecallResult, now_ms: Timestamp) -> Result<Critique, StoreError> {
+        self.critique_where(result, now_ms, |_| true)
+    }
+
+    /// Grant-aware [`critique`](Self::critique) (PBA-L6b-001 follow-up): an
+    /// adjacent proposal only counts if its far node is in a tenant `can_read`
+    /// admits, so the critic cannot reveal unreadable neighbours.
+    pub fn critique_readable(
+        &self,
+        result: &RecallResult,
+        now_ms: Timestamp,
+        can_read: impl Fn(&str) -> bool,
+    ) -> Result<Critique, StoreError> {
+        self.critique_where(result, now_ms, |far| far.is_some_and(&can_read))
+    }
+
+    fn critique_where(
+        &self,
+        result: &RecallResult,
+        now_ms: Timestamp,
+        visible: impl Fn(Option<&str>) -> bool,
+    ) -> Result<Critique, StoreError> {
         let mut gaps = Vec::new();
 
         // 1. Truncated coverage: the budget hid part of the tenant.
@@ -859,12 +967,22 @@ impl<'a> Recall<'a> {
                 }
                 // 4. Adjacent unconfirmed knowledge: a returned node has a
                 //    quarantined (proposed, advisory) edge the answer didn't show.
-                let has_quarantined = self
+                let mut has_quarantined = false;
+                let adjacent = self
                     .store
                     .out_edges(&i.id)?
                     .into_iter()
-                    .chain(self.store.in_edges(&i.id)?)
-                    .any(|e| e.quarantined);
+                    .map(|e| (e.to, e.quarantined))
+                    .chain(self.store.in_edges(&i.id)?.into_iter().map(|e| (e.from, e.quarantined)));
+                for (far, quarantined) in adjacent {
+                    if quarantined {
+                        let far = self.store.get_node(&far)?;
+                        if visible(far.as_ref().map(|n| n.repo.as_str())) {
+                            has_quarantined = true;
+                            break;
+                        }
+                    }
+                }
                 if has_quarantined {
                     gaps.push(Gap::AdjacentProposal(i.id));
                 }
@@ -1462,6 +1580,94 @@ mod tests {
         assert!(out[0].quarantined, "proposal visibly marked in the read path");
     }
 
+    /// PBA-L6b-001: `neighbors_readable` drops neighbours in unreadable tenants
+    /// before counting them against the budget, keeps both directions, and keeps
+    /// a readable neighbour that an unreadable one would otherwise crowd out.
+    #[test]
+    fn neighbors_readable_filters_unreadable_tenants_before_budget() {
+        let a = node("a", "anchor in a", 1);
+        let secret_out = node("b", "secret out-neighbour in b", 2);
+        let secret_in = node("b", "secret in-neighbour in b", 3);
+        let ok_in = node("a", "readable in-neighbour in a", 4);
+        let s = store_with(&[a.clone(), secret_out.clone(), secret_in.clone(), ok_in.clone()]);
+        s.add_edge(&plain_edge(&a, &secret_out, EdgeKind::References, false)).unwrap();
+        s.add_edge(&plain_edge(&secret_in, &a, EdgeKind::References, true)).unwrap();
+        s.add_edge(&plain_edge(&ok_in, &a, EdgeKind::Implements, false)).unwrap();
+        let r = Recall::new(&s);
+
+        // Only tenant "a" is readable. With budget 1, the unreadable out-neighbour
+        // must not consume the slot: the readable in-neighbour is returned.
+        let only_a = r.neighbors_readable(&a.compute_id(), 1, |t| t == "a").unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].direction, Direction::In);
+        assert_eq!(only_a[0].edge_kind, EdgeKind::Implements);
+        assert_eq!(only_a[0].node.as_ref().map(|n| n.repo.as_str()), Some("a"));
+        let all_a = r.neighbors_readable(&a.compute_id(), 10, |t| t == "a").unwrap();
+        assert_eq!(all_a.len(), 1, "both tenant-b neighbours dropped");
+        assert!(all_a.iter().all(|n| n.node.as_ref().map(|x| x.repo == "a").unwrap_or(true)));
+
+        // Everything readable: same set as the tenant-blind `neighbors`, with the
+        // quarantine mark preserved and the budget honoured.
+        let every = r.neighbors_readable(&a.compute_id(), 10, |_| true).unwrap();
+        assert_eq!(every.len(), 3);
+        assert_eq!(every.iter().filter(|n| n.direction == Direction::Out).count(), 1);
+        assert_eq!(every.iter().filter(|n| n.quarantined).count(), 1);
+        assert_eq!(r.neighbors_readable(&a.compute_id(), 2, |_| true).unwrap().len(), 2, "budget honoured");
+        assert!(r.neighbors_readable(&a.compute_id(), 0, |_| true).unwrap().is_empty());
+    }
+
+    /// A dangling edge (far node absent) carries no content and is kept, matching
+    /// `neighbors` — the predicate is only consulted for real nodes.
+    #[test]
+    fn neighbors_readable_keeps_dangling_edges() {
+        let a = node("a", "anchor", 1);
+        let ghost = node("zzz", "never stored", 2);
+        let s = store_with(std::slice::from_ref(&a));
+        s.add_edge(&plain_edge(&a, &ghost, EdgeKind::References, false)).unwrap();
+        let out = Recall::new(&s).neighbors_readable(&a.compute_id(), 10, |_| false).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].node.is_none());
+    }
+
+    /// PBA-L6b-017: tenant-scoped prefix resolution ignores other tenants for
+    /// both matching and ambiguity; the blind variant still sees everything.
+    #[test]
+    fn resolve_prefix_in_is_tenant_scoped() {
+        // Find two nodes in different tenants sharing a 1-hex-char id prefix.
+        let a = node("a", "tenant a note", 1);
+        let a_hex = a.compute_id().to_hex();
+        let mut i = 0;
+        let b = loop {
+            let n = node("b", &format!("tenant b note {i}"), 1);
+            if n.compute_id().to_hex()[..1] == a_hex[..1] {
+                break n;
+            }
+            i += 1;
+        };
+        let p = &a_hex[..1];
+        let s = store_with(&[a.clone(), b.clone()]);
+        let r = Recall::new(&s);
+        assert_eq!(r.resolve_prefix(p).unwrap(), None, "blind: ambiguous across tenants");
+        assert_eq!(r.resolve_prefix(&a_hex).unwrap(), Some(a.compute_id()), "blind: a full id resolves");
+        assert_eq!(r.resolve_prefix_in("a", p).unwrap(), Some(a.compute_id()));
+        assert_eq!(r.resolve_prefix_in("b", p).unwrap(), Some(b.compute_id()));
+        assert_eq!(r.resolve_prefix_in("c", p).unwrap(), None, "no match in an empty tenant");
+        assert_eq!(r.resolve_prefix_where(p, |n| n.repo != "b").unwrap(), Some(a.compute_id()));
+        assert_eq!(r.resolve_prefix_where(p, |_| false).unwrap(), None);
+        // Same-tenant ambiguity is still ambiguity.
+        let mut j = 0;
+        let a2 = loop {
+            let n = node("a", &format!("second a note {j}"), 1);
+            if n.compute_id().to_hex()[..1] == a_hex[..1] {
+                break n;
+            }
+            j += 1;
+        };
+        let s2 = store_with(&[a.clone(), a2, b]);
+        assert_eq!(Recall::new(&s2).resolve_prefix_in("a", p).unwrap(), None);
+        assert_eq!(Recall::new(&s2).resolve_prefix_in("a", &a_hex).unwrap(), Some(a.compute_id()), "full id is unique");
+    }
+
     #[test]
     fn neighbors_returns_connected_nodes() {
         let a = node("a", "sprint", 1);
@@ -1514,5 +1720,26 @@ mod tests {
         assert!(r.search("a", "ghostdag tip selection", 5).unwrap().items.is_empty());
         assert!(r.storyline("a", 5).unwrap().items.is_empty());
         assert!(r.neighbors(&b.compute_id(), 10).unwrap().is_empty(), "sealed edges die with their tenant");
+    }
+
+    /// PBA-L6b-001 follow-up: verify_readable counts supersession/refutation
+    /// edges only from readable tenants (absent far nodes never count), while the
+    /// tenant-blind verify still counts them all.
+    #[test]
+    fn verify_readable_counts_only_readable_edges() {
+        let target = node("a", "the claim", 1);
+        let ok_ref = node("a", "readable rebuttal", 2);
+        let hidden = node("b", "hidden rebuttal", 3);
+        let ghost = node("c", "never stored", 4);
+        let s = store_with(&[target.clone(), ok_ref.clone(), hidden.clone()]);
+        s.add_edge(&plain_edge(&ok_ref, &target, EdgeKind::Refutes, false)).unwrap();
+        s.add_edge(&plain_edge(&hidden, &target, EdgeKind::Contradicts, false)).unwrap();
+        s.add_edge(&plain_edge(&ghost, &target, EdgeKind::Refutes, false)).unwrap();
+        let r = Recall::new(&s);
+        let v = r.verify_readable(&target.compute_id(), |t| t == "a").unwrap().expect("exists");
+        assert_eq!(v.refuted_by, vec![ok_ref.compute_id()]);
+        assert!(v.superseded_by.is_empty());
+        assert_eq!(r.verify(&target.compute_id()).unwrap().expect("exists").refuted_by.len(), 3, "blind verify unchanged");
+        assert!(r.verify_readable(&ghost.compute_id(), |_| true).unwrap().is_none());
     }
 }

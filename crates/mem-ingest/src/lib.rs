@@ -469,6 +469,42 @@ fn doc_node(
     })
 }
 
+/// Largest tracked markdown doc the ingestor will read (PBA-L6b-004). Real docs
+/// are far smaller; anything bigger is skipped rather than read unboundedly.
+pub const MAX_DOC_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read one tracked doc for ingestion, or `None` to skip it (PBA-L6b-004).
+///
+/// `git ls-files` lists symlinks (mode 120000) like regular files and
+/// `std::fs::read` follows them, so a committed `docs/x.md -> /etc/…` (or
+/// `-> /dev/zero`) used to make the ingestor read host files into the store, or
+/// read forever while holding the gateway's write gate. Accept only:
+///   * a path whose final component is a REGULAR file (`symlink_metadata`, so a
+///     symlink is never followed, and devices / FIFOs / dirs are refused);
+///   * whose canonical path stays under the canonical `repo_root` (defends
+///     against a symlinked parent directory);
+///   * at most [`MAX_DOC_BYTES`], enforced on the read itself (`take`), not only
+///     on the stat, so a file growing after the check is still bounded.
+pub fn read_tracked_doc(repo_root: &Path, rel: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let path = repo_root.join(rel);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_DOC_BYTES {
+        return None;
+    }
+    let root = repo_root.canonicalize().ok()?;
+    let real = path.canonicalize().ok()?;
+    if !real.starts_with(&root) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(&real).ok()?.take(MAX_DOC_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_DOC_BYTES {
+        return None;
+    }
+    Some(buf)
+}
+
 /// Ingest every tracked markdown doc under `repo_root` into nodes/edges. Returns
 /// `(nodes, edges, doc_count)` where `doc_count` excludes minted reference nodes.
 fn build_doc_graph(
@@ -492,9 +528,12 @@ fn build_doc_graph(
     let mut doc_count = 0usize;
 
     for rel in &paths {
-        let bytes = match std::fs::read(repo_root.join(rel)) {
-            Ok(b) => b,
-            Err(_) => continue, // tracked but unreadable (e.g. deleted) — skip
+        // PBA-L6b-004: a tracked path is attacker-shaped (anyone who lands a
+        // commit chooses it) — never follow a symlink out of the repo, never read
+        // a device/FIFO, never read unboundedly under the write gate.
+        let bytes = match read_tracked_doc(repo_root, rel) {
+            Some(b) => b,
+            None => continue, // unreadable, not a regular in-repo file, or oversize — skip
         };
         let text = String::from_utf8_lossy(&bytes);
         let (fm, body) = frontmatter::parse(&text);

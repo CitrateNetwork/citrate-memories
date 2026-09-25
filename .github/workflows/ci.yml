@@ -29,6 +29,18 @@ jobs:
         run: cargo test --workspace
       - name: clippy -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # PBA R2 (2026-09-24 audit): the gateway's HTTP surface (`http.rs`, every
+      # authz regression test for it) is behind the `server` feature and the
+      # mem-sync HTTP transport behind `http`. `--workspace` enables neither, so
+      # those tests (and their tripwires) never ran in CI. Run them explicitly.
+      - name: cargo test (feature-gated surfaces — gateway server, sync http)
+        run: |
+          cargo test -p mem-gateway --features server
+          cargo test -p mem-sync --features http
+      - name: clippy -D warnings (feature-gated surfaces)
+        run: |
+          cargo clippy -p mem-gateway --features server --all-targets -- -D warnings
+          cargo clippy -p mem-sync --features http --all-targets -- -D warnings
 
   cargo-audit:
     # MEM-B-015: fail the build on a known-vulnerable dependency (RUSTSEC). The

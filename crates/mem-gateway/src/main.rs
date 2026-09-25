@@ -264,6 +264,7 @@ async fn main() {
         allow_dev_auth,
         layout_cache: Arc::new(Mutex::new(None)),
         ingest_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        byom_limits: Arc::new(mem_gateway::http::ByomLimits::default()),
     };
 
     if let Err(e) = run(state, &args.bind).await {

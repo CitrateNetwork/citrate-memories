@@ -253,6 +253,9 @@ mod verify {
         /// Tenants the token was scoped to; when present the grant is restricted to
         /// these repos (never widened beyond the membership).
         pub tenants: Option<Vec<String>>,
+        /// PBA-L3c-032: the org the token was minted for. The BYOM handler refuses
+        /// a token whose org is absent or is not this gateway's org.
+        pub org: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -262,6 +265,8 @@ mod verify {
         scope: Option<String>,
         #[serde(default)]
         tenants: Option<Vec<String>>,
+        #[serde(default)]
+        org: Option<String>,
     }
 
     /// Verify a BYOM connect token (HS256, `MEM_CONNECT_SECRET`). Returns the
@@ -275,7 +280,12 @@ mod verify {
         // Connect tokens are gateway-minted; no iss/aud constraints here.
         validation.validate_aud = false;
         decode::<ConnectTokenClaims>(token, &key, &validation)
-            .map(|d| ConnectClaims { sub: d.claims.sub, scope: d.claims.scope, tenants: d.claims.tenants })
+            .map(|d| ConnectClaims {
+                sub: d.claims.sub,
+                scope: d.claims.scope,
+                tenants: d.claims.tenants,
+                org: d.claims.org,
+            })
             .map_err(|e| AuthError::Token(e.to_string()))
     }
 
@@ -287,6 +297,8 @@ mod verify {
         scope: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         tenants: Vec<String>,
+        /// PBA-L3c-032: org binding (always minted).
+        org: String,
     }
 
     /// Mint an HS256 connect token for `sub`, carrying its declared `scope`/
@@ -298,6 +310,7 @@ mod verify {
     /// bound on the token, not a decorative label.
     pub fn mint_connect_token(
         secret: &str,
+        org: &str,
         sub: &str,
         scope: Option<&str>,
         tenants: &[String],
@@ -309,6 +322,7 @@ mod verify {
             exp: now_secs.saturating_add(ttl_secs),
             scope: scope.map(|s| s.to_string()),
             tenants: tenants.to_vec(),
+            org: org.to_string(),
         };
         encode(
             &Header::new(Algorithm::HS256),
@@ -354,6 +368,7 @@ mod tests {
         // exp in the real future (jsonwebtoken validates exp against system time)
         let token = mint_connect_token(
             secret,
+            "citrate-federation",
             "user-42",
             Some("read,propose"),
             &["citrate-landing".to_string()],
@@ -367,6 +382,8 @@ mod tests {
         // to be silently dropped at verify).
         assert_eq!(claims.scope.as_deref(), Some("read,propose"));
         assert_eq!(claims.tenants.as_deref(), Some(&["citrate-landing".to_string()][..]));
+        // PBA-L3c-032: the org binding survives the round-trip too.
+        assert_eq!(claims.org.as_deref(), Some("citrate-federation"));
         // a different secret rejects it
         assert!(verify_connect_token("wrong-secret", &token).is_err());
     }
@@ -376,7 +393,7 @@ mod tests {
     fn expired_connect_token_is_rejected() {
         let secret = "s";
         // minted well in the past (beyond jsonwebtoken's default 60s leeway)
-        let token = mint_connect_token(secret, "u", None, &[], now_secs() - 1000, 1).unwrap();
+        let token = mint_connect_token(secret, "org", "u", None, &[], now_secs() - 1000, 1).unwrap();
         assert!(verify_connect_token(secret, &token).is_err());
     }
 

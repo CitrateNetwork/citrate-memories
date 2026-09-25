@@ -403,7 +403,7 @@ impl<'a> MemoryMcpServer<'a> {
             return Ok(deny);
         }
         let recall = Recall::new(self.store);
-        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
+        let id = match recall.resolve_prefix_in(&repo, &prefix).map_err(store_err)? { // PBA-L6b-017
             Some(id) => id,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
@@ -416,19 +416,16 @@ impl<'a> MemoryMcpServer<'a> {
             Some(n) if n.repo == repo => {}
             _ => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         }
-        let neighbors = recall.neighbors(&id, budget).map_err(store_err)?;
+        // FUA-MEMORIES-01, refined to grant intersection (MEM-S4 WP-4.2, R3) and
+        // shared with the HTTP surface (PBA-L6b-001): a neighbour in another
+        // tenant (e.g. via a cross-DAG AnalogousTo edge) is shown iff this
+        // session's grant can READ that tenant. Unauthorized tenants are dropped
+        // before the budget — neither content nor existence leaks.
+        let neighbors = recall
+            .neighbors_readable(&id, budget, |t| t == repo || self.can_read(t))
+            .map_err(store_err)?;
         let mut text = format!("neighbors of {}:\n", &id.to_hex()[..12]);
         for nb in &neighbors {
-            // FUA-MEMORIES-01, refined to grant intersection (MEM-S4 WP-4.2, R3):
-            // a neighbour in another tenant (e.g. via a cross-DAG AnalogousTo
-            // edge) is shown iff this session's grant can READ that tenant.
-            // Unauthorized tenants are silently dropped — neither content nor
-            // existence leaks.
-            if let Some(n) = nb.node.as_ref() {
-                if n.repo != repo && !self.can_read(&n.repo) {
-                    continue;
-                }
-            }
             let arrow = match nb.direction {
                 Direction::Out => "->",
                 Direction::In => "<-",
@@ -489,7 +486,7 @@ impl<'a> MemoryMcpServer<'a> {
             return Ok(deny);
         }
         let recall = Recall::new(self.store);
-        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
+        let id = match recall.resolve_prefix_in(&repo, &prefix).map_err(store_err)? { // PBA-L6b-017
             Some(id) => id,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
@@ -498,7 +495,8 @@ impl<'a> MemoryMcpServer<'a> {
             Some(n) if n.repo == repo => {}
             _ => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         }
-        let v = match recall.verify(&id).map_err(store_err)? {
+        // PBA-L6b-001 follow-up: only edges from readable tenants count.
+        let v = match recall.verify_readable(&id, |t| self.can_read(t)).map_err(store_err)? {
             Some(v) => v,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
@@ -556,7 +554,10 @@ impl<'a> MemoryMcpServer<'a> {
             }
             None => Recall::new(self.store).storyline(&repo, budget).map_err(store_err)?,
         };
-        let critique = Recall::new(self.store).critique(&result, now_ms()).map_err(store_err)?;
+        // PBA-L6b-001 follow-up: adjacent proposals only from readable tenants.
+        let critique = Recall::new(self.store)
+            .critique_readable(&result, now_ms(), |t| self.can_read(t))
+            .map_err(store_err)?;
         let mut text = format!("self-critic over '{repo}' (completeness {:.2}):\n", critique.completeness);
         if let Some(age) = critique.watermark_age_ms {
             text.push_str(&format!("  freshness: index is {}ms behind now\n", age));
@@ -585,8 +586,16 @@ impl<'a> MemoryMcpServer<'a> {
 
     /// Grant-intersection read check (R3): no audit record, used for filtering
     /// individual cross-tenant items inside an already-audited call.
+    ///
+    /// PBA-L6b-036: the effective authority is the session grant INTERSECTED with
+    /// any per-request `_meta` attenuation — exactly as [`authorize`](Self::authorize)
+    /// computes it — so a narrowed request cannot see items in tenants its
+    /// attenuation dropped.
     fn can_read(&self, repo: &str) -> bool {
-        self.grant.check(&format!("repo:{repo}/memory"), Op::Read, now_ms()).is_ok()
+        let resource = format!("repo:{repo}/memory");
+        let now = now_ms();
+        self.grant.check(&resource, Op::Read, now).is_ok()
+            && self.req_grant.as_ref().is_none_or(|rg| rg.check(&resource, Op::Read, now).is_ok())
     }
 
     /// Resolve an id prefix to a node, requiring the session to be able to read
@@ -594,7 +603,11 @@ impl<'a> MemoryMcpServer<'a> {
     /// (FUA-MEMORIES-01: existence must not leak).
     fn resolve_readable(&self, prefix: &str) -> Result<Option<(mem_core::ContentHash, MemoryNode)>, (i64, String)> {
         let recall = Recall::new(self.store);
-        let Some(id) = recall.resolve_prefix(prefix).map_err(store_err)? else {
+        // PBA-L6b-017: only readable tenants participate in matching/ambiguity.
+        let Some(id) = recall
+            .resolve_prefix_where(prefix, |n| self.can_read(&n.repo))
+            .map_err(store_err)?
+        else {
             return Ok(None);
         };
         match self.store.get_node(&id).map_err(store_err)? {
@@ -613,7 +626,7 @@ impl<'a> MemoryMcpServer<'a> {
             return Ok(deny);
         }
         let recall = Recall::new(self.store);
-        let id = match recall.resolve_prefix(&prefix).map_err(store_err)? {
+        let id = match recall.resolve_prefix_in(&repo, &prefix).map_err(store_err)? { // PBA-L6b-017
             Some(id) => id,
             None => return Ok(tool_error(format!("no unique node for prefix '{prefix}'"))),
         };
@@ -900,7 +913,14 @@ impl<'a> MemoryMcpServer<'a> {
             Ok(guard) => guard,
             Err(deny) => return Ok(deny),
         };
-        match apply_diff(self.store, &diff) {
+        // PBA-L6b-002: the merging principal's author identity, so an existing
+        // node/edge can only be changed by its own author (never LWW-overwritten).
+        let caller = self.asserter.as_ref().map(|a| a.pubkey_hex().to_string());
+        match apply_diff(self.store, &diff, caller.as_deref()) {
+            Ok(report) if report.unembedded > 0 => Ok(tool_text(format!(
+                "merged {} nodes, {} edges — {} relayed node(s) stored WITHOUT their embedding (only the author may set it); not findable by memory.search until the author merges it or a backfill runs",
+                report.nodes, report.edges, report.unembedded
+            ))),
             Ok(report) => Ok(tool_text(format!("merged {} nodes, {} edges", report.nodes, report.edges))),
             Err(e) => Ok(tool_error(format!("merge rejected: {e}"))),
         }
@@ -2233,5 +2253,153 @@ mod tests {
             }
         });
         assert_eq!(s.node_count().unwrap(), before + 2, "both sessions' assertions landed");
+    }
+
+    /// PBA-L6b-017 over MCP: an own-tenant prefix that collides with a node in a
+    /// tenant the session cannot read resolves the same whether or not that
+    /// foreign node exists (no existence oracle).
+    #[test]
+    fn pba_l6b_017_mcp_prefix_is_not_a_cross_tenant_oracle() {
+        let own = node("citrate-chain", "own chain note");
+        let own_hex = own.compute_id().to_hex();
+        let mut i = 0;
+        let foreign = loop {
+            let n = node("citrate-identity", &format!("foreign identity note {i}"));
+            if n.compute_id().to_hex()[..3] == own_hex[..3] {
+                break n;
+            }
+            i += 1;
+        };
+        let prefix = &own_hex[..3];
+        for with_foreign in [false, true] {
+            let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+            s.put_node(&own).unwrap();
+            if with_foreign {
+                s.put_node(&foreign).unwrap();
+            }
+            for tool in ["memory.verify", "memory.neighbors", "memory.analogy"] {
+                let mut srv = MemoryMcpServer::new(&s, grant());
+                let r = call_json(&mut srv, tool, json!({"repo": "citrate-chain", "id_prefix": prefix}));
+                assert_eq!(r["isError"], false, "PBA-L6b-017: {tool} differs by foreign existence ({with_foreign})");
+            }
+        }
+    }
+
+    /// PBA-L6b-036: the per-request `_meta` attenuation must also narrow the
+    /// per-ITEM cross-tenant filter (`can_read`), not just the anchor authz. A
+    /// session that reads both tenants, narrowed per request to citrate-chain,
+    /// must not see the citrate-identity neighbour in that request.
+    #[test]
+    fn pba_l6b_036_meta_attenuation_narrows_cross_tenant_neighbors() {
+        let s = store();
+        let nodes = s.all_nodes().unwrap();
+        let chain = nodes.iter().find(|n| n.repo == "citrate-chain").unwrap().clone();
+        let ident = nodes.iter().find(|n| n.repo == "citrate-identity").unwrap().clone();
+        let mut edge = Asserter::new(trust_key()).assert_edge(chain.compute_id(), ident.compute_id(), EdgeKind::AnalogousTo, 1);
+        edge.quarantined = false;
+        s.add_edge(&edge).unwrap();
+        let prefix = chain.compute_id().to_hex()[..12].to_string();
+        let mut srv = MemoryMcpServer::new(&s, session_grant_all());
+
+        // Control: the wildcard session sees the cross-tenant neighbour.
+        let open = text_of(&call_json(&mut srv, "memory.neighbors", json!({"repo": "citrate-chain", "id_prefix": prefix})));
+        assert!(open.contains("siwe login"), "control: session grant reads citrate-identity");
+
+        let narrowed = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "memory.neighbors",
+                "arguments": { "repo": "citrate-chain", "id_prefix": prefix },
+                "_meta": { "ai.citrate/grant": grant_scoped("repo:citrate-chain/memory", "agent:test", &trust_key()) }
+            }
+        })
+        .to_string();
+        let resp: Value = serde_json::from_str(&srv.handle_line(&narrowed).unwrap()).unwrap();
+        let text = text_of(&resp["result"]);
+        assert!(!text.contains("siwe"), "PBA-L6b-036: _meta-narrowed request still saw citrate-identity: {text}");
+        assert!(!text.contains("citrate-identity"), "PBA-L6b-036: existence leaked: {text}");
+
+        // The attenuation is per-request: the next plain call sees it again.
+        let again = text_of(&call_json(&mut srv, "memory.neighbors", json!({"repo": "citrate-chain", "id_prefix": prefix})));
+        assert!(again.contains("siwe login"));
+    }
+
+    /// PBA-L6b-002 over MCP: memory.merge_diff hands apply_diff the SESSION
+    /// asserter as caller — the author can update their own node (monotone), a
+    /// different session cannot; a node-only diff is not "empty".
+    #[test]
+    fn pba_l6b_002_mcp_merge_diff_is_author_gated() {
+        let s = store();
+        let me = asserter();
+        let mine = me.assert_node("citrate-chain", NodeKind::Rationale, "my note", 1);
+        let mut d = MemoryDiff::new(me.pubkey_hex(), 1);
+        d.add_node(mine.clone());
+        let args = json!({"diff": d.to_json().unwrap()});
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), me.clone());
+        let r = call_json(&mut srv, "memory.merge_diff", args);
+        assert_eq!(r["isError"], false, "a node-only diff merges: {r}");
+        assert!(text_of(&r).contains("merged 1 nodes, 0 edges"));
+
+        let mut retired = mine.clone();
+        retired.status = Status::Archived;
+        let mut d2 = MemoryDiff::new(me.pubkey_hex(), 2);
+        d2.add_node(retired);
+        let args2 = json!({"diff": d2.to_json().unwrap()});
+        let mut other = MemoryMcpServer::new_with_asserter(&s, write_grant(), Asserter::new(SigningKey::from_bytes(&[9u8; 32])));
+        let r = call_json(&mut other, "memory.merge_diff", args2.clone());
+        assert_eq!(r["isError"], true, "another session may not retire my node: {r}");
+        assert_eq!(s.get_node(&mine.compute_id()).unwrap().unwrap().status, Status::Active);
+        let mut reader = MemoryMcpServer::new(&s, write_grant());
+        assert_eq!(call_json(&mut reader, "memory.merge_diff", args2.clone())["isError"], true, "no identity, no change");
+
+        let r = call_json(&mut srv, "memory.merge_diff", args2);
+        assert_eq!(r["isError"], false, "the author may: {r}");
+        assert_eq!(s.get_node(&mine.compute_id()).unwrap().unwrap().status, Status::Archived);
+    }
+
+    /// merge_diff byte cap boundary (FUA-MEMORIES-05): exactly 4 MiB is parsed
+    /// (and rejected as malformed), one byte more is refused as too large.
+    #[test]
+    fn merge_diff_byte_cap_is_inclusive() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        let at = "x".repeat(4 * 1024 * 1024);
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": at}));
+        assert!(text_of(&r).starts_with("malformed diff"), "{}", text_of(&r));
+        let over = "x".repeat(4 * 1024 * 1024 + 1);
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": over}));
+        assert!(text_of(&r).starts_with("diff too large"), "{}", text_of(&r));
+        let empty = MemoryDiff::new(asserter().pubkey_hex(), 1).to_json().unwrap();
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": empty}));
+        assert!(text_of(&r).starts_with("empty diff"));
+    }
+
+    /// PBA-L6b-001 follow-up (verifier probe `v_l6b001_mcp_verify_counts_foreign_edges`):
+    /// MCP `memory.verify` / `memory.critique` must not count or flag edges whose
+    /// far end lives in a tenant the session cannot read (existence + edge-kind leak).
+    #[test]
+    fn pba_l6b_001_mcp_verify_and_critique_ignore_unreadable_edges() {
+        let s = store();
+        let nodes = s.all_nodes().unwrap();
+        let chain = nodes.iter().find(|n| n.repo == "citrate-chain").unwrap().clone();
+        let ident = nodes.iter().find(|n| n.repo == "citrate-identity").unwrap().clone();
+        let a = Asserter::new(trust_key());
+        s.add_edge(&a.assert_edge(ident.compute_id(), chain.compute_id(), EdgeKind::Refutes, 2)).unwrap();
+        s.add_edge(&a.propose_edge(ident.compute_id(), chain.compute_id(), EdgeKind::AnalogousTo, EdgeMethod::Nlp, None, 3)).unwrap();
+        let prefix = chain.compute_id().to_hex()[..12].to_string();
+
+        let mut only_chain = MemoryMcpServer::new(&s, grant());
+        let v = text_of(&call_json(&mut only_chain, "memory.verify", json!({"repo":"citrate-chain","id_prefix":prefix})));
+        assert!(v.contains("trustworthy: true"), "PBA-L6b-001: unreadable refutation counted: {v}");
+        assert!(!v.contains("refuted"), "{v}");
+        let c = text_of(&call_json(&mut only_chain, "memory.critique", json!({"repo":"citrate-chain"})));
+        assert!(!c.contains("unconfirmed proposal"), "PBA-L6b-001: unreadable proposal flagged: {c}");
+
+        // A session that reads both tenants still sees both.
+        let mut both = MemoryMcpServer::new(&s, grant_both(false));
+        let v = text_of(&call_json(&mut both, "memory.verify", json!({"repo":"citrate-chain","id_prefix":prefix})));
+        assert!(v.contains("refuted/contradicted by 1 node(s)"), "{v}");
+        let c = text_of(&call_json(&mut both, "memory.critique", json!({"repo":"citrate-chain"})));
+        assert!(c.contains("unconfirmed proposal"), "{c}");
     }
 }

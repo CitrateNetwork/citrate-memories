@@ -27,6 +27,8 @@ thiserror = { workspace = true }
 # WP-5.3 chain-anchor checkpoint binding (feature-gated so the default build
 # stays network-free). ureq is already a transitive workspace dependency.
 ureq = { version = "2", features = ["json"], optional = true }
+# PBA-L6b-019: hex-encode the per-peer grant credential on the HTTP transport.
+hex = { workspace = true, optional = true }
 
 [dev-dependencies]
 ed25519-dalek = "2"
@@ -39,7 +41,7 @@ rocksdb = ["mem-store/rocksdb"]
 chain = ["dep:ureq"]
 # WP-5.4 minimal HTTP bundle transport (push/pull) so federation sync needs no
 # operator file-moves. Server is std-net only; client is ureq. Gossip is deferred.
-http = ["dep:ureq"]
+http = ["dep:ureq", "dep:hex"]
 
 [[example]]
 name = "sync"
