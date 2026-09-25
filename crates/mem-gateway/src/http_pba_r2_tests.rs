@@ -202,7 +202,7 @@ use mem_core::{BelnapValue, Status, VersionedVector};
 
 fn byom_headers(secret: &str, sub: &str, scope: &str) -> HeaderMap {
     let now_s = (now_ms() / 1000) as usize;
-    let tok = mint_connect_token(secret, sub, Some(scope), &[], now_s, 900).unwrap();
+    let tok = mint_connect_token(secret, ORG, sub, Some(scope), &[], now_s, 900).unwrap();
     let mut h = HeaderMap::new();
     h.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {tok}")).unwrap());
     h
@@ -452,4 +452,39 @@ fn pba_l6b_018_tripwire_byom_work_is_bounded() {
         assert!(f.contains(must), "PBA-L6b-018: byom lost `{must}`");
     }
     assert!(!f.contains("for line in body.lines()"), "PBA-L6b-018: byom runs raw body lines inline again");
+}
+
+// ---------------------------------------------------------------------------
+// PBA-L3c-032 (gateway half) — BYOM connect tokens are org-bound
+// ---------------------------------------------------------------------------
+
+fn hs256(secret: &str, claims: Value) -> HeaderMap {
+    let tok = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap();
+    let mut h = HeaderMap::new();
+    h.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {tok}")).unwrap());
+    h
+}
+
+/// PBA-L3c-032: a connect token minted for a DIFFERENT org (the webapp puts the
+/// org in the token, the gateway used to ignore it) must be refused here, and a
+/// token with no org claim at all is refused too (fail closed).
+#[tokio::test]
+async fn pba_l3c_032_byom_refuses_token_for_another_org() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("mallory", &["tenant-a"], false)], Some(secret));
+    let exp = (now_ms() / 1000) as usize + 600;
+    let other = hs256(secret, json!({"sub": "mallory", "exp": exp, "scope": "read", "org": "some-other-org"}));
+    let r = byom(State(app.clone()), Path("mallory".into()), other, recall_line(1)).await;
+    assert_eq!(r.err().map(|e| e.status), Some(StatusCode::FORBIDDEN), "PBA-L3c-032: foreign-org token accepted");
+    let none = hs256(secret, json!({"sub": "mallory", "exp": exp, "scope": "read"}));
+    let r = byom(State(app.clone()), Path("mallory".into()), none, recall_line(1)).await;
+    assert_eq!(r.err().map(|e| e.status), Some(StatusCode::FORBIDDEN), "PBA-L3c-032: org-less token accepted");
+    let ok = hs256(secret, json!({"sub": "mallory", "exp": exp, "scope": "read", "org": ORG}));
+    assert!(byom(State(app), Path("mallory".into()), ok, recall_line(1)).await.is_ok(), "own-org token works");
 }

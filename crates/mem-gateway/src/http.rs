@@ -1023,7 +1023,7 @@ async fn connect_token(
     // days + no scope, i.e. a long-lived full-org bearer credential.
     const TTL_SECS: usize = 15 * 60; // 15 minutes
     let now_secs = (now_ms() / 1000) as usize;
-    let token = mint_connect_token(secret, &sub, Some("read"), &[], now_secs, TTL_SECS)
+    let token = mint_connect_token(secret, app.org_id.as_str(), &sub, Some("read"), &[], now_secs, TTL_SECS)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "mint failed"))?;
     Ok(Json(json!({
         "connect_token": token,
@@ -1051,6 +1051,11 @@ async fn byom(
         verify_connect_token(secret, &token).map_err(|_| unauthorized("connect token rejected"))?;
     if claims.sub != sub {
         return Err(forbidden("connect token sub mismatch"));
+    }
+    // PBA-L3c-032: a connect token is bound to the org it was minted for; one
+    // minted for another org (or with no org at all — fail closed) is refused.
+    if claims.org.as_deref() != Some(app.org_id.as_str()) {
+        return Err(forbidden("connect token not issued for this org"));
     }
 
     let membership = {
@@ -1211,7 +1216,7 @@ mod byom_attenuation_tests {
             grant.check("repo:citrate-chain/memory", Op::Write, now).is_ok(),
             "precondition: owner membership can write before attenuation"
         );
-        let claims = ConnectClaims { sub: "owner-1".into(), scope: Some("read".into()), tenants: None };
+        let claims = ConnectClaims { sub: "owner-1".into(), scope: Some("read".into()), tenants: None, org: None };
         let att = attenuate_grant(&grant, &claims, &sk);
         assert!(att.check("repo:citrate-chain/memory", Op::Read, now).is_ok(), "read is preserved");
         assert!(
@@ -1231,6 +1236,7 @@ mod byom_attenuation_tests {
             sub: "owner-1".into(),
             scope: Some("read,propose".into()),
             tenants: Some(vec!["citrate-landing".into()]),
+            org: None,
         };
         let att = attenuate_grant(&grant, &claims, &sk);
         assert!(att.check("repo:citrate-landing/memory", Op::Write, now).is_ok(), "named tenant writable (propose ⇒ write)");
@@ -1247,7 +1253,7 @@ mod byom_attenuation_tests {
         let sk = signing_key_from_seed("seed");
         let now = now_ms();
         let grant = mint_grant(&sk, "iss", &owner_membership(), now, GRANT_TTL_MS);
-        let claims = ConnectClaims { sub: "owner-1".into(), scope: None, tenants: None };
+        let claims = ConnectClaims { sub: "owner-1".into(), scope: None, tenants: None, org: None };
         let att = attenuate_grant(&grant, &claims, &sk);
         assert!(att.check("repo:x/memory", Op::Read, now).is_ok());
         assert!(
