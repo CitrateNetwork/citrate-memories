@@ -82,8 +82,15 @@ fn resource_matches(scope: &str, requested: &str) -> bool {
 
 impl CapabilityGrant {
     /// Domain-separated, length-prefixed encoding of the identity-bearing fields.
-    /// Excludes `revoked` and `signature` (mutable/derived); includes
-    /// `issuer_pubkey` so the signing key is bound to the grant.
+    /// Excludes `signature` (derived); includes `issuer_pubkey` so the signing key
+    /// is bound to the grant.
+    ///
+    /// PBA-L6b-019 follow-up: `revoked` is covered WHEN SET (tag 11), so a grant
+    /// the issuer signed as revoked cannot be un-revoked by the presenter flipping
+    /// the flag back. A never-revoked grant's preimage is unchanged, so every
+    /// existing signature still verifies. (Revoking an already-issued grant still
+    /// needs a server-side deny list keyed by grant id — the holder keeps the old
+    /// copy — see `mem-sync::transport::PeerAuth::revoked_ids`.)
     pub fn signing_preimage(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
         feed(&mut buf, 0, b"mem-authz:grant:v1");
@@ -101,6 +108,9 @@ impl CapabilityGrant {
             feed(&mut buf, 9, &d.at_ms.to_le_bytes());
         }
         feed(&mut buf, 10, &self.issuer_pubkey);
+        if self.revoked {
+            feed(&mut buf, 11, b"revoked");
+        }
         buf
     }
 

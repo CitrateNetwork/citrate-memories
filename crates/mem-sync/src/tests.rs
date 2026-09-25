@@ -968,3 +968,32 @@ fn tripwire_trusted_local_grant_key_is_not_hardcoded() {
         "trusted_local_grant must NOT sign with a hardcoded constant key (MEM-B-018)"
     );
 }
+
+/// PBA-L6b-019 tripwire (remediation plan): the peer-to-peer HTTP transport stays
+/// OFF in every shipped binary until mTLS / peer identity lands. Fails if any
+/// workspace crate enables mem-sync's `http` feature (the only ones allowed are
+/// mem-sync itself, whose manifest declares it).
+#[test]
+fn tripwire_no_binary_enables_the_sync_http_feature() {
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&crates_dir).expect("crates dir") {
+        let dir = entry.expect("entry").path();
+        let manifest = dir.join("Cargo.toml");
+        if dir.file_name().and_then(|n| n.to_str()) == Some("mem-sync") || !manifest.exists() {
+            continue;
+        }
+        let toml = std::fs::read_to_string(&manifest).expect("read manifest");
+        for line in toml.lines().filter(|l| l.contains("mem-sync")) {
+            assert!(
+                !line.contains("\"http\""),
+                "PBA-L6b-019: {} enables mem-sync's `http` transport: {line}",
+                manifest.display()
+            );
+        }
+        // `mem-sync/http` feature forwarding, e.g. `foo = ["mem-sync/http"]`.
+        assert!(!toml.contains("mem-sync/http"), "PBA-L6b-019: {} forwards mem-sync/http", manifest.display());
+        checked += 1;
+    }
+    assert!(checked >= 9, "scanned {checked} crate manifests");
+}
