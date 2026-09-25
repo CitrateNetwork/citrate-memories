@@ -41,6 +41,26 @@ export async function withOwner<T>(req: Request, fn: (owner: string) => Promise<
   }
 }
 
+/**
+ * PBA-L3c-038: what of a gateway error the browser may see. A 4xx carries the
+ * gateway's own deliberate `error` string (e.g. "not authorized for resource"),
+ * trimmed; a 5xx body (internal paths, store errors, upstream detail) and any
+ * non-JSON body are replaced with a generic message.
+ */
+export function publicGatewayMessage(e: GatewayError): string {
+  if (e.status >= 400 && e.status < 500) {
+    try {
+      const parsed = JSON.parse(e.message) as { error?: unknown };
+      if (typeof parsed?.error === "string") return parsed.error.slice(0, 200);
+    } catch {
+      /* not the gateway's JSON error shape */
+    }
+    if (e.status === 400 && e.message === "invalid path segment") return e.message;
+    return `gateway request failed (${e.status})`;
+  }
+  return e.status === 503 ? "gateway unavailable" : "gateway request failed";
+}
+
 export async function withCaller<T>(
   req: Request,
   fn: (caller: GatewayCaller) => Promise<T>,
@@ -63,7 +83,7 @@ export async function withCaller<T>(
     if (e instanceof GatewayError) {
       // 401/403/404/503 from the gateway pass through; anything else is 502.
       const status = [400, 401, 403, 404, 429, 503].includes(e.status) ? e.status : 502;
-      return json({ error: e.message }, status);
+      return json({ error: publicGatewayMessage(e) }, status);
     }
     return json({ error: "gateway request failed" }, 502);
   }

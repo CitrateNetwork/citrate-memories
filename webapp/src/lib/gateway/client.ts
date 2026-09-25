@@ -123,7 +123,18 @@ export async function health(): Promise<{ ok: boolean; service?: string }> {
   return (await res.json()) as { ok: boolean; service?: string };
 }
 
-const enc = encodeURIComponent;
+/**
+ * Encode ONE path segment (PBA-L3c-038). `encodeURIComponent` leaves `.` and
+ * `..` intact, and URL parsing then normalizes them — `/tenants/../x` would reach
+ * a different gateway route than the one this client meant. Such segments (and
+ * empty ones) are refused outright.
+ */
+export function enc(segment: string): string {
+  if (segment === "" || segment === "." || segment === "..") {
+    throw new GatewayError(400, "invalid path segment");
+  }
+  return encodeURIComponent(segment);
+}
 
 export const gateway = {
   health,
