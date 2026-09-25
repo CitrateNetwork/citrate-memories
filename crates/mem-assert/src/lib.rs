@@ -350,6 +350,13 @@ pub fn inserted_by_key(e: &Edge) -> Vec<u8> {
     [b"edge-inserted-by:".as_slice(), &e.key()].concat()
 }
 
+/// Edge kinds whose confirmation contests another principal's node and so needs
+/// a second party (the node's author, or a writer who is neither the proposal's
+/// inserter nor its signer).
+pub fn needs_second_party(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Supersedes | EdgeKind::Refutes | EdgeKind::Contradicts)
+}
+
 /// Largest clock skew tolerated on a relayed node's `observed_at` (5 minutes).
 pub const RELAY_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -500,7 +507,7 @@ pub fn apply_diff(
                 return Err(AssertError::NotAuthor(label()));
             }
         }
-        let target_author = if e.kind == EdgeKind::Supersedes {
+        let target_author = if needs_second_party(e.kind) {
             match diff.nodes.iter().find(|n| n.compute_id() == e.to) {
                 Some(n) => Some(n.author.clone()),
                 None => store.get_node(&e.to)?.map(|n| n.author),
@@ -511,9 +518,9 @@ pub fn apply_diff(
         // Pass 2: a Supersedes proposal onto another principal's node must be
         // current — a backdated proposal is a primed backdate for a later confirm
         // (also when it would rewrite a stored proposal's timestamp).
-        if e.kind == EdgeKind::Supersedes && e.quarantined {
+        if needs_second_party(e.kind) && e.quarantined {
             if let Some(author) = &target_author {
-                if !is_caller(author) && e.provenance.at.abs_diff(now) > RELAY_CLOCK_SKEW_MS {
+                if e.kind == EdgeKind::Supersedes && !is_caller(author) && e.provenance.at.abs_diff(now) > RELAY_CLOCK_SKEW_MS {
                     return Err(AssertError::NotAuthor(format!(
                         "{} (supersedes proposal on another principal's node must be timestamped now)",
                         label()
@@ -524,7 +531,7 @@ pub fn apply_diff(
                 // pass for a second party at confirmation.
                 if !is_caller(author) && !is_caller(&e.provenance.asserter) {
                     return Err(AssertError::NotAuthor(format!(
-                        "{} (supersedes proposal on another principal's node must be signed by the caller)",
+                        "{} (proposal contesting another principal's node must be signed by the caller)",
                         label()
                     )));
                 }
@@ -553,7 +560,7 @@ pub fn apply_diff(
     // GHSA-p545: record the inserting principal of every Supersedes proposal this
     // diff wrote, for the second-party confirmation rule.
     if let Some(c) = caller {
-        for e in plain.iter().filter(|e| e.kind == EdgeKind::Supersedes && e.quarantined) {
+        for e in plain.iter().filter(|e| needs_second_party(e.kind) && e.quarantined) {
             let tenant = match diff.nodes.iter().find(|n| n.compute_id() == e.to) {
                 Some(n) => Some(n.repo.clone()),
                 None => store.get_node(&e.to)?.map(|n| n.repo),
@@ -1281,5 +1288,35 @@ mod tests {
         assert!(k1.starts_with(b"edge-inserted-by:") && k1.ends_with(&e1.key()));
         assert_eq!(k1.len(), b"edge-inserted-by:".len() + e1.key().len());
         assert_ne!(k1, inserted_by_key(&e2));
+    }
+
+    /// Pass 4: a relayed Refutes/Contradicts proposal onto another principal's
+    /// node must be signed by the caller, and the diff records its inserter.
+    #[test]
+    fn ghsa_p545_contesting_proposals_are_signer_bound_and_recorded() {
+        for kind in [EdgeKind::Refutes, EdgeKind::Contradicts] {
+            let bob = asserter(56);
+            let mal = asserter(57);
+            let puppet = asserter(58);
+            let victim = bob.assert_node("r", NodeKind::Adr, "bob", 1_000);
+            let store = stored_with(&victim);
+            let mine = mal.assert_node("r", NodeKind::Rationale, "mine", 2_000);
+            store.put_node(&mine).unwrap();
+            let now = super::wall_now_ms();
+            let pp = puppet.propose_edge(mine.compute_id(), victim.compute_id(), kind, EdgeMethod::Nlp, None, now);
+            let mut d = MemoryDiff::new(mal.pubkey_hex(), 1);
+            d.add_edge(pp);
+            assert!(matches!(apply_diff(&store, &d, Some(mal.pubkey_hex())), Err(AssertError::NotAuthor(_))), "{kind:?}");
+            // (no timestamp window for these kinds: they carry no validity time)
+            let own = mal.propose_edge(mine.compute_id(), victim.compute_id(), kind, EdgeMethod::Nlp, None, 1);
+            let mut d2 = MemoryDiff::new(mal.pubkey_hex(), 1);
+            d2.add_edge(own.clone());
+            apply_diff(&store, &d2, Some(mal.pubkey_hex())).unwrap();
+            assert_eq!(store.get_meta(&inserted_by_key(&own)).unwrap().as_deref(), Some(mal.pubkey_hex().as_bytes()), "{kind:?}");
+            assert!(needs_second_party(kind));
+        }
+        assert!(needs_second_party(EdgeKind::Supersedes));
+        assert!(!needs_second_party(EdgeKind::AnalogousTo));
+        assert!(!needs_second_party(EdgeKind::References));
     }
 }

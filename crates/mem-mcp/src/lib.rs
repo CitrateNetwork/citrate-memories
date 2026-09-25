@@ -729,7 +729,7 @@ impl<'a> MemoryMcpServer<'a> {
         }
         self.store.add_edge(&edge).map_err(store_err)?;
         // GHSA-p545: record this session as the proposal's inserting principal.
-        if kind == EdgeKind::Supersedes {
+        if mem_assert::needs_second_party(kind) {
             if let Some(a) = self.asserter.as_ref() {
                 self.store
                     .put_meta(&to_node.repo, &mem_assert::inserted_by_key(&edge), a.pubkey_hex().as_bytes())
@@ -772,7 +772,7 @@ impl<'a> MemoryMcpServer<'a> {
         // PBA-L6b-002 pass 2: a Supersedes that retires ANOTHER principal's node
         // needs a second party — its author, or a writer other than the proposer
         // (no self-confirmed cross-author retirement).
-        if kind == EdgeKind::Supersedes {
+        if mem_assert::needs_second_party(kind) {
             let caller = self.asserter.as_ref().map(|a| a.pubkey_hex().to_string());
             let proposal = self
                 .store
@@ -802,7 +802,7 @@ impl<'a> MemoryMcpServer<'a> {
             };
             if !allowed {
                 return Ok(tool_error(
-                    "a supersession of another principal's node must be confirmed by that node's author or by a writer other than its proposer".to_string(),
+                    "a supersedes/refutes/contradicts edge on another principal's node must be confirmed by that node's author or by a writer other than its proposer".to_string(),
                 ));
             }
         }
@@ -2566,5 +2566,55 @@ mod tests {
         assert!(text_of(&call_json(&mut srv, "memory.propose_edge", args)).starts_with("proposed"), "re-proposing a proposal is allowed");
         let r = call_json(&mut srv, "memory.propose_edge", json!({"from_prefix": x.to_hex()[..16], "to_prefix": z.to_hex()[..16], "kind": "references"}));
         assert!(text_of(&r).contains("already exists"), "same-key load-bearing edge is left intact");
+    }
+
+    /// Pass 4: the two-party confirmation binding also covers Refutes and
+    /// Contradicts onto another principal's node (they flip its verify result);
+    /// the author may confirm; a distinct writer may; the proposer/inserter may
+    /// not; an unattributed (legacy) proposal is author-only.
+    #[test]
+    fn ghsa_p545_refutes_and_contradicts_need_a_second_party() {
+        for (kind, kind_str) in [(EdgeKind::Refutes, "refutes"), (EdgeKind::Contradicts, "contradicts")] {
+            let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+            let bob = Asserter::new(SigningKey::from_bytes(&[41u8; 32]));
+            let mal = Asserter::new(SigningKey::from_bytes(&[42u8; 32]));
+            let carol = Asserter::new(SigningKey::from_bytes(&[43u8; 32]));
+            let vid = s.put_node(&bob.assert_node("citrate-chain", NodeKind::Adr, "bob claim", 1_000)).unwrap();
+            let v2 = s.put_node(&bob.assert_node("citrate-chain", NodeKind::Adr, "bob claim 2", 1_000)).unwrap();
+            let own = s.put_node(&mal.assert_node("citrate-chain", NodeKind::Adr, "mal claim", 1_000)).unwrap();
+            let mid = s.put_node(&mal.assert_node("citrate-chain", NodeKind::Rationale, "rebuttal", 2_000)).unwrap();
+            let args = |to: &mem_core::ContentHash| json!({"from_prefix": mid.to_hex()[..16], "to_prefix": to.to_hex()[..16], "kind": kind_str});
+            let mut as_mal = MemoryMcpServer::new_with_asserter(&s, write_grant(), mal.clone());
+            let mut as_carol = MemoryMcpServer::new_with_asserter(&s, write_grant(), carol.clone());
+            let mut as_bob = MemoryMcpServer::new_with_asserter(&s, write_grant(), bob.clone());
+            let verify = |srv: &mut MemoryMcpServer, id: &mem_core::ContentHash| {
+                text_of(&call_json(srv, "memory.verify", json!({"repo":"citrate-chain","id_prefix": id.to_hex()[..16]})))
+            };
+
+            assert_eq!(call_json(&mut as_mal, "memory.propose_edge", args(&vid))["isError"], false);
+            assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&vid))["isError"], true, "{kind_str}: proposer self-confirm");
+            assert!(verify(&mut as_carol, &vid).contains("trustworthy: true"), "{kind_str}: bob's node untouched");
+            assert_eq!(call_json(&mut as_carol, "memory.confirm_edge", args(&vid))["isError"], false, "{kind_str}: distinct writer");
+            assert!(verify(&mut as_carol, &vid).contains("refuted/contradicted by 1"));
+
+            // Legacy (no recorded inserter): author only.
+            s.add_edge(&mal.propose_edge(mid, v2, kind, EdgeMethod::Nlp, None, now_ms())).unwrap();
+            assert_eq!(call_json(&mut as_carol, "memory.confirm_edge", args(&v2))["isError"], true, "{kind_str}: legacy, not carol");
+            assert_eq!(call_json(&mut as_bob, "memory.confirm_edge", args(&v2))["isError"], false, "{kind_str}: legacy, author");
+
+            // Onto the proposer's OWN node: unchanged (self-refutation is the author's call).
+            assert_eq!(call_json(&mut as_mal, "memory.propose_edge", args(&own))["isError"], false);
+            assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&own))["isError"], false, "{kind_str}: own node");
+        }
+        // Non-contested kinds are unchanged: self-confirm of an AnalogousTo stays allowed.
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let bob = Asserter::new(SigningKey::from_bytes(&[44u8; 32]));
+        let mal = Asserter::new(SigningKey::from_bytes(&[45u8; 32]));
+        let vid = s.put_node(&bob.assert_node("citrate-chain", NodeKind::Adr, "b", 1)).unwrap();
+        let mid = s.put_node(&mal.assert_node("citrate-chain", NodeKind::Adr, "m", 1)).unwrap();
+        let a = json!({"from_prefix": mid.to_hex()[..16], "to_prefix": vid.to_hex()[..16], "kind": "analogous_to"});
+        let mut as_mal = MemoryMcpServer::new_with_asserter(&s, write_grant(), mal);
+        assert_eq!(call_json(&mut as_mal, "memory.propose_edge", a.clone())["isError"], false);
+        assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", a)["isError"], false);
     }
 }
