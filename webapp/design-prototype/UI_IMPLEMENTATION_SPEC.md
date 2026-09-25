@@ -749,7 +749,7 @@ Appears when lasso box-select is active:
   - "Ask about these N" → Adds to Ask context
   - "Focus these" → Fly camera to selection center
   - "Confirm N advisory" → Promote advisory → confirmed
-  - "Propose cluster edge" → Generate HITL proposal
+  - "Propose cluster edge" → Generate HIC proposal
   - "Export" → Download memory lineage
 
 ### 3.8 Command Palette (⌘K)
@@ -777,11 +777,11 @@ Auto-dismissing notification:
 - Icon + text + optional audit sequence
 - Fades after 2.8s
 
-### 3.10 Review Center (HITL)
+### 3.10 Review Center (HIC)
 
 **Component: `ReviewCenter`**
 
-Four-tab interface for human-in-the-loop confirmation:
+Four-tab interface for HIC confirmation:
 1. **Proposals** — AI-proposed edges awaiting witness
 2. **Contradictions** — Belnap "Both" conflicts
 3. **Supersessions** — Old memory → new memory links
@@ -1352,7 +1352,7 @@ setState(p) {
     - "Ask about this" → Add to Ask context, switch to Ask tab
     - "Focus neighborhood" → Fly camera, highlight neighbors
     - "Find analogues" → Query for cross-repo parallels
-    - "Propose edge" → HITL proposal modal
+    - "Propose edge" → HIC proposal modal
 
 - **TimeScrubber**:
   - Knob drag → Update timeline
@@ -1363,7 +1363,7 @@ setState(p) {
   - "Ask about these" → Pull selected into context
   - "Focus these" → Fly camera to centroid
   - "Confirm advisory" → Mark advisory nodes as confirmed
-  - "Propose cluster edge" → Generate HITL proposal
+  - "Propose cluster edge" → Generate HIC proposal
   - "Export" → Download memory lineage
 
 - **Review Center**:
@@ -1420,7 +1420,7 @@ Shift + drag on canvas → Start lasso box
     - "Ask about these" → Add to Ask context
     - "Focus these" → Fly camera to selection centroid
     - "Confirm advisory" → Promote advisory nodes
-    - "Propose cluster edge" → Generate HITL proposal
+    - "Propose cluster edge" → Generate HIC proposal
     - "Export" → Download lineage
   → Click X or Clear → Dismiss SelectionHUD
 ```

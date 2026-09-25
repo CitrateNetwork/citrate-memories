@@ -1,7 +1,7 @@
 # Memrizz — citrate-memories webapp
 
 > The human face of the citrate-memories knowledge DAG: a 2.5D memory **constellation**
-> you can fly through, ask in plain language, and steward through a human-in-the-loop
+> you can fly through, ask in plain language, and steward through an HIC (Human In Control)
 > trust workflow. Next.js 16 / React 19, fronting `mem-gateway`.
 
 **Status:** WP-7.0 → WP-7.3 + WP-7.2 (BFF) complete and verified green (`pnpm test`
@@ -57,7 +57,7 @@ locked; the rest is staged in
   `verify` + `neighbors`, renders the trust verdict + blast-radius (clickable → fly-to)
   + actions, via an imperative constellation handle. **7.6:** `/api/chat` grounds every
   answer in real memories (`search`→`recall` fallback) with citations that fly to nodes
-  (LLM-synthesis seam present; retrieval-grounded without a provider). **7.8:** the HITL
+  (LLM-synthesis seam present; retrieval-grounded without a provider). **7.8:** the HIC
   Review Center derives proposals/contradictions/supersessions from the scene and
   **Confirm** calls the write-scoped, audited `edges/confirm` route. **G-4:** member
   provisioning — `members` GET/POST + DELETE (attenuation-gated onboarding, F-7
@@ -156,7 +156,7 @@ webapp/
    feed it from `GET /api/orgs/[org]/layout` (the BFF route is live).
 2. **Gateway (Rust)** — G-2 real OIDC/JWKS verification + G-3 durable ControlPlane in
    `crates/mem-gateway`; the BFF already forwards the bearer by default. G-1 write
-   routes (assert/propose/confirm) unblock the HITL surfaces.
+   routes (assert/propose/confirm) unblock the HIC surfaces.
 3. **WP-7.1 follow-through** — register Memrizz as an OIDC client in
    `citrate-identity/src/config.ts`; add `/auth/callback` + client provider
    (`src/lib/auth/client.tsx`) for the login flow.

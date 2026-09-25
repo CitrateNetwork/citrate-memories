@@ -35,7 +35,7 @@ non-technical teammate logs in with their Citrate identity, *sees* the org's mem
 as a living 3D constellation, asks it questions in plain language with the model of
 their choice, watches the answer's sources light up, and — where a human's judgment
 is required (confirming an AI's guess, resolving a contradiction, forgetting a
-record) — does so through a calm, trustworthy Human-in-the-Loop interface. It must
+record) — does so through a calm, trustworthy Human In Control (HIC) interface. It must
 feel like piloting a starship through your company's mind: gorgeous, fast, legible,
 and never lying about what it knows or how sure it is.
 
@@ -49,7 +49,7 @@ and never lying about what it knows or how sure it is.
 |---|---|---|
 | **Non-technical teammate** (PM, ops, design, exec) | "What happened with X? Why did we decide Y? What depends on Z?" — answered in plain language with trustworthy citations | Plain-language first; the graph is *explorable* but never *required*; jargon (DAG, blue_score, Belnap) is hidden behind friendly affordances with progressive disclosure |
 | **Technical teammate / agent operator** | Connect their own model via MCP; deep recall; propose edges; trace provenance | Power tools one layer down; BYOM connection manager; keyboard-driven |
-| **Regular administrator** | Onboard team members, scope their access, run the HITL review queues for their tenants | Admin console scoped to their subtree; review inboxes |
+| **Regular administrator** | Onboard team members, scope their access, run the HIC review queues for their tenants | Admin console scoped to their subtree; review inboxes |
 | **Super administrator** | Everything: roles, tenants, ingestion, ops/recovery, the "forget" (crypto-shred) power | Full admin + dangerous-action surfaces with strong confirmation + audit |
 
 ### 1.2 The three core experiences (the product is these three, linked)
@@ -58,7 +58,7 @@ and never lying about what it knows or how sure it is.
 2. **Ask it** — conversational RAG over the graph with a model the user picks
    (in-app) or brings (BYOM over MCP). Answers cite nodes; cited nodes light up and
    fly into view. The chat and the constellation are **one linked surface**.
-3. **Steward it** — Human-in-the-Loop: confirm/reject AI proposals, resolve
+3. **Steward it** — Human In Control (HIC): confirm/reject AI proposals, resolve
    contradictions, supersede stale memory, and (admins) forget records — all
    recorded in a tamper-evident audit chain the user can see.
 
@@ -73,7 +73,7 @@ and never lying about what it knows or how sure it is.
   it's the whole trust model.
 - **AI output is a proposal, never a fact, until a human confirms.** Anything an LLM
   or the analogy engine produces enters **quarantined** and is advisory. Confirmation
-  is a deliberate human act. This is the HITL spine.
+  is a deliberate human act. This is the HIC spine.
 - **Fail closed, visibly.** No access without a valid scope; a denied action says so
   plainly (and is audited). Missing config never silently opens a door.
 - **Everything is audited.** Reads, writes, denials — a hash-chained log the user can
@@ -140,7 +140,7 @@ structured):
 ```
                 ┌─────────────────────────────────────────────┐
   Browser  ───► │  Next.js app (Memrizz)                     │
-  (RP)          │  • UI: 3D constellation, chat, HITL, admin   │
+  (RP)          │  • UI: 3D constellation, chat, HIC, admin    │
                 │  • Server actions / route handlers (BFF)     │
                 │  • OIDC RP (citrate-identity, PKCE)          │
                 └───────────────┬─────────────────────────────┘
@@ -240,8 +240,8 @@ scope check. `*` means "all repo-tenants **in this Org**."
 |---|---|---|---|---|---|
 | **Platform Operator** | platform (us) | — (out-of-band) | platform | n/a | provision/suspend Orgs, platform health/ops, **never reads Org memory content** (isolation: ops-plane only, audited). The SaaS host role. |
 | **Org Owner** (Super Admin) | per-Org | `Maintainer` | `*` **within the Org** | yes — issues root + admin grants in the Org | everything in their Org incl. **forget (crypto-shred)**, repo-tenant lifecycle, ingestion, Org ops/recovery, manage Org admins, Org settings/billing, OSS export. **Cannot** cross Orgs. |
-| **Org Admin** (Regular Admin) | per-Org | `Operator` | subtree of repo-tenants (their `allowed_resources`) | yes — only a **subset** of their own scopes (attenuation) | onboard members under them, run HITL review queues for their repo-tenants, trigger ingestion for them, issue/revoke **delegated** grants in their subtree. **Cannot** shred, manage other admins, touch Org-level ops/billing. |
-| **Member** | per-Org | `Guided` or `ReadOnly` | specific repo-tenants | no (leaf) | query, visualize, BYOM-connect, **propose** (quarantined) edges/assertions; confirmation is HITL-gated to admins by default ⟦DECIDE⟧ whether `Operator` members can self-confirm. |
+| **Org Admin** (Regular Admin) | per-Org | `Operator` | subtree of repo-tenants (their `allowed_resources`) | yes — only a **subset** of their own scopes (attenuation) | onboard members under them, run HIC review queues for their repo-tenants, trigger ingestion for them, issue/revoke **delegated** grants in their subtree. **Cannot** shred, manage other admins, touch Org-level ops/billing. |
+| **Member** | per-Org | `Guided` or `ReadOnly` | specific repo-tenants | no (leaf) | query, visualize, BYOM-connect, **propose** (quarantined) edges/assertions; confirmation is HIC-gated to admins by default ⟦DECIDE⟧ whether `Operator` members can self-confirm. |
 | **Agent / BYOM session** | per-Org | inherits the connecting user's grant | == user's (same Org) | no | exactly what the user can, in the user's Org, every call audited under the user's principal. |
 
 > The two admin tiers the user asked for = **Org Owner** (super admin) + **Org Admin**
@@ -294,7 +294,7 @@ Engine tools behind it: `recall` (storyline), `search` (semantic, bge cosine),
   and (b) **flies the constellation to that node and lights it**. The chat ↔ graph
   link is the signature interaction.
 - **"Show your work"** toggle: reveal which tool calls + which nodes produced the
-  answer (HITL transparency — the user can audit the AI's grounding).
+  answer (HIC transparency — the user can audit the AI's grounding).
 - **Self-critic inline** (`critique`): an answer can carry a "completeness" chip —
   if the critic flags gaps (truncated coverage, superseded sources, contradictions,
   adjacent unconfirmed proposals, stale index), surface them as a dismissible
@@ -342,7 +342,7 @@ Engine tool: `as_of` (Derived-plane snapshot at time T).
   that existed *when it was made* — answering "what did we know then?"
 - Plain-language framing for non-technical users: "Rewind the memory to June 1st."
 
-### 4.6 HITL Review Center (the human-judgment surface) — second-most-important after the constellation
+### 4.6 HIC Review Center (the human-judgment surface) — second-most-important after the constellation
 
 This is where the two-plane / quarantine / trust model becomes a *workflow*. A
 unified **inbox** with filtered queues:
@@ -560,7 +560,7 @@ auto-degrade if fps drops.
   always knows they're filtered.
 - **Blast-radius focus:** select a node → everything except its N-hop neighborhood
   dims into the fog; a slider sets N.
-- **Box/lasso select** → multi-select → (admin) bulk HITL actions.
+- **Box/lasso select** → multi-select → (admin) bulk HIC actions.
 - **Time scrubber** (§4.5) → the graph morphs through `as_of` states.
 - **Analogy beams:** "find analogues" on a node → cross-tenant arcs animate in,
   ranked by the combined embedding+structural score.
@@ -587,7 +587,7 @@ need >100k points later. Layout (UMAP) server-side in Rust (or a small Python si
   dark), with the constellation as the light source. Non-technical users should feel
   *invited*, not intimidated — progressive disclosure everywhere (the jargon lives
   behind tooltips and "details" toggles).
-- **The AI/ML + HITL edge:** make the machine's reasoning *visible and reviewable*
+- **The AI/ML + HIC edge:** make the machine's reasoning *visible and reviewable*
   (show-your-work, citations that light up, completeness heads-ups, the proposal
   inbox). The aesthetic of trust: certainty and freshness are always on screen; the
   difference between "the record" (Derived) and "what someone said" (Asserted) is
@@ -612,7 +612,7 @@ need >100k points later. Layout (UMAP) server-side in Rust (or a small Python si
   ├─ bottom: Time scrubber (as_of)
   └─ overlay: first-run guided tour
 /ask                           Conversational RAG (model picker, citations↔graph)
-/review                        HITL Review Center (proposals · contradictions · supersessions · critic)
+/review                        HIC Review Center (proposals · contradictions · supersessions · critic)
 /storyline/:tenant             Recall storyline timeline
 /org                           Federation / org overview (meta-graph)
 /audit                         Audit log viewer (integrity-verified, live tail)
@@ -767,10 +767,10 @@ HTML prototype. The `⟦DECIDE⟧` items are flagged for Saul.
   - **See:** Constellation (Galaxy + Lattice modes, Lite/Full), Node Inspector/Verify,
     Search/Recall.
   - **Ask:** conversational RAG with model picker + citations↔graph.
-  - **Steward:** HITL Review Center (proposals · contradictions · supersession ·
+  - **Steward:** HIC Review Center (proposals · contradictions · supersession ·
     self-critic) + Assert + time-travel scrubber.
   - All strictly Org-scoped. This is the in-house demo — it shows the *whole trust
-    story* (the quarantine→confirm HITL loop), not just read-only wow.
+    story* (the quarantine→confirm HIC loop), not just read-only wow.
 - **M2 (Operate):** Admin console (Org people/grants/delegation tree + Org
   provisioning), BYOM connect, audit viewer, ops (checkpoints/sync/anchor),
   memory-diff import/export.
@@ -779,7 +779,7 @@ HTML prototype. The `⟦DECIDE⟧` items are flagged for Saul.
 - **M4 (Polish + OSS):** federation islands + storyline-river modes, the full shader
   pass, accessibility hardening, the Tier-1 audit + OSS release.
 
-> Note: M1 now includes the HITL Steward surface, so **F-5 (identity-bound principals)
+> Note: M1 now includes the HIC Steward surface, so **F-5 (identity-bound principals)
 > and the signing path for `assert`/`confirm` are M1 backend prerequisites**, not M2.
 > The delegation-revocation cascade (F-7) can trail to M2 with the admin console.
 
@@ -797,7 +797,7 @@ HTML prototype. The `⟦DECIDE⟧` items are flagged for Saul.
 | `critique` (self-critic) | Ask completeness heads-up, Review Center |
 | `analogy` (cross-tenant) | Constellation analogy beams, Inspector "find analogues" |
 | `propose_edge` / quarantine | Inspector action + Review Center proposals queue |
-| `confirm_edge` (promote) | Review Center confirm (HITL) |
+| `confirm_edge` (promote) | Review Center confirm (HIC) |
 | `assert` (signed node) | Add-a-memory form |
 | `merge_diff` (handoff) | Handoff import/export + DiffPreview |
 | Two-plane (Derived/Asserted) | PlaneBadge everywhere; color/material in 3D |

@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * HITL Review Center (WP-7.8). The queues are DERIVED from the same Org scene the
+ * HIC Review Center (WP-7.8). The queues are DERIVED from the same Org scene the
  * constellation uses (no new gateway route needed): proposals = quarantined edges,
  * contradictions = `contradicted` nodes, supersessions = Supersedes edges.
  * **Confirm** calls the gateway's write-scoped, audited `edges/confirm` route
@@ -106,7 +106,7 @@ export function ReviewCenter({
     <div className="route">
       <div className="route-inner">
         <div className="route-head">
-          <span className="eyebrow">Human-in-the-loop · org-scoped</span>
+          <span className="eyebrow">Human In Control (HIC) · org-scoped</span>
           <h1>Review center</h1>
           <p>
             Nothing an AI proposes becomes load-bearing until a person confirms it. Witness

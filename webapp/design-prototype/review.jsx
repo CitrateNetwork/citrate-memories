@@ -1,4 +1,4 @@
-/* Memrizz — HITL Review Center (proposals · contradictions · supersessions · critic) */
+/* Memrizz — HIC Review Center (proposals · contradictions · supersessions · critic) */
 
 function NodeMini({ node, onCite }) {
   const c = MEM.laneColor(node.lane);
@@ -150,7 +150,7 @@ function ReviewCenter({ onCite, onToast }) {
     <div className="route">
       <div className="route-inner">
         <div className="route-head">
-          <span className="eyebrow">Human-in-the-loop · org-scoped</span>
+          <span className="eyebrow">Human In Control (HIC) · org-scoped</span>
           <h1>Review center</h1>
           <p>Nothing an AI proposes becomes load-bearing until a person confirms it. Witness each one — every decision is written to the tamper-evident audit chain.</p>
         </div>
