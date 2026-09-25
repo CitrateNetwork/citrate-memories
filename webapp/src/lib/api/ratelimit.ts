@@ -49,9 +49,8 @@ export function isDistributed(): boolean {
   return Boolean(REDIS_URL && REDIS_TOKEN);
 }
 
-async function redisFixedWindow(id: string, limit: number): Promise<RateResult> {
-  const windowSec = 1;
-  const windowStart = Math.floor(Date.now() / 1000);
+async function redisFixedWindow(id: string, limit: number, windowSec = 1): Promise<RateResult> {
+  const windowStart = Math.floor(Date.now() / 1000 / windowSec);
   const key = `rl:${id}:${windowStart}`;
   const res = await fetch(`${REDIS_URL}/pipeline`, {
     method: "POST",
@@ -101,4 +100,33 @@ export function clientIp(req: Request): string {
     if (hops.length) return hops[hops.length - 1];
   }
   return req.headers.get("x-real-ip")?.trim() || "unknown";
+}
+
+const windows = new Map<string, { start: number; count: number }>();
+
+/**
+ * Fixed-window quota: at most `limit` calls per `windowSec` for `id` (e.g. an
+ * hourly LLM budget per account, PBA-L3c-015). Distributed when Upstash is
+ * configured, else a per-instance in-memory window (same degrade-not-lock-out
+ * policy as {@link checkRateLimit}).
+ */
+export async function checkWindowLimit(id: string, limit: number, windowSec: number): Promise<RateResult> {
+  if (isDistributed()) {
+    try {
+      return await redisFixedWindow(`w${windowSec}:${id}`, limit, windowSec);
+    } catch {
+      // Store unreachable — degrade to the local window rather than lock out.
+    }
+  }
+  const start = Math.floor(Date.now() / 1000 / windowSec);
+  let w = windows.get(id);
+  if (!w || w.start !== start) {
+    w = { start, count: 0 };
+    windows.set(id, w);
+  }
+  if (w.count >= limit) {
+    return { ok: false, retryAfter: (start + 1) * windowSec - Math.floor(Date.now() / 1000), backend: "memory" };
+  }
+  w.count += 1;
+  return { ok: true, backend: "memory" };
 }

@@ -6,7 +6,8 @@ import {
   type UIMessage,
 } from "ai";
 import { requireOwner, tokenFromRequest } from "@/lib/auth/session";
-import { checkRateLimit, clientIp } from "@/lib/api/ratelimit";
+import { checkRateLimit, checkWindowLimit } from "@/lib/api/ratelimit";
+import { asUIMessages, MAX_CHAT_BODY_BYTES, sanitizeChatMessages } from "@/lib/ai/chat-input";
 import { gateway, GatewayError, type GatewayCaller } from "@/lib/gateway/client";
 import { inferenceModel, maxOutputTokens } from "@/lib/ai/provider";
 import type { RecallItem } from "@/lib/gateway/types";
@@ -24,7 +25,14 @@ import type { RecallItem } from "@/lib/gateway/types";
  */
 export const maxDuration = 300; // cold DGX/CPU inference can be slow
 
-const READ_RATE_PER_SEC = Number(process.env.MEM_BFF_RATE_PER_SEC) || 12;
+/**
+ * PBA-L3c-015: LLM calls get their OWN budget, not the 12 rps read limiter —
+ * each one is inference on the DGX. Per account (not per IP, so rotating IPs
+ * does not multiply it): a small burst, a sustained rate, and an hourly cap.
+ */
+const LLM_RATE_PER_SEC = Number(process.env.MEM_LLM_RATE_PER_SEC) || 0.2;
+const LLM_BURST = Number(process.env.MEM_LLM_BURST) || 3;
+const LLM_PER_HOUR = Number(process.env.MEM_LLM_PER_HOUR) || 30;
 
 interface Citation {
   id: string;
@@ -64,11 +72,29 @@ async function retrieve(c: GatewayCaller, org: string, tenant: string | undefine
 export async function POST(req: Request): Promise<Response> {
   const sub = await requireOwner(req);
   if (!sub) return Response.json({ error: "unauthenticated" }, { status: 401 });
-  const rl = await checkRateLimit(`bff:${sub}:${clientIp(req)}`, READ_RATE_PER_SEC);
-  if (!rl.ok) return Response.json({ error: "rate_limited" }, { status: 429 });
+  const rl = await checkRateLimit(`llm:${sub}`, LLM_RATE_PER_SEC, LLM_BURST);
+  const hourly = rl.ok ? await checkWindowLimit(`llm-h:${sub}`, LLM_PER_HOUR, 3600) : rl;
+  if (!rl.ok || !hourly.ok) {
+    const retry = (rl.ok ? hourly : rl).retryAfter;
+    return Response.json({ error: "rate_limited" }, { status: 429, headers: retry ? { "retry-after": String(retry) } : {} });
+  }
+
+  // PBA-L3c-015: bound the raw body, then keep only a sanitized recent window.
+  const raw = await req.text();
+  if (raw.length > MAX_CHAT_BODY_BYTES) return Response.json({ error: "request too large" }, { status: 413 });
+  let parsed: { messages?: unknown; org?: string; tenant?: string };
+  try {
+    parsed = JSON.parse(raw) as typeof parsed;
+  } catch {
+    return Response.json({ error: "invalid json" }, { status: 400 });
+  }
+  const clean = sanitizeChatMessages(parsed.messages ?? []);
+  if (!clean.ok) return Response.json({ error: clean.error }, { status: clean.status });
+  const messages = asUIMessages(clean.messages);
+  const org = typeof parsed.org === "string" ? parsed.org : undefined;
+  const tenant = typeof parsed.tenant === "string" ? parsed.tenant : undefined;
 
   const caller: GatewayCaller = { sub, token: tokenFromRequest(req) };
-  const { messages = [], org, tenant } = (await req.json()) as { messages?: UIMessage[]; org?: string; tenant?: string };
   const theOrg = org || "citrate-federation";
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
   const question = lastUser ? textOf(lastUser) : "";
