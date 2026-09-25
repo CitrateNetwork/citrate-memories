@@ -77,6 +77,21 @@ pub struct PeerAuth<'a> {
     pub revoked_ids: &'a std::collections::HashSet<String>,
 }
 
+impl<'a> PeerAuth<'a> {
+    /// Build a server's credential policy. Refuses an empty (or whitespace)
+    /// audience at startup: it would match a bare `peer:` scope (pass-2 INFO).
+    pub fn new(
+        trust_root: &'a [u8],
+        audience: &'a str,
+        revoked_ids: &'a std::collections::HashSet<String>,
+    ) -> Result<Self, SyncError> {
+        if audience.trim().is_empty() {
+            return Err(SyncError::Chain("PeerAuth: audience (this peer's id) must not be empty".into()));
+        }
+        Ok(PeerAuth { trust_root, audience, revoked_ids })
+    }
+}
+
 /// The scope a grant must carry to be honoured by peer `peer_id`.
 pub fn audience_resource(peer_id: &str) -> String {
     format!("peer:{peer_id}")
@@ -97,6 +112,9 @@ fn verify_credential(header_value: &str, auth: &PeerAuth<'_>, now_ms: u64) -> Op
     let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?.trim();
     let bytes = hex::decode(token).ok()?;
     let grant: CapabilityGrant = serde_json::from_slice(&bytes).ok()?;
+    if auth.audience.trim().is_empty() {
+        return None; // misconfigured server: never match a bare `peer:` scope
+    }
     let aud = audience_resource(auth.audience);
     let addressed_here = grant.allowed_resources.iter().any(|r| r.resource_id == aud && r.can_read);
     if grant.verify_signature().is_err()
@@ -707,5 +725,51 @@ mod transport_tests {
     fn audience_resource_wire_format() {
         assert_eq!(audience_resource("peer-C"), "peer:peer-C");
         assert_ne!(audience_resource("a"), audience_resource("b"));
+    }
+
+    /// Pass-2: a grant that names this peer's audience scope but with
+    /// can_read=false is refused (kills the surviving `&& r.can_read` mutant).
+    #[test]
+    fn pba_l6b_019_p2_audience_scope_without_read_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        peer.commit(&[derived_node("citrate-chain", "private")], &[]).unwrap();
+        let root = crate::tests::trust_root();
+        let mut g = crate::tests::grant_for(&["citrate-chain"], false);
+        g.allowed_resources.push(mem_authz::ResourceScope { resource_id: audience_resource(PEER_ID), can_read: false, can_write: true });
+        g.sign_with(&ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]));
+        let c = raw_request(addr, format!("GET /bundle/citrate-chain HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n", encode_credential(&g).unwrap()));
+        serve_one(&listener, &peer, &auth(&root, &none())).unwrap();
+        assert!(c.join().unwrap().starts_with("HTTP/1.1 401"));
+    }
+
+    /// Pass-2 (INFO): an empty server audience would match a `peer:` scope — it is
+    /// refused both at request time and by the PeerAuth constructor.
+    #[test]
+    fn pba_l6b_019_p2_empty_audience_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        peer.commit(&[derived_node("citrate-chain", "private")], &[]).unwrap();
+        let root = crate::tests::trust_root();
+        let mut g = crate::tests::grant_for(&["citrate-chain"], false);
+        g.allowed_resources.push(mem_authz::ResourceScope { resource_id: "peer:".into(), can_read: true, can_write: false });
+        g.sign_with(&ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]));
+        let empty = none();
+        let bad = PeerAuth { trust_root: &root, audience: "", revoked_ids: &empty };
+        let c = raw_request(addr, format!("GET /bundle/citrate-chain HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n", encode_credential(&g).unwrap()));
+        serve_one(&listener, &peer, &bad).unwrap();
+        assert!(c.join().unwrap().starts_with("HTTP/1.1 401"), "PBA-L6b-019 p2: empty audience matched peer:");
+    }
+
+    #[test]
+    fn pba_l6b_019_p2_peer_auth_constructor_rejects_empty_audience() {
+        let root = crate::tests::trust_root();
+        let r = none();
+        assert!(PeerAuth::new(&root, "", &r).is_err());
+        assert!(PeerAuth::new(&root, "  ", &r).is_err());
+        let ok = PeerAuth::new(&root, PEER_ID, &r).expect("valid");
+        assert_eq!(ok.audience, PEER_ID);
     }
 }
