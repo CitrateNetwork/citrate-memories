@@ -588,3 +588,35 @@ async fn pba_l6b_002_byom_cannot_front_run_new_node_with_forged_fields() {
     let a = app.store.get_node(&vid).unwrap().unwrap();
     assert_eq!((a.status, a.valid_to, a.confidence.clone()), (Status::Active, None, vec![BelnapValue::True]));
 }
+
+/// PBA-L6b-018 nit: ping and notifications do not spend the per-principal call
+/// budget (only tools/call does).
+#[tokio::test]
+async fn pba_l6b_018_ping_and_notifications_are_budget_free() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("m", &["tenant-a"], false)], Some(secret));
+    let ping = json!({"jsonrpc":"2.0","id":1,"method":"ping"}).to_string();
+    let note = json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string();
+    let batch = [ping.as_str(), note.as_str()].repeat(16).join("\n");
+    for i in 0..20 {
+        let r = byom(State(app.clone()), Path("m".into()), byom_headers(secret, "m", "read"), batch.clone()).await;
+        assert!(r.is_ok(), "PBA-L6b-018: ping/notification batch {i} was rate-limited");
+    }
+    // tools/call still spends: the full burst is still available.
+    assert!(app.byom_limits.try_spend("m", BYOM_BURST_CALLS as usize, now_ms()));
+}
+
+/// PBA-L6b-018 nit: one principal may hold at most
+/// BYOM_MAX_CONCURRENT_PER_PRINCIPAL executions; the slot frees on drop and other
+/// principals are unaffected.
+#[test]
+fn pba_l6b_018_per_principal_concurrency_cap() {
+    let l = ByomLimits::default();
+    let held: Vec<_> = (0..BYOM_MAX_CONCURRENT_PER_PRINCIPAL).map(|_| l.try_enter("m").expect("slot")).collect();
+    assert!(l.try_enter("m").is_none(), "cap reached");
+    assert!(l.try_enter("other").is_some(), "per principal");
+    drop(held);
+    assert!(l.try_enter("m").is_some(), "released on drop");
+    assert!(lock(&l.inflight).get("m").copied().unwrap_or(0) <= 1);
+}

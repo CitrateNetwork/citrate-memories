@@ -96,6 +96,9 @@ pub const BYOM_BURST_CALLS: f64 = 128.0;
 pub const BYOM_REFILL_PER_SEC: f64 = 2.0;
 /// PBA-L6b-018: BYOM executions allowed on the blocking pool at once.
 pub const BYOM_MAX_CONCURRENT: usize = 4;
+/// PBA-L6b-018 follow-up: of those, how many ONE principal may hold at once (so a
+/// single member cannot occupy every slot and stall everyone else).
+pub const BYOM_MAX_CONCURRENT_PER_PRINCIPAL: usize = 2;
 
 /// PBA-L6b-018: BYOM work bounds. Buckets are keyed by the verified principal
 /// and only created after the membership check, so the map is bounded by the
@@ -103,6 +106,7 @@ pub const BYOM_MAX_CONCURRENT: usize = 4;
 pub struct ByomLimits {
     slots: Arc<tokio::sync::Semaphore>,
     buckets: Mutex<HashMap<String, (f64, u64)>>,
+    inflight: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Default for ByomLimits {
@@ -110,11 +114,42 @@ impl Default for ByomLimits {
         ByomLimits {
             slots: Arc::new(tokio::sync::Semaphore::new(BYOM_MAX_CONCURRENT)),
             buckets: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// Releases one of a principal's in-flight BYOM executions on drop.
+struct InflightGuard {
+    map: Arc<Mutex<HashMap<String, usize>>>,
+    sub: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut m = lock(&self.map);
+        if let Some(n) = m.get_mut(&self.sub) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.sub);
+            }
         }
     }
 }
 
 impl ByomLimits {
+    /// Claim one of `sub`'s per-principal execution slots, or `None` if it
+    /// already holds [`BYOM_MAX_CONCURRENT_PER_PRINCIPAL`].
+    fn try_enter(&self, sub: &str) -> Option<InflightGuard> {
+        let mut m = lock(&self.inflight);
+        let n = m.entry(sub.to_string()).or_insert(0);
+        if *n >= BYOM_MAX_CONCURRENT_PER_PRINCIPAL {
+            return None;
+        }
+        *n += 1;
+        Some(InflightGuard { map: self.inflight.clone(), sub: sub.to_string() })
+    }
+
     /// Spend `calls` from `sub`'s bucket at `now_ms`; `false` (and nothing spent)
     /// if the bucket cannot cover them.
     fn try_spend(&self, sub: &str, calls: usize, now_ms: u64) -> bool {
@@ -1088,9 +1123,24 @@ async fn byom(
             format!("too many JSON-RPC calls in one request (max {BYOM_MAX_LINES})"),
         ));
     }
-    if !app.byom_limits.try_spend(&sub, lines.len(), now_ms()) {
+    // Only tool calls do store work; ping / notifications / initialize /
+    // tools/list are free (they would otherwise eat a multi-agent user's budget).
+    let calls = lines
+        .iter()
+        .filter(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|m| m == "tools/call"))
+                .unwrap_or(true) // unparseable lines count (fail closed)
+        })
+        .count();
+    if !app.byom_limits.try_spend(&sub, calls, now_ms()) {
         return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "BYOM call budget exhausted; retry later"));
     }
+    let inflight = app
+        .byom_limits
+        .try_enter(&sub)
+        .ok_or_else(|| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too many concurrent BYOM requests for this principal"))?;
     let permit = app
         .byom_limits
         .slots
@@ -1102,6 +1152,7 @@ async fn byom(
     let app2 = app.clone();
     let out = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _inflight = inflight;
         // FWA-C10-04: per-principal authorship (see /assert). `sub` is the
         // connect-token-verified principal.
         let asserter = Asserter::for_principal(&app2.signing_key, &sub);
