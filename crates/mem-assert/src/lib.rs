@@ -392,7 +392,12 @@ fn is_as_asserted(n: &MemoryNode, now_ms: u64) -> bool {
 ///   * **Supersession:** a non-quarantined `Supersedes` edge may only retire a
 ///     node whose author is the caller (extends the MEM-B-010 plane guard to
 ///     cross-author supersession on this path). Another principal's node is
-///     retired through `confirm_edge` under a write grant, not a diff.
+///     retired through `confirm_edge` under a write grant, not a diff. A NEW
+///     Supersedes *proposal* onto another principal's node must be timestamped
+///     within [`RELAY_CLOCK_SKEW_MS`] of now, and an identical, already-stored
+///     edge is a no-op (so relaying an applied handoff is not refused).
+///   * **Relayed times:** a non-author copy's `valid_from` / `observed_at` are
+///     floored at `now - RELAY_CLOCK_SKEW_MS` (no retroactive presence).
 ///   * **Existing edge:** promotion from quarantined to load-bearing, or any other
 ///     change, needs the caller to be the stored edge's asserter
 ///     ([`AssertError::EdgePromotion`] / [`AssertError::NotAuthor`]). A
@@ -431,6 +436,12 @@ pub fn apply_diff(
         let mut incoming = n.clone();
         if !own {
             incoming.embedding = None;
+            // Pass 2: valid_from / observed_at are unsigned too. A non-author copy
+            // may not place the node earlier than "about now" (retroactive
+            // presence in as_of snapshots); the author supplies the real times.
+            let floor = now.saturating_sub(RELAY_CLOCK_SKEW_MS);
+            incoming.valid_from = incoming.valid_from.max(floor);
+            incoming.observed_at = incoming.observed_at.max(floor);
         }
         match store.get_node(&id)? {
             None => {
@@ -466,6 +477,9 @@ pub fn apply_diff(
     for e in &diff.edges {
         let label = || format!("edge {}->{} {:?}", &e.from.to_hex()[..10], &e.to.to_hex()[..10], e.kind);
         let stored = store.out_edges(&e.from)?.into_iter().find(|x| x.to == e.to && x.kind == e.kind);
+        if stored.as_ref() == Some(e) {
+            continue; // identical and already applied (incl. a Supersedes) — no-op
+        }
         if let Some(stored) = &stored {
             let by_asserter = is_caller(&stored.provenance.asserter);
             if stored.quarantined && !e.quarantined && !by_asserter {
@@ -478,12 +492,28 @@ pub fn apply_diff(
                 return Err(AssertError::NotAuthor(label()));
             }
         }
-        if e.kind == EdgeKind::Supersedes && !e.quarantined {
-            // Cross-author supersession: only the target's author may retire it.
-            let target_author = match diff.nodes.iter().find(|n| n.compute_id() == e.to) {
+        let target_author = if e.kind == EdgeKind::Supersedes {
+            match diff.nodes.iter().find(|n| n.compute_id() == e.to) {
                 Some(n) => Some(n.author.clone()),
                 None => store.get_node(&e.to)?.map(|n| n.author),
-            };
+            }
+        } else {
+            None
+        };
+        // Pass 2: a NEW Supersedes proposal onto another principal's node must be
+        // current — a backdated proposal is a primed backdate for a later confirm.
+        if e.kind == EdgeKind::Supersedes && e.quarantined && stored.is_none() {
+            if let Some(author) = &target_author {
+                if !is_caller(author) && e.provenance.at.abs_diff(now) > RELAY_CLOCK_SKEW_MS {
+                    return Err(AssertError::NotAuthor(format!(
+                        "{} (supersedes proposal on another principal's node must be timestamped now)",
+                        label()
+                    )));
+                }
+            }
+        }
+        if e.kind == EdgeKind::Supersedes && !e.quarantined {
+            // Cross-author supersession: only the target's author may retire it.
             if let Some(author) = target_author {
                 if !is_caller(&author) {
                     return Err(AssertError::NotAuthor(format!("{} (supersedes another principal's node)", label())));
@@ -960,7 +990,8 @@ mod tests {
         d3.add_edge(e3);
         assert_eq!(apply_diff(&store, &d3, Some(bob.pubkey_hex())).unwrap().superseded, 1);
         // A QUARANTINED supersedes proposal by a non-author is still just a proposal.
-        let p = mallory.propose_edge(mine.compute_id(), ghost.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, 4);
+        // (timestamped now: a backdated cross-author proposal is refused, pass 2)
+        let p = mallory.propose_edge(mine.compute_id(), ghost.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, super::wall_now_ms());
         let mut d4 = MemoryDiff::new(mallory.pubkey_hex(), 4);
         d4.add_node(mine.clone());
         d4.add_edge(p);
@@ -975,7 +1006,9 @@ mod tests {
     fn pba_l6b_002_non_author_first_insert_must_be_as_asserted() {
         let bob = asserter(32);
         let mallory = asserter(33);
-        let n = bob.assert_node_with("r", NodeKind::Adr, "bob's pending", 1_000, 1_000, None);
+        // Timestamped "now": a relayed copy's times are floored at now - skew (pass 2).
+        let t = super::wall_now_ms();
+        let n = bob.assert_node_with("r", NodeKind::Adr, "bob's pending", t, t, None);
         type Tweak = Box<dyn Fn(&mut MemoryNode)>;
         let tweaks: Vec<(&str, Tweak)> = vec![
             ("status", Box::new(|n| n.status = Status::Archived)),
@@ -1058,5 +1091,76 @@ mod tests {
         // The asserter's own load-bearing copy is accepted.
         apply_diff(&store, &d, Some(bob.pubkey_hex())).unwrap();
         assert!(!store.out_edges(&a.compute_id()).unwrap()[0].quarantined);
+    }
+
+    // ---- R2 verifier pass 2 ----
+
+    /// Front-run residual: a relay may not give someone else's unstored node an
+    /// early valid_from / observed_at (retroactive presence in as_of snapshots);
+    /// re-relaying stays idempotent and the author can still set the real value.
+    #[test]
+    fn pba_l6b_002_p2_relayed_first_insert_times_are_clamped_to_now() {
+        let bob = asserter(40);
+        let real = bob.assert_node_with("r", NodeKind::Adr, "bob real", 1_000_000, 1_000_000, None);
+        let mut early = real.clone();
+        early.valid_from = 0;
+        early.observed_at = 0;
+        let store: MemoryDagStore<MemoryNode> = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let relay = asserter(41);
+        let mut d = MemoryDiff::new("relay", 1);
+        d.add_node(early);
+        let floor = super::wall_now_ms() - RELAY_CLOCK_SKEW_MS;
+        apply_diff(&store, &d, Some(relay.pubkey_hex())).unwrap();
+        let s1 = store.get_node(&real.compute_id()).unwrap().unwrap();
+        assert!(s1.valid_from >= floor && s1.observed_at >= floor, "PBA-L6b-002 p2: relayed node backdated to {}/{}", s1.valid_from, s1.observed_at);
+        apply_diff(&store, &d, Some(relay.pubkey_hex())).expect("re-relay is a no-op");
+        let mut own = MemoryDiff::new(bob.pubkey_hex(), 2);
+        own.add_node(real.clone());
+        apply_diff(&store, &own, Some(bob.pubkey_hex())).unwrap();
+        assert_eq!(store.get_node(&real.compute_id()).unwrap().unwrap().valid_from, 1_000_000, "author sets the real time");
+    }
+
+    /// Regression: relaying an identical, already-applied handoff that contains
+    /// the author's own Supersedes edge is a no-op, not a refusal.
+    #[test]
+    fn pba_l6b_002_p2_relayed_already_applied_supersession_is_noop() {
+        let bob = asserter(42);
+        let a = bob.assert_node("r", NodeKind::Adr, "bob a", 1_000);
+        let b = bob.assert_node("r", NodeKind::Adr, "bob b", 2_000);
+        let sup = bob.assert_edge(b.compute_id(), a.compute_id(), EdgeKind::Supersedes, 2_000);
+        let store: MemoryDagStore<MemoryNode> = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let mut d = MemoryDiff::new(bob.pubkey_hex(), 2);
+        d.add_node(a.clone());
+        d.add_node(b.clone());
+        d.add_edge(sup.clone());
+        apply_diff(&store, &d, Some(bob.pubkey_hex())).unwrap();
+        let stored_a = store.get_node(&a.compute_id()).unwrap().unwrap();
+        let mut relay = MemoryDiff::new(bob.pubkey_hex(), 3);
+        relay.add_node(stored_a);
+        relay.add_node(b.clone());
+        relay.add_edge(sup);
+        apply_diff(&store, &relay, Some(asserter(43).pubkey_hex())).expect("identical applied handoff relays as a no-op");
+    }
+
+    /// A NEW quarantined Supersedes proposal onto another principal's node must
+    /// carry a timestamp within the clock-skew window (no backdated proposals to
+    /// confirm later).
+    #[test]
+    fn pba_l6b_002_p2_backdated_cross_author_proposal_is_refused() {
+        let bob = asserter(44);
+        let mal = asserter(45);
+        let victim = bob.assert_node("r", NodeKind::Adr, "bob", 1_000);
+        let store = stored_with(&victim);
+        let mine = mal.assert_node("r", NodeKind::Rationale, "mine", 2_000);
+        let old = mal.propose_edge(mine.compute_id(), victim.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, 1);
+        let mut d = MemoryDiff::new(mal.pubkey_hex(), 1);
+        d.add_node(mine.clone());
+        d.add_edge(old);
+        assert!(matches!(apply_diff(&store, &d, Some(mal.pubkey_hex())), Err(AssertError::NotAuthor(_))));
+        let fresh = mal.propose_edge(mine.compute_id(), victim.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, super::wall_now_ms());
+        let mut d2 = MemoryDiff::new(mal.pubkey_hex(), 1);
+        d2.add_node(mine);
+        d2.add_edge(fresh);
+        apply_diff(&store, &d2, Some(mal.pubkey_hex())).expect("a current proposal relays");
     }
 }

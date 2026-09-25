@@ -761,7 +761,29 @@ impl<'a> MemoryMcpServer<'a> {
             Ok(guard) => guard,
             Err(deny) => return Ok(deny),
         };
-        match self.store.confirm_edge(&from_id, &to_id, kind) {
+        // PBA-L6b-002 pass 2: a Supersedes that retires ANOTHER principal's node
+        // needs a second party — its author, or a writer other than the proposer
+        // (no self-confirmed cross-author retirement).
+        if kind == EdgeKind::Supersedes {
+            let caller = self.asserter.as_ref().map(|a| a.pubkey_hex().to_string());
+            let proposer = self
+                .store
+                .out_edges(&from_id)
+                .map_err(store_err)?
+                .into_iter()
+                .find(|e| e.to == to_id && e.kind == kind)
+                .map(|e| e.provenance.asserter);
+            let allowed = match caller.as_deref() {
+                None => false,
+                Some(c) => c == to_node.author || proposer.as_deref() != Some(c),
+            };
+            if !allowed {
+                return Ok(tool_error(
+                    "a supersession of another principal's node must be confirmed by that node's author or by a writer other than its proposer".to_string(),
+                ));
+            }
+        }
+        match self.store.confirm_edge(&from_id, &to_id, kind, now_ms()) {
             Ok(mem_store::ConfirmOutcome::Confirmed) => Ok(tool_text(format!(
                 "confirmed {} -{kind_str}-> {} (now load-bearing)",
                 &from_id.to_hex()[..10],

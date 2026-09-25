@@ -724,11 +724,17 @@ impl MemoryDagStore<MemoryNode> {
     /// `Supersedes` edge routes through [`apply_supersession`]
     /// (cycle-guarded, atomic edge+status), so a proposal can never transition
     /// anyone's status before confirmation.
+    ///
+    /// PBA-L6b-002 pass 2: `now_ms` is the confirmation clock. A confirmed
+    /// `Supersedes` is stamped with it (`provenance.at = now_ms`, hence the
+    /// target's `valid_to`), NOT the proposal's unsigned, caller-chosen timestamp
+    /// — a proposal backdated to t=1 used to erase its target from every `as_of`.
     pub fn confirm_edge(
         &self,
         from: &ContentHash,
         to: &ContentHash,
         kind: EdgeKind,
+        now_ms: u64,
     ) -> Result<ConfirmOutcome, SupersessionError> {
         let Some(mut edge) = self
             .out_edges(from)?
@@ -742,6 +748,7 @@ impl MemoryDagStore<MemoryNode> {
         }
         edge.quarantined = false;
         if edge.kind == EdgeKind::Supersedes {
+            edge.provenance.at = now_ms;
             self.apply_supersession(&edge)?;
         } else {
             self.add_edge(&edge)?;
@@ -1378,21 +1385,23 @@ mod tests {
         assert_eq!(s.get_node(&old.compute_id()).unwrap().unwrap().status, Status::Active);
 
         // Confirming flips it load-bearing AND applies the supersession.
-        let outcome = s.confirm_edge(&new.compute_id(), &old.compute_id(), EdgeKind::Supersedes).unwrap();
+        let outcome = s.confirm_edge(&new.compute_id(), &old.compute_id(), EdgeKind::Supersedes, 50).unwrap();
         assert_eq!(outcome, ConfirmOutcome::Confirmed);
         let old_now = s.get_node(&old.compute_id()).unwrap().unwrap();
         assert_eq!(old_now.status, Status::Superseded);
-        assert_eq!(old_now.valid_to, Some(5));
+        // PBA-L6b-002 pass 2: stamped with the confirm clock (50), not the
+        // proposal's timestamp (5).
+        assert_eq!(old_now.valid_to, Some(50));
         let stored = &s.out_edges(&new.compute_id()).unwrap()[0];
         assert!(!stored.quarantined, "edge is load-bearing after confirm");
 
         // Idempotent re-confirm; unknown edge reads NotFound.
         assert_eq!(
-            s.confirm_edge(&new.compute_id(), &old.compute_id(), EdgeKind::Supersedes).unwrap(),
+            s.confirm_edge(&new.compute_id(), &old.compute_id(), EdgeKind::Supersedes, 50).unwrap(),
             ConfirmOutcome::AlreadyConfirmed
         );
         assert_eq!(
-            s.confirm_edge(&old.compute_id(), &new.compute_id(), EdgeKind::References).unwrap(),
+            s.confirm_edge(&old.compute_id(), &new.compute_id(), EdgeKind::References, 50).unwrap(),
             ConfirmOutcome::NotFound
         );
     }
@@ -1410,7 +1419,7 @@ mod tests {
         let mut proposal = supersedes_at(&b, &a, 2);
         proposal.quarantined = true;
         s.add_edge(&proposal).unwrap();
-        let err = s.confirm_edge(&b.compute_id(), &a.compute_id(), EdgeKind::Supersedes).unwrap_err();
+        let err = s.confirm_edge(&b.compute_id(), &a.compute_id(), EdgeKind::Supersedes, 50).unwrap_err();
         assert!(matches!(err, SupersessionError::Cycle));
         assert!(s.out_edges(&b.compute_id()).unwrap()[0].quarantined, "proposal stays quarantined");
         assert_eq!(s.get_node(&a.compute_id()).unwrap().unwrap().status, Status::Active);
@@ -1513,5 +1522,25 @@ mod tests {
         s.put_node(&b).unwrap();
         s.apply_supersession(&supersedes_at(&a, &b, 11)).unwrap();
         assert_eq!(s.get_node(&b.compute_id()).unwrap().unwrap().valid_to, Some(11));
+    }
+
+    /// PBA-L6b-002 pass 2: confirming a Supersedes proposal stamps the target's
+    /// valid_to with the CONFIRM clock, not the proposal's (unsigned) timestamp.
+    #[test]
+    fn confirm_supersession_uses_the_confirm_clock() {
+        let s = store();
+        let new = node("p2 newer");
+        let mut old = node("p2 older");
+        old.valid_from = 1_000;
+        s.put_node(&new).unwrap();
+        s.put_node(&old).unwrap();
+        let mut p = supersedes_at(&new, &old, 1);
+        p.quarantined = true;
+        s.add_edge(&p).unwrap();
+        s.confirm_edge(&new.compute_id(), &old.compute_id(), EdgeKind::Supersedes, 5_000).unwrap();
+        assert_eq!(s.get_node(&old.compute_id()).unwrap().unwrap().valid_to, Some(5_000));
+        let stored = s.out_edges(&new.compute_id()).unwrap();
+        assert_eq!(stored[0].provenance.at, 5_000, "the confirmed edge records when it was confirmed");
+        assert!(!stored[0].quarantined);
     }
 }

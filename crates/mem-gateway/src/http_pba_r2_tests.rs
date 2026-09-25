@@ -631,3 +631,89 @@ fn pba_l6b_018_inflight_release_is_exact() {
     let _c = l.try_enter("m").expect("one slot freed");
     assert!(l.try_enter("m").is_none(), "still capped at BYOM_MAX_CONCURRENT_PER_PRINCIPAL");
 }
+
+// ---------------------------------------------------------------------------
+// R2 verifier pass-2 follow-ups
+// ---------------------------------------------------------------------------
+
+fn tool_rpc(name: &str, args: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})
+}
+
+/// PBA-L6b-002 pass-2 (verifier probe `p2_proposal_relay_then_confirm_backdate`,
+/// inverted): Mallory relays her OWN quarantined Supersedes proposal on Bob's
+/// node with at=1, then confirms it herself. Bob's node must not end up with a
+/// zero-width validity (erased from every as_of).
+#[tokio::test]
+async fn pba_l6b_002_p2_relayed_proposal_plus_self_confirm_cannot_backdate() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let mal = Asserter::for_principal(&gw, "mallory");
+    let victim = bob.assert_node("tenant-a", NodeKind::Adr, "ADR bob", 1_000);
+    let vid = store.put_node(&victim).unwrap();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("bob", &["tenant-a"], true), member("mallory", &["tenant-a"], true), member("carol", &["tenant-a"], true)], Some(secret));
+    let mine = mal.assert_node("tenant-a", NodeKind::Rationale, "override", 2_000);
+    let mid = mine.compute_id();
+    let p = mal.propose_edge(mid, vid, EdgeKind::Supersedes, mem_core::EdgeMethod::Nlp, None, 1);
+    let diff = mem_assert::MemoryDiff { author: mal.pubkey_hex().into(), created_at_ms: 1, nodes: vec![mine], edges: vec![p] };
+    let _ = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), merge_rpc(&diff)).await;
+    let confirm = tool_rpc("memory.confirm_edge", json!({"from_prefix": mid.to_hex()[..16], "to_prefix": vid.to_hex()[..16], "kind": "supersedes"}));
+    let _ = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), confirm.clone()).await;
+    let a = app.store.get_node(&vid).unwrap().unwrap();
+    let snap = mem_query::Recall::new(&app.store).with_asserted(true).as_of("tenant-a", 1_500, 50).unwrap();
+    assert!(snap.items.iter().any(|i| i.id == vid), "PBA-L6b-002 p2: bob's node erased from as_of(1500): {:?} {:?}", a.status, a.valid_to);
+    assert_eq!(a.status, Status::Active, "PBA-L6b-002 p2: self-confirmed cross-author supersession retired bob's node");
+}
+
+/// PBA-L6b-002 pass-2: the sanctioned cross-author path (a proposal confirmed by
+/// a DIFFERENT writer) still works, and stamps valid_to from the confirm clock —
+/// never the proposal's unsigned timestamp.
+#[tokio::test]
+async fn pba_l6b_002_p2_distinct_confirmer_retires_at_confirm_time() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let mal = Asserter::for_principal(&gw, "mallory");
+    let victim = bob.assert_node("tenant-a", NodeKind::Adr, "ADR bob", 1_000);
+    let vid = store.put_node(&victim).unwrap();
+    let mine = mal.assert_node("tenant-a", NodeKind::Rationale, "override", 2_000);
+    let mid = store.put_node(&mine).unwrap();
+    // A stored proposal carrying an old (unsigned) timestamp.
+    store.add_edge(&mal.propose_edge(mid, vid, EdgeKind::Supersedes, mem_core::EdgeMethod::Nlp, None, 1)).unwrap();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("carol", &["tenant-a"], true)], Some(secret));
+    let before = now_ms();
+    let confirm = tool_rpc("memory.confirm_edge", json!({"from_prefix": mid.to_hex()[..16], "to_prefix": vid.to_hex()[..16], "kind": "supersedes"}));
+    let body = byom_call(&app, "carol", byom_headers(secret, "carol", "read,propose"), confirm).await;
+    assert!(body.contains("\"isError\":false"), "{body}");
+    let a = app.store.get_node(&vid).unwrap().unwrap();
+    assert_eq!(a.status, Status::Superseded);
+    assert!(a.valid_to.unwrap_or(0) >= before, "PBA-L6b-002 p2: valid_to {:?} taken from the proposal timestamp, not the confirm clock", a.valid_to);
+}
+
+/// PBA-L6b-002 pass 2: even a CURRENT proposal (MCP propose_edge, at=now) onto
+/// another principal's node cannot be self-confirmed by its proposer; the target's
+/// author (or another writer) can confirm it.
+#[tokio::test]
+async fn pba_l6b_002_p2_proposer_cannot_self_confirm_cross_author_supersession() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let bob = Asserter::for_principal(&gw, "bob");
+    let mal = Asserter::for_principal(&gw, "mallory");
+    let victim = bob.assert_node("tenant-a", NodeKind::Adr, "ADR bob", 1_000);
+    let vid = store.put_node(&victim).unwrap();
+    let mid = store.put_node(&mal.assert_node("tenant-a", NodeKind::Rationale, "override", 2_000)).unwrap();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("bob", &["tenant-a"], true), member("mallory", &["tenant-a"], true)], Some(secret));
+    let args = json!({"from_prefix": mid.to_hex()[..16], "to_prefix": vid.to_hex()[..16], "kind": "supersedes"});
+    let body = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), tool_rpc("memory.propose_edge", args.clone())).await;
+    assert!(body.contains("\"isError\":false"), "{body}");
+    let body = byom_call(&app, "mallory", byom_headers(secret, "mallory", "read,propose"), tool_rpc("memory.confirm_edge", args.clone())).await;
+    assert!(body.contains("\"isError\":true"), "PBA-L6b-002 p2: proposer self-confirmed a cross-author supersession: {body}");
+    assert_eq!(app.store.get_node(&vid).unwrap().unwrap().status, Status::Active);
+    let body = byom_call(&app, "bob", byom_headers(secret, "bob", "read,propose"), tool_rpc("memory.confirm_edge", args)).await;
+    assert!(body.contains("\"isError\":false"), "the target's author may confirm: {body}");
+    assert_eq!(app.store.get_node(&vid).unwrap().unwrap().status, Status::Superseded);
+}
