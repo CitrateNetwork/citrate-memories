@@ -1543,4 +1543,31 @@ mod tests {
         assert_eq!(stored[0].provenance.at, 5_000, "the confirmed edge records when it was confirmed");
         assert!(!stored[0].quarantined);
     }
+
+    /// Mutation-hardening: confirm_edge matches the full (to, kind) key.
+    #[test]
+    fn confirm_edge_matches_the_full_key() {
+        let s = store();
+        let (a, b, c) = (node("k-a"), node("k-b"), node("k-c"));
+        for n in [&a, &b, &c] {
+            s.put_node(n).unwrap();
+        }
+        for t in [&b, &c] {
+            let mut p = supersedes_at(&a, t, 1);
+            p.quarantined = true;
+            s.add_edge(&p).unwrap();
+        }
+        s.confirm_edge(&a.compute_id(), &b.compute_id(), EdgeKind::Supersedes, 10).unwrap();
+        assert_eq!(s.get_node(&b.compute_id()).unwrap().unwrap().status, Status::Superseded);
+        assert_eq!(s.get_node(&c.compute_id()).unwrap().unwrap().status, Status::Active, "only the named edge");
+        assert_eq!(
+            s.confirm_edge(&a.compute_id(), &c.compute_id(), EdgeKind::Supersedes, 11).unwrap(),
+            ConfirmOutcome::Confirmed
+        );
+        assert_eq!(s.get_node(&c.compute_id()).unwrap().unwrap().valid_to, Some(11));
+        assert_eq!(
+            s.confirm_edge(&a.compute_id(), &c.compute_id(), EdgeKind::References, 12).unwrap(),
+            ConfirmOutcome::NotFound
+        );
+    }
 }

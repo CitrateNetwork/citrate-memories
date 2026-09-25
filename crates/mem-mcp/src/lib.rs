@@ -2424,4 +2424,33 @@ mod tests {
         let c = text_of(&call_json(&mut both, "memory.critique", json!({"repo":"citrate-chain"})));
         assert!(c.contains("unconfirmed proposal"), "{c}");
     }
+
+    /// PBA-L6b-002 pass 2 over MCP: a proposer may not confirm its own Supersedes
+    /// of another principal's node; the author may; a session with no identity
+    /// may not; a proposer confirming a supersession of ITS OWN node may.
+    #[test]
+    fn pba_l6b_002_p2_confirm_cross_author_supersession_needs_a_second_party() {
+        let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let bob = Asserter::new(SigningKey::from_bytes(&[21u8; 32]));
+        let mal = Asserter::new(SigningKey::from_bytes(&[22u8; 32]));
+        let victim = bob.assert_node("citrate-chain", NodeKind::Adr, "bob adr", 1_000);
+        let vid = s.put_node(&victim).unwrap();
+        let mine = mal.assert_node("citrate-chain", NodeKind::Rationale, "mine", 2_000);
+        let mid = s.put_node(&mine).unwrap();
+        let own_old = mal.assert_node("citrate-chain", NodeKind::Rationale, "my old", 1_500);
+        let oid = s.put_node(&own_old).unwrap();
+        s.add_edge(&mal.propose_edge(mid, vid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
+        s.add_edge(&mal.propose_edge(mid, oid, EdgeKind::Supersedes, EdgeMethod::Nlp, None, now_ms())).unwrap();
+        let args = |to: &mem_core::ContentHash| json!({"from_prefix": mid.to_hex()[..16], "to_prefix": to.to_hex()[..16], "kind": "supersedes"});
+
+        let mut as_mal = MemoryMcpServer::new_with_asserter(&s, write_grant(), mal.clone());
+        assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&vid))["isError"], true, "self-confirm refused");
+        let mut anon = MemoryMcpServer::new(&s, write_grant());
+        assert_eq!(call_json(&mut anon, "memory.confirm_edge", args(&vid))["isError"], true, "no identity refused");
+        assert_eq!(s.get_node(&vid).unwrap().unwrap().status, Status::Active);
+        assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", args(&oid))["isError"], false, "own node: fine");
+        let mut as_bob = MemoryMcpServer::new_with_asserter(&s, write_grant(), bob.clone());
+        assert_eq!(call_json(&mut as_bob, "memory.confirm_edge", args(&vid))["isError"], false, "author confirms");
+        assert_eq!(s.get_node(&vid).unwrap().unwrap().status, Status::Superseded);
+    }
 }

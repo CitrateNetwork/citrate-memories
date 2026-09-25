@@ -500,9 +500,10 @@ pub fn apply_diff(
         } else {
             None
         };
-        // Pass 2: a NEW Supersedes proposal onto another principal's node must be
-        // current — a backdated proposal is a primed backdate for a later confirm.
-        if e.kind == EdgeKind::Supersedes && e.quarantined && stored.is_none() {
+        // Pass 2: a Supersedes proposal onto another principal's node must be
+        // current — a backdated proposal is a primed backdate for a later confirm
+        // (also when it would rewrite a stored proposal's timestamp).
+        if e.kind == EdgeKind::Supersedes && e.quarantined {
             if let Some(author) = &target_author {
                 if !is_caller(author) && e.provenance.at.abs_diff(now) > RELAY_CLOCK_SKEW_MS {
                     return Err(AssertError::NotAuthor(format!(
@@ -1162,5 +1163,26 @@ mod tests {
         d2.add_node(mine);
         d2.add_edge(fresh);
         apply_diff(&store, &d2, Some(mal.pubkey_hex())).expect("a current proposal relays");
+    }
+
+    /// Pass 2 (mutation-hardening): re-sending one's own STORED cross-author
+    /// proposal with a backdated timestamp is refused too, not a silent rewrite.
+    #[test]
+    fn pba_l6b_002_p2_backdated_rewrite_of_stored_proposal_is_refused() {
+        let bob = asserter(46);
+        let mal = asserter(47);
+        let victim = bob.assert_node("r", NodeKind::Adr, "bob", 1_000);
+        let store = stored_with(&victim);
+        let mine = mal.assert_node("r", NodeKind::Rationale, "mine", 2_000);
+        store.put_node(&mine).unwrap();
+        let now = super::wall_now_ms();
+        let current = mal.propose_edge(mine.compute_id(), victim.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, now);
+        store.add_edge(&current).unwrap();
+        let mut old = current.clone();
+        old.provenance.at = 1;
+        let mut d = MemoryDiff::new(mal.pubkey_hex(), 1);
+        d.add_edge(old);
+        assert!(matches!(apply_diff(&store, &d, Some(mal.pubkey_hex())), Err(AssertError::NotAuthor(_))));
+        assert_eq!(store.out_edges(&mine.compute_id()).unwrap()[0].provenance.at, now);
     }
 }
