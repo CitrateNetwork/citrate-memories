@@ -184,12 +184,16 @@ describe("PBA-L3c-015 — /api/chat LLM budget and bounded history", () => {
       calls.push(init.body);
       return new Response(JSON.stringify([{ result: 99 }, { result: 1 }]), { status: 200 });
     });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-24T10:59:00.000Z"));
     try {
       const { checkWindowLimit } = await import("../api/ratelimit");
-      expect(await checkWindowLimit("k", 5, 3600)).toEqual({ ok: false, retryAfter: 3600, backend: "redis" });
+      // Denial reports the seconds left in the current hour window (PBA-L3c-012 variant).
+      expect(await checkWindowLimit("k", 5, 3600)).toEqual({ ok: false, retryAfter: 60, backend: "redis" });
       expect(calls[0]).toContain("rl:w3600:k:");
     } finally {
       vi.unstubAllGlobals();
+      vi.useRealTimers();
     }
   });
 });

@@ -3,7 +3,8 @@
  *
  * Two backends behind one async entry point ({@link checkRateLimit}):
  *  1. **Distributed** — Upstash Redis REST (`UPSTASH_REDIS_REST_URL` + `_TOKEN`):
- *     a 1-second fixed-window counter shared across every instance/region.
+ *     a fixed-window counter (`burst` per `ceil(burst / perSec)` s, see
+ *     {@link redisWindowSec}) shared across every instance/region.
  *  2. **In-memory token bucket** ({@link rateLimit}) — fallback when no store is
  *     configured (local dev). Per-instance, resets on cold start; best-effort.
  *
@@ -49,8 +50,25 @@ export function isDistributed(): boolean {
   return Boolean(REDIS_URL && REDIS_TOKEN);
 }
 
-async function redisFixedWindow(id: string, limit: number, windowSec = 1): Promise<RateResult> {
-  const windowStart = Math.floor(Date.now() / 1000 / windowSec);
+/**
+ * PBA-L3c-012 (variant of the citrate-explorer fix): the Upstash window is sized
+ * so its SUSTAINED rate matches the in-memory token bucket — `burst` requests per
+ * `ceil(burst / perSec)` seconds. It used to be a 1-second window capped at
+ * `burst`, i.e. `burst`/s: the BFF read limiter (12/s, burst 24) admitted 24/s and
+ * the LLM limiter (0.2/s, burst 3) admitted 3/s — 15x the intended rate.
+ */
+export function redisWindowSec(perSec: number, burst: number): number {
+  return Math.max(1, Math.ceil(burst / Math.max(perSec, 0.001)));
+}
+
+/**
+ * Fixed-window counter in Upstash (`INCR` + `EXPIRE windowSec NX`), windows
+ * aligned to epoch multiples of `windowSec`. A denial reports the seconds left in
+ * the current window. Throws on any transport/store error so callers can degrade.
+ */
+async function redisFixedWindow(id: string, limit: number, windowSec: number): Promise<RateResult> {
+  const nowMs = Date.now();
+  const windowStart = Math.floor(nowMs / 1000 / windowSec);
   const key = `rl:${id}:${windowStart}`;
   const res = await fetch(`${REDIS_URL}/pipeline`, {
     method: "POST",
@@ -65,7 +83,10 @@ async function redisFixedWindow(id: string, limit: number, windowSec = 1): Promi
   const body = (await res.json()) as Array<{ result?: number; error?: string }>;
   const count = body?.[0]?.result;
   if (typeof count !== "number") throw new Error("upstash malformed response");
-  if (count > limit) return { ok: false, retryAfter: windowSec, backend: "redis" };
+  if (count > limit) {
+    const windowEndMs = (windowStart + 1) * windowSec * 1000;
+    return { ok: false, retryAfter: Math.max(1, Math.ceil((windowEndMs - nowMs) / 1000)), backend: "redis" };
+  }
   return { ok: true, backend: "redis" };
 }
 
@@ -76,7 +97,7 @@ export async function checkRateLimit(
 ): Promise<RateResult> {
   if (isDistributed()) {
     try {
-      return await redisFixedWindow(id, burst);
+      return await redisFixedWindow(id, burst, redisWindowSec(perSec, burst));
     } catch {
       // Store unreachable — degrade to the local bucket rather than lock out.
     }
