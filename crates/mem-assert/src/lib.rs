@@ -643,7 +643,8 @@ mod tests {
         let bob = asserter(10);
         let mallory = asserter(11);
         let victim = bob.assert_node("r", NodeKind::Adr, "bob's ADR", 5);
-        let tweaks: Vec<Box<dyn Fn(&mut MemoryNode)>> = vec![
+        type Tweak = Box<dyn Fn(&mut MemoryNode)>;
+        let tweaks: Vec<Tweak> = vec![
             Box::new(|n| n.status = Status::Archived),
             Box::new(|n| n.confidence = vec![BelnapValue::False]),
             Box::new(|n| n.valid_to = Some(1)),

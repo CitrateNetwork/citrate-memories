@@ -1566,7 +1566,7 @@ mod tests {
     fn neighbors_readable_keeps_dangling_edges() {
         let a = node("a", "anchor", 1);
         let ghost = node("zzz", "never stored", 2);
-        let s = store_with(&[a.clone()]);
+        let s = store_with(std::slice::from_ref(&a));
         s.add_edge(&plain_edge(&a, &ghost, EdgeKind::References, false)).unwrap();
         let out = Recall::new(&s).neighbors_readable(&a.compute_id(), 10, |_| false).unwrap();
         assert_eq!(out.len(), 1);
