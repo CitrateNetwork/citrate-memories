@@ -43,7 +43,13 @@ describe("POST /api/auth/session", () => {
 
   it("rejects invalid JSON", async () => {
     const res = await POST(
-      new Request("https://app/api/auth/session", { method: "POST", body: "{" }),
+      // Declared JSON (PBA-L3c-031 refuses undeclared/text bodies with 415 before
+      // parsing — see pba-l3c-031.test.ts); the malformed body is still a 400.
+      new Request("https://app/api/auth/session", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{",
+      }),
     );
     expect(res.status).toBe(400);
   });
