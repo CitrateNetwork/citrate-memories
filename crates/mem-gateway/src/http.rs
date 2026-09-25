@@ -80,6 +80,56 @@ pub struct AppState {
     /// MEM-S7 WP-7.2: verified, in-scope push events awaiting incremental ingest.
     /// The receiver only enqueues; the single-writer worker (WP-7.3) drains it.
     pub ingest_queue: Arc<Mutex<VecDeque<crate::webhook::PushEvent>>>,
+    /// PBA-L6b-018: BYOM work bounds (per-principal call budget + a gateway-wide
+    /// cap on concurrent blocking MCP executions).
+    pub byom_limits: Arc<ByomLimits>,
+}
+
+/// PBA-L6b-018: most JSON-RPC calls one BYOM POST may carry. Each call can be a
+/// full-store decrypt scan, so an uncapped 2 MB body (~20k calls) was a cheap
+/// DoS. Real MCP clients send one call per request.
+pub const BYOM_MAX_LINES: usize = 32;
+/// PBA-L6b-018: per-principal BYOM call budget — a token bucket of this many
+/// calls, refilled at [`BYOM_REFILL_PER_SEC`].
+pub const BYOM_BURST_CALLS: f64 = 128.0;
+/// PBA-L6b-018: sustained BYOM calls per second per principal.
+pub const BYOM_REFILL_PER_SEC: f64 = 2.0;
+/// PBA-L6b-018: BYOM executions allowed on the blocking pool at once.
+pub const BYOM_MAX_CONCURRENT: usize = 4;
+
+/// PBA-L6b-018: BYOM work bounds. Buckets are keyed by the verified principal
+/// and only created after the membership check, so the map is bounded by the
+/// org's membership.
+pub struct ByomLimits {
+    slots: Arc<tokio::sync::Semaphore>,
+    buckets: Mutex<HashMap<String, (f64, u64)>>,
+}
+
+impl Default for ByomLimits {
+    fn default() -> Self {
+        ByomLimits {
+            slots: Arc::new(tokio::sync::Semaphore::new(BYOM_MAX_CONCURRENT)),
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ByomLimits {
+    /// Spend `calls` from `sub`'s bucket at `now_ms`; `false` (and nothing spent)
+    /// if the bucket cannot cover them.
+    fn try_spend(&self, sub: &str, calls: usize, now_ms: u64) -> bool {
+        let mut buckets = lock(&self.buckets);
+        let (tokens, last) = buckets.entry(sub.to_string()).or_insert((BYOM_BURST_CALLS, now_ms));
+        let elapsed_s = now_ms.saturating_sub(*last) as f64 / 1000.0;
+        *tokens = (*tokens + elapsed_s * BYOM_REFILL_PER_SEC).min(BYOM_BURST_CALLS);
+        *last = now_ms;
+        let need = calls as f64;
+        if *tokens < need {
+            return false;
+        }
+        *tokens -= need;
+        true
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1016,30 +1066,60 @@ async fn byom(
     // grant with the token's declared scope/tenants so it can never authorize more
     // than the user was shown (and never write when the token is read-only).
     let grant = attenuate_grant(&grant, &claims, &app.signing_key);
-    // FWA-C10-04: per-principal authorship (see /assert). `sub` is the
-    // connect-token-verified principal.
-    let asserter = Asserter::for_principal(&app.signing_key, &sub);
-    let mut server = MemoryMcpServer::new_with_asserter(&app.store, grant, asserter)
-        .with_write_gate(app.write_gate.clone())
-        .with_index_cache(app.index_cache.clone())
-        .with_audit_chain(app.audit.clone());
-    if let Some(e) = &app.embedder {
-        server = server.with_query_embedder(e.clone());
-    }
 
-    let mut out = String::new();
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(resp) = server.handle_line(line) {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&resp);
-        }
+    // PBA-L6b-018: bound the work one request can force BEFORE doing any of it —
+    // a line cap, a per-principal call budget, and execution on the blocking pool
+    // under a gateway-wide concurrency cap (each call may be a full-store decrypt
+    // scan; running them inline starved the async runtime).
+    let lines: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.len() > BYOM_MAX_LINES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("too many JSON-RPC calls in one request (max {BYOM_MAX_LINES})"),
+        ));
     }
+    if !app.byom_limits.try_spend(&sub, lines.len(), now_ms()) {
+        return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "BYOM call budget exhausted; retry later"));
+    }
+    let permit = app
+        .byom_limits
+        .slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ise("BYOM executor closed"))?;
+
+    let app2 = app.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // FWA-C10-04: per-principal authorship (see /assert). `sub` is the
+        // connect-token-verified principal.
+        let asserter = Asserter::for_principal(&app2.signing_key, &sub);
+        let mut server = MemoryMcpServer::new_with_asserter(&app2.store, grant, asserter)
+            .with_write_gate(app2.write_gate.clone())
+            .with_index_cache(app2.index_cache.clone())
+            .with_audit_chain(app2.audit.clone());
+        if let Some(e) = &app2.embedder {
+            server = server.with_query_embedder(e.clone());
+        }
+        let mut out = String::new();
+        for line in &lines {
+            if let Some(resp) = server.handle_line(line) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&resp);
+            }
+        }
+        out
+    })
+    .await
+    .map_err(ise)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], out).into_response())
 }
 

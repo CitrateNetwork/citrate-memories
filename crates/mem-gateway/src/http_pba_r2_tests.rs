@@ -45,6 +45,7 @@ fn app_with(store: MemoryDagStore<MemoryNode>, members: Vec<Membership>, connect
         allow_dev_auth: true,
         layout_cache: Arc::new(Mutex::new(None)),
         ingest_queue: Arc::new(Mutex::new(VecDeque::new())),
+        byom_limits: Arc::new(ByomLimits::default()),
     }
 }
 
@@ -372,4 +373,83 @@ fn pba_l6b_017_tripwire_no_tenant_blind_prefix_resolution_on_caller_surfaces() {
             src.lines().enumerate().filter(|(_, l)| l.contains(needle)).map(|(i, l)| (i + 1, l.trim())).collect();
         assert!(hits.is_empty(), "PBA-L6b-017: {name} uses tenant-blind resolve_prefix: {hits:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// PBA-L6b-018 — BYOM request work is bounded (lines/request, per-principal rate)
+// ---------------------------------------------------------------------------
+
+fn recall_line(i: usize) -> String {
+    json!({"jsonrpc":"2.0","id":i,"method":"tools/call",
+        "params":{"name":"memory.recall","arguments":{"repo":"tenant-a"}}})
+    .to_string()
+}
+
+/// PBA-L6b-018: a single BYOM POST carrying more than `BYOM_MAX_LINES` JSON-RPC
+/// calls is refused up front (413) instead of running thousands of full-store
+/// scans on a runtime worker.
+#[tokio::test]
+async fn pba_l6b_018_byom_refuses_too_many_lines_per_request() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("mallory", &["tenant-a"], false)], Some(secret));
+    let body: Vec<String> = (0..1000).map(recall_line).collect();
+    let r = byom(State(app.clone()), Path("mallory".into()), byom_headers(secret, "mallory", "read"), body.join("\n")).await;
+    assert_eq!(r.err().map(|e| e.status), Some(StatusCode::PAYLOAD_TOO_LARGE), "PBA-L6b-018: 1000 calls in one request ran");
+}
+
+/// PBA-L6b-018 no-false-negative: a normal multi-call request still works.
+#[tokio::test]
+async fn pba_l6b_018_byom_small_batch_still_served() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("mallory", &["tenant-a"], false)], Some(secret));
+    let body: Vec<String> = (0..4).map(recall_line).collect();
+    let r = byom(State(app.clone()), Path("mallory".into()), byom_headers(secret, "mallory", "read"), body.join("\n")).await;
+    let resp = match r {
+        Ok(r) => r,
+        Err(e) => panic!("small batch refused: {}", e.status),
+    };
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 4, "one response per call");
+}
+
+/// PBA-L6b-018: a principal that keeps sending full batches is rate-limited
+/// (429) — the budget is per principal, so another member is unaffected.
+#[tokio::test]
+async fn pba_l6b_018_byom_per_principal_rate_limit() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let app = app_with(
+        store,
+        vec![member("mallory", &["tenant-a"], false), member("alice", &["tenant-a"], false)],
+        Some(secret),
+    );
+    let batch: Vec<String> = (0..8).map(recall_line).collect();
+    let batch = batch.join("\n");
+    let mut limited = false;
+    for _ in 0..64 {
+        let r = byom(State(app.clone()), Path("mallory".into()), byom_headers(secret, "mallory", "read"), batch.clone()).await;
+        if let Err(e) = r {
+            assert_eq!(e.status, StatusCode::TOO_MANY_REQUESTS);
+            limited = true;
+            break;
+        }
+    }
+    assert!(limited, "PBA-L6b-018: 512 calls in a burst were never rate-limited");
+    let other = byom(State(app.clone()), Path("alice".into()), byom_headers(secret, "alice", "read"), recall_line(1)).await;
+    assert!(other.is_ok(), "another principal keeps its own budget");
+}
+
+/// PBA-L6b-018 tripwire: the BYOM handler must keep its line cap, per-principal
+/// budget, and off-runtime (spawn_blocking) execution.
+#[test]
+fn pba_l6b_018_tripwire_byom_work_is_bounded() {
+    let http = include_str!("http.rs");
+    let f = &http[http.find("async fn byom(").expect("byom handler")..];
+    let f = &f[..f.find("\n}\n").unwrap_or(f.len())];
+    for must in ["BYOM_MAX_LINES", "try_spend(", "acquire_owned()", "spawn_blocking("] {
+        assert!(f.contains(must), "PBA-L6b-018: byom lost `{must}`");
+    }
+    assert!(!f.contains("for line in body.lines()"), "PBA-L6b-018: byom runs raw body lines inline again");
 }
