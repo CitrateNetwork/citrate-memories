@@ -342,6 +342,21 @@ pub struct MergeReport {
     pub unembedded: usize,
 }
 
+/// Store-meta key recording which principal INSERTED a (quarantined) edge — the
+/// identity the second-party confirmation rule compares against. The edge's own
+/// `provenance.asserter` is just the key that signed it and is not bound to a
+/// member (GHSA-p545).
+pub fn inserted_by_key(e: &Edge) -> Vec<u8> {
+    [b"edge-inserted-by:".as_slice(), &e.key()].concat()
+}
+
+/// Edge kinds whose confirmation contests another principal's node and so needs
+/// a second party (the node's author, or a writer who is neither the proposal's
+/// inserter nor its signer).
+pub fn needs_second_party(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Supersedes | EdgeKind::Refutes | EdgeKind::Contradicts)
+}
+
 /// Largest clock skew tolerated on a relayed node's `observed_at` (5 minutes).
 pub const RELAY_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -492,7 +507,7 @@ pub fn apply_diff(
                 return Err(AssertError::NotAuthor(label()));
             }
         }
-        let target_author = if e.kind == EdgeKind::Supersedes {
+        let target_author = if needs_second_party(e.kind) {
             match diff.nodes.iter().find(|n| n.compute_id() == e.to) {
                 Some(n) => Some(n.author.clone()),
                 None => store.get_node(&e.to)?.map(|n| n.author),
@@ -503,11 +518,20 @@ pub fn apply_diff(
         // Pass 2: a Supersedes proposal onto another principal's node must be
         // current — a backdated proposal is a primed backdate for a later confirm
         // (also when it would rewrite a stored proposal's timestamp).
-        if e.kind == EdgeKind::Supersedes && e.quarantined {
+        if needs_second_party(e.kind) && e.quarantined {
             if let Some(author) = &target_author {
-                if !is_caller(author) && e.provenance.at.abs_diff(now) > RELAY_CLOCK_SKEW_MS {
+                if e.kind == EdgeKind::Supersedes && !is_caller(author) && e.provenance.at.abs_diff(now) > RELAY_CLOCK_SKEW_MS {
                     return Err(AssertError::NotAuthor(format!(
                         "{} (supersedes proposal on another principal's node must be timestamped now)",
+                        label()
+                    )));
+                }
+                // GHSA-p545: and signed by the relaying caller itself — a key the
+                // caller controls but is not bound to a member would otherwise
+                // pass for a second party at confirmation.
+                if !is_caller(author) && !is_caller(&e.provenance.asserter) {
+                    return Err(AssertError::NotAuthor(format!(
+                        "{} (proposal contesting another principal's node must be signed by the caller)",
                         label()
                     )));
                 }
@@ -533,6 +557,19 @@ pub fn apply_diff(
     }
 
     store.commit(&to_write, &plain)?;
+    // GHSA-p545: record the inserting principal of every Supersedes proposal this
+    // diff wrote, for the second-party confirmation rule.
+    if let Some(c) = caller {
+        for e in plain.iter().filter(|e| needs_second_party(e.kind) && e.quarantined) {
+            let tenant = match diff.nodes.iter().find(|n| n.compute_id() == e.to) {
+                Some(n) => Some(n.repo.clone()),
+                None => store.get_node(&e.to)?.map(|n| n.repo),
+            };
+            if let Some(t) = tenant {
+                store.put_meta(&t, &inserted_by_key(e), c.as_bytes())?;
+            }
+        }
+    }
     let mut superseded = 0;
     for e in supersessions {
         if store.apply_supersession(e)?.transitioned {
@@ -1184,5 +1221,102 @@ mod tests {
         d.add_edge(old);
         assert!(matches!(apply_diff(&store, &d, Some(mal.pubkey_hex())), Err(AssertError::NotAuthor(_))));
         assert_eq!(store.out_edges(&mine.compute_id()).unwrap()[0].provenance.at, now);
+    }
+
+    /// GHSA-p545: a cross-author Supersedes proposal in a diff must be signed by
+    /// the relaying caller; one signed by any other key is refused. Proposals on
+    /// the caller's own nodes, and the caller's own proposals, still relay.
+    #[test]
+    fn ghsa_p545_cross_author_proposal_must_be_signed_by_the_caller() {
+        let bob = asserter(50);
+        let mal = asserter(51);
+        let puppet = asserter(52);
+        let victim = bob.assert_node("r", NodeKind::Adr, "bob", 1_000);
+        let store = stored_with(&victim);
+        let mine = mal.assert_node("r", NodeKind::Rationale, "mine", 2_000);
+        store.put_node(&mine).unwrap();
+        let now = super::wall_now_ms();
+        let pp = puppet.propose_edge(mine.compute_id(), victim.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, now);
+        let mut d = MemoryDiff::new(mal.pubkey_hex(), 1);
+        d.add_edge(pp);
+        assert!(matches!(apply_diff(&store, &d, Some(mal.pubkey_hex())), Err(AssertError::NotAuthor(_))));
+        assert!(store.out_edges(&mine.compute_id()).unwrap().is_empty());
+        let own = mal.propose_edge(mine.compute_id(), victim.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, now);
+        let mut d2 = MemoryDiff::new(mal.pubkey_hex(), 1);
+        d2.add_edge(own);
+        apply_diff(&store, &d2, Some(mal.pubkey_hex())).expect("own proposal relays");
+        // A puppet proposal onto the CALLER's own node is the caller's business.
+        let pp_own = puppet.propose_edge(victim.compute_id(), mine.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, now);
+        let mut d3 = MemoryDiff::new(mal.pubkey_hex(), 1);
+        d3.add_edge(pp_own);
+        apply_diff(&store, &d3, Some(mal.pubkey_hex())).expect("proposal onto caller's own node");
+    }
+
+    /// GHSA-p545: a diff that inserts a Supersedes proposal records the caller as
+    /// its inserting principal (the identity the confirm rule compares against).
+    #[test]
+    fn ghsa_p545_diff_records_the_inserting_principal() {
+        let bob = asserter(53);
+        let mal = asserter(54);
+        let victim = bob.assert_node("r", NodeKind::Adr, "bob", 1_000);
+        let store = stored_with(&victim);
+        let mine = mal.assert_node("r", NodeKind::Rationale, "mine", 2_000);
+        let p = mal.propose_edge(mine.compute_id(), victim.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, super::wall_now_ms());
+        let mut d = MemoryDiff::new(mal.pubkey_hex(), 1);
+        d.add_node(mine);
+        d.add_edge(p.clone());
+        apply_diff(&store, &d, Some(mal.pubkey_hex())).unwrap();
+        assert_eq!(store.get_meta(&inserted_by_key(&p)).unwrap().as_deref(), Some(mal.pubkey_hex().as_bytes()));
+        // No identity, no record (and such a proposal can then only be confirmed by the author).
+        let store2 = stored_with(&victim);
+        let own = bob.propose_edge(victim.compute_id(), victim.compute_id(), EdgeKind::References, EdgeMethod::Nlp, None, 1);
+        let mut d2 = MemoryDiff::new("x", 1);
+        d2.add_edge(own.clone());
+        apply_diff(&store2, &d2, Some(bob.pubkey_hex())).unwrap();
+        assert_eq!(store2.get_meta(&inserted_by_key(&own)).unwrap(), None, "only Supersedes proposals are recorded");
+    }
+
+    /// GHSA-p545: the inserter key is per edge (prefix + the edge's identity key).
+    #[test]
+    fn ghsa_p545_inserted_by_key_is_per_edge() {
+        let a = asserter(55);
+        let n1 = a.assert_node("r", NodeKind::Rationale, "n1", 1);
+        let n2 = a.assert_node("r", NodeKind::Rationale, "n2", 1);
+        let e1 = a.propose_edge(n1.compute_id(), n2.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, 1);
+        let e2 = a.propose_edge(n2.compute_id(), n1.compute_id(), EdgeKind::Supersedes, EdgeMethod::Nlp, None, 1);
+        let k1 = inserted_by_key(&e1);
+        assert!(k1.starts_with(b"edge-inserted-by:") && k1.ends_with(&e1.key()));
+        assert_eq!(k1.len(), b"edge-inserted-by:".len() + e1.key().len());
+        assert_ne!(k1, inserted_by_key(&e2));
+    }
+
+    /// Pass 4: a relayed Refutes/Contradicts proposal onto another principal's
+    /// node must be signed by the caller, and the diff records its inserter.
+    #[test]
+    fn ghsa_p545_contesting_proposals_are_signer_bound_and_recorded() {
+        for kind in [EdgeKind::Refutes, EdgeKind::Contradicts] {
+            let bob = asserter(56);
+            let mal = asserter(57);
+            let puppet = asserter(58);
+            let victim = bob.assert_node("r", NodeKind::Adr, "bob", 1_000);
+            let store = stored_with(&victim);
+            let mine = mal.assert_node("r", NodeKind::Rationale, "mine", 2_000);
+            store.put_node(&mine).unwrap();
+            let now = super::wall_now_ms();
+            let pp = puppet.propose_edge(mine.compute_id(), victim.compute_id(), kind, EdgeMethod::Nlp, None, now);
+            let mut d = MemoryDiff::new(mal.pubkey_hex(), 1);
+            d.add_edge(pp);
+            assert!(matches!(apply_diff(&store, &d, Some(mal.pubkey_hex())), Err(AssertError::NotAuthor(_))), "{kind:?}");
+            // (no timestamp window for these kinds: they carry no validity time)
+            let own = mal.propose_edge(mine.compute_id(), victim.compute_id(), kind, EdgeMethod::Nlp, None, 1);
+            let mut d2 = MemoryDiff::new(mal.pubkey_hex(), 1);
+            d2.add_edge(own.clone());
+            apply_diff(&store, &d2, Some(mal.pubkey_hex())).unwrap();
+            assert_eq!(store.get_meta(&inserted_by_key(&own)).unwrap().as_deref(), Some(mal.pubkey_hex().as_bytes()), "{kind:?}");
+            assert!(needs_second_party(kind));
+        }
+        assert!(needs_second_party(EdgeKind::Supersedes));
+        assert!(!needs_second_party(EdgeKind::AnalogousTo));
+        assert!(!needs_second_party(EdgeKind::References));
     }
 }
