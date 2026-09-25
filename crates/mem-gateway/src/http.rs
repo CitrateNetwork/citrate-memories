@@ -330,6 +330,7 @@ fn grant_can_read(grant: &CapabilityGrant, repo: &str) -> bool {
 ///   * write is allowed only when the token's `scope` names a write-y capability
 ///     (`write` or `propose`); an absent scope defaults to read-only (least
 ///     privilege) so a legacy claimless token cannot silently escalate.
+///
 /// The narrowed grant is re-signed with the gateway key so it still verifies.
 fn attenuate_grant(grant: &CapabilityGrant, claims: &ConnectClaims, sk: &SigningKey) -> CapabilityGrant {
     let token_allows_write = claims
