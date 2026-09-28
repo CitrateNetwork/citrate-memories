@@ -1,0 +1,31 @@
+{
+  "_README": "Template for the Citrate Memories team allowlist. The LIVE file lives on the gateway host at $MEM_TEAM_ALLOWLIST (production: /var/lib/memrizz/team-allowlist.json), holds real team PII, and is NOT committed to git. Copy this schema, fill it in there, and the gateway auto-provisions each listed person on their first auth.citrate.ai login. See docs/TEAM_ACCESS.md.",
+  "members": [
+    {
+      "name": "Founder / owner",
+      "email": "owner@example.com",
+      "role": "OrgOwner"
+    },
+    {
+      "name": "A teammate — read all federation knowledge",
+      "email": "teammate@example.com",
+      "role": "ReadOnly",
+      "scopes": [ { "resource_id": "*", "can_read": true } ]
+    },
+    {
+      "name": "A teammate matched by wallet instead of email",
+      "wallet": "0x0000000000000000000000000000000000000000",
+      "role": "ReadOnly",
+      "scopes": [ { "resource_id": "*", "can_read": true } ]
+    },
+    {
+      "name": "A contributor who may also propose (write) to specific repos",
+      "email": "contributor@example.com",
+      "role": "Member",
+      "scopes": [
+        { "resource_id": "*", "can_read": true },
+        { "resource_id": "citrate-chain", "can_read": true, "can_write": true }
+      ]
+    }
+  ]
+}

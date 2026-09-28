@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "citrate-memories": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-connector.py"],
+      "env": {
+        "MEM_GATEWAY_ORIGIN": "https://mem-gateway.citrate.ai",
+        "MEM_ISSUER": "https://auth.citrate.ai"
+      }
+    }
+  }
+}

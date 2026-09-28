@@ -1,0 +1,10 @@
+{
+  "name": "citrate-memories",
+  "version": "1.0.0",
+  "description": "Citrate Memories over MCP: your agent recalls the federation's shared, always-current institutional knowledge. Sign in once at the identity layer — no key to paste.",
+  "author": {
+    "name": "Citrate Inc.",
+    "email": "team@citrate.ai"
+  },
+  "homepage": "https://memrizz.citrate.ai"
+}

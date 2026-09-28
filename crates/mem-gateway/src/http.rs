@@ -28,10 +28,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use std::collections::VecDeque;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 
 use mem_assert::Asserter;
 use mem_authz::{AuditChain, CapabilityGrant, MemoryEvent, Op, PolicyProfile, ResourceScope};
@@ -41,11 +41,12 @@ use mem_mcp::MemoryMcpServer;
 use mem_query::{NeighborItem, Recall, RecallItem, RecallResult, TenantIndexCache};
 use mem_store::MemoryDagStore;
 
+use crate::allowlist::TeamAllowlist;
 use crate::auth::{
     mint_connect_token, mint_grant, repo_resource, verify_connect_token, ConnectClaims,
-    OidcVerifier,
+    OidcVerifier, Principal,
 };
-use crate::control::{Control, OrgStatus};
+use crate::control::{Control, Membership, OrgStatus};
 use crate::now_ms;
 use crate::scene::{self, NodeInput, Scene};
 
@@ -76,6 +77,12 @@ pub struct AppState {
     pub oidc: Option<Arc<OidcVerifier>>,
     pub connect_secret: Option<Arc<String>>,
     pub allow_dev_auth: bool,
+    /// Path to the durable control plane (`control.json`), so a JIT-provisioned
+    /// membership can be persisted at the moment it is granted.
+    pub control_path: Arc<String>,
+    /// Path to the team allowlist (JSON). `None` disables JIT provisioning — an
+    /// unknown `sub` then always 403s (the pre-allowlist behavior).
+    pub team_allowlist_path: Option<Arc<String>>,
     pub layout_cache: Arc<Mutex<Option<Scene>>>,
     /// MEM-S7 WP-7.2: verified, in-scope push events awaiting incremental ingest.
     /// The receiver only enqueues; the single-writer worker (WP-7.3) drains it.
@@ -250,6 +257,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn rlock<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     l.read().unwrap_or_else(|p| p.into_inner())
 }
+fn wlock<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|p| p.into_inner())
+}
 
 // --------------------------------------------------------------------------
 // Auth + authorization
@@ -262,13 +272,15 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Establish the principal `sub`. OIDC takes precedence and fails closed; the
-/// `x-dev-sub` backdoor is only honored when OIDC is off and dev-auth is on.
-fn authenticate(app: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
+/// Establish the full [`Principal`] (sub + email/wallet claims). OIDC takes
+/// precedence and fails closed; the `x-dev-sub` backdoor is only honored when
+/// OIDC is off and dev-auth is on. The dev-auth path carries no email/wallet, so
+/// JIT provisioning never fires there.
+fn authenticate_principal(app: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
     if let Some(oidc) = &app.oidc {
         let token = bearer(headers).ok_or_else(|| unauthorized("missing bearer token"))?;
         return oidc
-            .verify(&token)
+            .verify_principal(&token)
             .map_err(|_| unauthorized("token rejected"));
     }
     if app.allow_dev_auth {
@@ -276,10 +288,57 @@ fn authenticate(app: &AppState, headers: &HeaderMap) -> Result<String, ApiError>
             .get("x-dev-sub")
             .and_then(|v| v.to_str().ok())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .map(|s| Principal {
+                sub: s.to_string(),
+                email: None,
+                email_verified: false,
+                wallet_address: None,
+            })
             .ok_or_else(|| unauthorized("missing x-dev-sub (dev-auth)"));
     }
     Err(unauthorized("authentication not configured"))
+}
+
+/// Establish the principal `sub`. Convenience wrapper over
+/// [`authenticate_principal`] for call sites that need only the subject.
+fn authenticate(app: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
+    authenticate_principal(app, headers).map(|p| p.sub)
+}
+
+/// Team-access JIT provisioning: a teammate whose opaque `sub` has no membership
+/// is provisioned on first authenticated login IF the token's VERIFIED email or
+/// wallet is on the team allowlist. Returns the new membership, or `None` when
+/// JIT is disabled, the identity is not allowlisted, or the write cannot be
+/// persisted (fail closed — never grant on unpersisted state).
+fn jit_provision(app: &AppState, principal: &Principal, org: &str) -> Option<Membership> {
+    let path = app.team_allowlist_path.as_ref()?;
+    let allow = TeamAllowlist::load_or_empty(path.as_str());
+    let entry = allow
+        .match_identity(
+            principal.email.as_deref(),
+            principal.email_verified,
+            principal.wallet_address.as_deref(),
+        )?
+        .clone();
+
+    let mut control = wlock(&app.control);
+    // Re-check under the write lock: a concurrent request may have provisioned
+    // this same principal between the read miss and here.
+    if control.membership(&principal.sub, org).is_none() {
+        control.upsert_membership_full(&principal.sub, org, entry.role, entry.scopes.clone());
+        if let Err(e) = control.save(app.control_path.as_str()) {
+            eprintln!(
+                "mem-gateway: JIT membership persist failed for sub={} ({e}); refusing to grant",
+                principal.sub
+            );
+            return None;
+        }
+        eprintln!(
+            "mem-gateway: JIT-provisioned membership sub={} org={} role={:?} (team allowlist)",
+            principal.sub, org, entry.role
+        );
+    }
+    control.membership(&principal.sub, org).cloned()
 }
 
 /// Append one audited decision, failing CLOSED: MEM-B-011 — if the append fails
@@ -294,10 +353,13 @@ fn audit_event(
     detail: &str,
 ) -> Result<(), ApiError> {
     let mut chain = lock(&app.audit);
-    chain.append(ev, actor, resource, detail, now_ms()).map(|_| ()).map_err(|e| {
-        tracing::error!("audit append failed for {actor} on {resource}: {e}");
-        ise(format!("audit append failed; refusing to proceed: {e}"))
-    })
+    chain
+        .append(ev, actor, resource, detail, now_ms())
+        .map(|_| ())
+        .map_err(|e| {
+            tracing::error!("audit append failed for {actor} on {resource}: {e}");
+            ise(format!("audit append failed; refusing to proceed: {e}"))
+        })
 }
 
 /// Authenticate, then authorize one operation against the principal's Org
@@ -332,28 +394,54 @@ fn gate_with_grant(
     if org != app.org_id.as_str() {
         return Err(not_found("unknown org on this gateway"));
     }
-    let sub = authenticate(app, headers)?;
+    let principal = authenticate_principal(app, headers)?;
+    let sub = principal.sub.clone();
 
     let membership = {
-        let control = rlock(&app.control);
-        match control.org(org) {
-            Some(o) if o.status == OrgStatus::Active => {}
-            Some(_) => return Err(forbidden("org suspended")),
-            None => return Err(not_found("unknown org")),
-        }
-        match control.membership(&sub, org) {
-            Some(m) => m.clone(),
-            None => {
-                drop(control);
-                // Best-effort on the deny path: the outcome is already a refusal.
-                let _ = audit_event(app, MemoryEvent::Denied, &sub, resource, "no membership");
-                return Err(forbidden("no membership in org"));
+        let existing = {
+            let control = rlock(&app.control);
+            match control.org(org) {
+                Some(o) if o.status == OrgStatus::Active => {}
+                Some(_) => return Err(forbidden("org suspended")),
+                None => return Err(not_found("unknown org")),
             }
+            control.membership(&sub, org).cloned()
+        };
+        match existing {
+            Some(m) => m,
+            // No membership yet: try just-in-time provisioning from the team
+            // allowlist (the only place a human's opaque `sub` becomes an Org
+            // member without an operator hand-editing control.json). The read
+            // lock is released above so `jit_provision` can take the write lock.
+            None => match jit_provision(app, &principal, org) {
+                Some(m) => {
+                    // Best-effort audit of the grant of membership itself.
+                    let _ = audit_event(
+                        app,
+                        MemoryEvent::Write,
+                        &sub,
+                        resource,
+                        "jit-provision membership",
+                    );
+                    m
+                }
+                None => {
+                    // Best-effort on the deny path: the outcome is already a refusal.
+                    let _ = audit_event(app, MemoryEvent::Denied, &sub, resource, "no membership");
+                    return Err(forbidden("no membership in org"));
+                }
+            },
         }
     };
 
     let now = now_ms();
-    let grant = mint_grant(&app.signing_key, &app.issuer, &membership, now, GRANT_TTL_MS);
+    let grant = mint_grant(
+        &app.signing_key,
+        &app.issuer,
+        &membership,
+        now,
+        GRANT_TTL_MS,
+    );
     match grant.check(resource, op, now) {
         Ok(()) => {
             let ev = match op {
@@ -403,7 +491,9 @@ fn resolve_in_tenant(
 /// cross-DAG `AnalogousTo` edge) so neither their content nor existence leaks to a
 /// caller whose membership excludes that tenant (MEM-B-007).
 fn grant_can_read(grant: &CapabilityGrant, repo: &str) -> bool {
-    grant.check(&repo_resource(repo), Op::Read, now_ms()).is_ok()
+    grant
+        .check(&repo_resource(repo), Op::Read, now_ms())
+        .is_ok()
 }
 
 /// PBA-L6b-001: the ONE way an HTTP handler fetches neighbours for a caller —
@@ -435,11 +525,18 @@ fn readable_neighbors(
 ///     privilege) so a legacy claimless token cannot silently escalate.
 ///
 /// The narrowed grant is re-signed with the gateway key so it still verifies.
-fn attenuate_grant(grant: &CapabilityGrant, claims: &ConnectClaims, sk: &SigningKey) -> CapabilityGrant {
+fn attenuate_grant(
+    grant: &CapabilityGrant,
+    claims: &ConnectClaims,
+    sk: &SigningKey,
+) -> CapabilityGrant {
     let token_allows_write = claims
         .scope
         .as_deref()
-        .map(|s| s.split(',').any(|t| matches!(t.trim(), "write" | "propose")))
+        .map(|s| {
+            s.split(',')
+                .any(|t| matches!(t.trim(), "write" | "propose"))
+        })
         .unwrap_or(false);
     let now = now_ms();
 
@@ -452,7 +549,11 @@ fn attenuate_grant(grant: &CapabilityGrant, claims: &ConnectClaims, sk: &Signing
                     let rid = repo_resource(t);
                     let can_read = grant.check(&rid, Op::Read, now).is_ok();
                     let can_write = token_allows_write && grant.check(&rid, Op::Write, now).is_ok();
-                    ResourceScope { resource_id: rid, can_read, can_write }
+                    ResourceScope {
+                        resource_id: rid,
+                        can_read,
+                        can_write,
+                    }
                 })
                 .collect();
         }
@@ -579,11 +680,7 @@ async fn connector_script() -> Response {
 /// body, fail-closed when `MEM_INGEST_WEBHOOK_SECRET` is unset), then org
 /// allowlist + parse, then enqueue an incremental-ingest job. The single-writer
 /// worker (WP-7.3) drains the queue; this handler never writes the store.
-async fn github_webhook(
-    State(app): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn github_webhook(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let secret = std::env::var("MEM_INGEST_WEBHOOK_SECRET").unwrap_or_default();
     if secret.is_empty() {
         // Fail closed: an unconfigured secret must never accept an unauthenticated body.
@@ -637,7 +734,14 @@ async fn recall(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let repo = qparam(&q, "repo").ok_or_else(|| bad("repo query param required"))?;
-    gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "recall")?;
+    gate(
+        &app,
+        &headers,
+        &org,
+        &repo_resource(&repo),
+        Op::Read,
+        "recall",
+    )?;
     let r = recaller(&app)
         .with_in_flight(in_flight_param(&q))
         .storyline(&repo, budget(&q, 15))
@@ -647,7 +751,9 @@ async fn recall(
 
 /// ADR-09 B.4: opt in to the in-flight branch layer via `?include_in_flight=true`.
 fn in_flight_param(q: &HashMap<String, String>) -> bool {
-    q.get("include_in_flight").map(|v| v == "true" || v == "1").unwrap_or(false)
+    q.get("include_in_flight")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
 }
 
 async fn search(
@@ -658,7 +764,14 @@ async fn search(
 ) -> Result<Json<Value>, ApiError> {
     let repo = qparam(&q, "repo").ok_or_else(|| bad("repo query param required"))?;
     let query = qparam(&q, "q").ok_or_else(|| bad("q query param required"))?;
-    gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "search")?;
+    gate(
+        &app,
+        &headers,
+        &org,
+        &repo_resource(&repo),
+        Op::Read,
+        "search",
+    )?;
     let r = recaller(&app)
         .with_in_flight(in_flight_param(&q))
         .search(&repo, &query, budget(&q, 10))
@@ -674,8 +787,14 @@ async fn neighbors(
 ) -> Result<Json<Value>, ApiError> {
     let repo = qparam(&q, "repo").ok_or_else(|| bad("repo query param required"))?;
     let id_prefix = qparam(&q, "id").ok_or_else(|| bad("id query param required"))?;
-    let (_sub, grant) =
-        gate_with_grant(&app, &headers, &org, &repo_resource(&repo), Op::Read, "neighbors")?;
+    let (_sub, grant) = gate_with_grant(
+        &app,
+        &headers,
+        &org,
+        &repo_resource(&repo),
+        Op::Read,
+        "neighbors",
+    )?;
     let rc = recaller(&app);
     // MEM-B-007: the anchor must live in the authorized tenant (cross-tenant → 404).
     let (id, _node) = resolve_in_tenant(&app.store, &rc, &repo, &id_prefix)?;
@@ -758,7 +877,14 @@ async fn review(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let repo = qparam(&q, "repo").ok_or_else(|| bad("repo query param required"))?;
-    gate(&app, &headers, &org, &repo_resource(&repo), Op::Read, "review")?;
+    gate(
+        &app,
+        &headers,
+        &org,
+        &repo_resource(&repo),
+        Op::Read,
+        "review",
+    )?;
     let want = budget(&q, 25);
     // Pull a wider window, then keep the items a human should review: advisory
     // (inferred) trust, or anything no longer Active.
@@ -911,9 +1037,10 @@ fn sign_checkpoint(
 fn map_sync_err(e: mem_sync::SyncError) -> ApiError {
     match e {
         // RPC unreachable / malformed / wrong-chain — an upstream failure.
-        mem_sync::SyncError::Chain(m) => {
-            ApiError::new(StatusCode::BAD_GATEWAY, format!("chain checkpoint failed: {m}"))
-        }
+        mem_sync::SyncError::Chain(m) => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("chain checkpoint failed: {m}"),
+        ),
         other => ise(other),
     }
 }
@@ -936,7 +1063,9 @@ async fn submit_checkpoint(
         return Err(bad("root required"));
     }
     if root.len() > 256 {
-        return Err(bad("root too long (max 256 chars; submit a hash, not a document)"));
+        return Err(bad(
+            "root too long (max 256 chars; submit a hash, not a document)",
+        ));
     }
     let _sub = gate(
         &app,
@@ -1016,8 +1145,14 @@ async fn ops(State(app): State<AppState>, headers: HeaderMap) -> Result<Json<Val
         "encrypted_at_rest".into(),
         json!(app.store.is_encrypted_at_rest()),
     );
-    obj.insert("node_count".into(), json!(app.store.node_count().map_err(ise)?));
-    obj.insert("edge_count".into(), json!(app.store.edge_count().map_err(ise)?));
+    obj.insert(
+        "node_count".into(),
+        json!(app.store.node_count().map_err(ise)?),
+    );
+    obj.insert(
+        "edge_count".into(),
+        json!(app.store.edge_count().map_err(ise)?),
+    );
     obj.insert("audit_records".into(), json!(lock(&app.audit).len()));
     obj.insert(
         "embedder".into(),
@@ -1049,7 +1184,10 @@ async fn connect_token(
 ) -> Result<Json<Value>, ApiError> {
     let sub = authenticate(&app, &headers)?;
     let secret = app.connect_secret.as_ref().ok_or_else(|| {
-        ApiError::new(StatusCode::NOT_IMPLEMENTED, "connect minting not configured")
+        ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "connect minting not configured",
+        )
     })?;
     // MEM-B-008: short-lived and read-only by default. The token's authority is
     // the intersection of membership and these claims at use time; this
@@ -1068,8 +1206,9 @@ async fn connect_token(
     })))
 }
 
-/// BYOM (bring-your-own-model) MCP-over-HTTP: a connect-token-authenticated
-/// client speaks JSON-RPC to the same `MemoryMcpServer` the stdio/daemon
+/// BYOM (bring-your-own-model) MCP-over-HTTP: a client authenticated by EITHER an
+/// OIDC id_token (terminal/CLI path, JIT-provisioned) or an HS256 connect token
+/// (webapp path) speaks JSON-RPC to the same `MemoryMcpServer` the stdio/daemon
 /// transports use.
 async fn byom(
     State(app): State<AppState>,
@@ -1077,35 +1216,87 @@ async fn byom(
     headers: HeaderMap,
     body: String,
 ) -> Result<Response, ApiError> {
-    let secret = app
-        .connect_secret
-        .as_ref()
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_IMPLEMENTED, "BYOM connect not configured"))?;
-    let token = bearer(&headers).ok_or_else(|| unauthorized("missing connect token"))?;
-    let claims =
-        verify_connect_token(secret, &token).map_err(|_| unauthorized("connect token rejected"))?;
-    if claims.sub != sub {
-        return Err(forbidden("connect token sub mismatch"));
+    let token = bearer(&headers).ok_or_else(|| unauthorized("missing bearer token"))?;
+
+    // The BYOM endpoint accepts two credentials:
+    //   (1) an OIDC id_token (aud=memrizz) — the terminal/CLI path. It carries the
+    //       verified email, so it JIT-provisions on first use and needs no
+    //       pre-minted connect token; it grants the caller's FULL membership (no
+    //       attenuation — the identity itself is the authority).
+    //   (2) an HS256 connect token — the webapp path. It is an ATTENUATION of the
+    //       membership (scope/tenants), honored at use time (MEM-B-008).
+    // OIDC is tried first when configured; a token that is not a valid id_token
+    // falls back to connect-token verification, so existing webapp clients keep
+    // working unchanged.
+    enum Cred {
+        Oidc(Principal),
+        Connect(ConnectClaims),
     }
-    // PBA-L3c-032: a connect token is bound to the org it was minted for; one
-    // minted for another org (or with no org at all — fail closed) is refused.
-    if claims.org.as_deref() != Some(app.org_id.as_str()) {
-        return Err(forbidden("connect token not issued for this org"));
+    let cred = match app
+        .oidc
+        .as_ref()
+        .and_then(|o| o.verify_principal(&token).ok())
+    {
+        Some(p) => Cred::Oidc(p),
+        None => {
+            let secret = app.connect_secret.as_ref().ok_or_else(|| {
+                ApiError::new(StatusCode::NOT_IMPLEMENTED, "BYOM connect not configured")
+            })?;
+            let claims =
+                verify_connect_token(secret, &token).map_err(|_| unauthorized("token rejected"))?;
+            // PBA-L3c-032: a connect token is bound to the org it was minted for;
+            // one minted for another org (or with no org at all — fail closed) is
+            // refused. The OIDC path is bound by its audience instead.
+            if claims.org.as_deref() != Some(app.org_id.as_str()) {
+                return Err(forbidden("connect token not issued for this org"));
+            }
+            Cred::Connect(claims)
+        }
+    };
+
+    // The token's subject must match the path segment (no acting-as another user).
+    let token_sub = match &cred {
+        Cred::Oidc(p) => p.sub.as_str(),
+        Cred::Connect(c) => c.sub.as_str(),
+    };
+    if token_sub != sub {
+        return Err(forbidden("token sub mismatch"));
     }
 
+    let org = app.org_id.as_str();
     let membership = {
-        let control = rlock(&app.control);
-        match control.membership(&sub, app.org_id.as_str()) {
-            Some(m) => m.clone(),
-            None => return Err(forbidden("no membership in org")),
+        let existing = {
+            let control = rlock(&app.control);
+            control.membership(&sub, org).cloned()
+        };
+        match existing {
+            Some(m) => m,
+            // Only the OIDC path can JIT-provision (it carries email/wallet); a
+            // connect token alone cannot, so an unprovisioned connect caller 403s
+            // exactly as before.
+            None => match &cred {
+                Cred::Oidc(p) => {
+                    jit_provision(&app, p, org).ok_or_else(|| forbidden("no membership in org"))?
+                }
+                Cred::Connect(_) => return Err(forbidden("no membership in org")),
+            },
         }
     };
     let now = now_ms();
-    let grant = mint_grant(&app.signing_key, &app.issuer, &membership, now, GRANT_TTL_MS);
-    // MEM-B-008: the connect token is an ATTENUATION — intersect the membership
-    // grant with the token's declared scope/tenants so it can never authorize more
-    // than the user was shown (and never write when the token is read-only).
-    let grant = attenuate_grant(&grant, &claims, &app.signing_key);
+    let grant = mint_grant(
+        &app.signing_key,
+        &app.issuer,
+        &membership,
+        now,
+        GRANT_TTL_MS,
+    );
+    // Attenuate ONLY for connect tokens (MEM-B-008). An OIDC principal is the full
+    // verified identity, so its grant is the membership grant unmodified. The grant
+    // flows into the blocking-pool executor below (PBA-L6b-018).
+    let grant = match &cred {
+        Cred::Connect(c) => attenuate_grant(&grant, c, &app.signing_key),
+        Cred::Oidc(_) => grant,
+    };
 
     // PBA-L6b-018: bound the work one request can force BEFORE doing any of it —
     // a line cap, a per-principal call budget, and execution on the blocking pool
@@ -1264,14 +1455,21 @@ mod byom_attenuation_tests {
         let now = now_ms();
         let grant = mint_grant(&sk, "iss", &owner_membership(), now, GRANT_TTL_MS);
         assert!(
-            grant.check("repo:citrate-chain/memory", Op::Write, now).is_ok(),
+            grant
+                .check("repo:citrate-chain/memory", Op::Write, now)
+                .is_ok(),
             "precondition: owner membership can write before attenuation"
         );
         let claims = ConnectClaims { sub: "owner-1".into(), scope: Some("read".into()), tenants: None, org: None };
         let att = attenuate_grant(&grant, &claims, &sk);
-        assert!(att.check("repo:citrate-chain/memory", Op::Read, now).is_ok(), "read is preserved");
         assert!(
-            att.check("repo:citrate-chain/memory", Op::Write, now).is_err(),
+            att.check("repo:citrate-chain/memory", Op::Read, now)
+                .is_ok(),
+            "read is preserved"
+        );
+        assert!(
+            att.check("repo:citrate-chain/memory", Op::Write, now)
+                .is_err(),
             "MEM-B-008: a read-scope token must not authorize write, even for an owner"
         );
     }
@@ -1290,7 +1488,11 @@ mod byom_attenuation_tests {
             org: None,
         };
         let att = attenuate_grant(&grant, &claims, &sk);
-        assert!(att.check("repo:citrate-landing/memory", Op::Write, now).is_ok(), "named tenant writable (propose ⇒ write)");
+        assert!(
+            att.check("repo:citrate-landing/memory", Op::Write, now)
+                .is_ok(),
+            "named tenant writable (propose ⇒ write)"
+        );
         assert!(
             att.check("repo:citrate-chain/memory", Op::Read, now).is_err(),
             "MEM-B-008: a tenant the token did not name is denied, though the owner membership covered it"
@@ -1334,7 +1536,9 @@ mod resolve_in_tenant_tests {
             kind: NodeKind::Rationale,
             repo: repo.into(),
             author: "ingest".into(),
-            source_ref: SourceRef::DagNative { key: content.into() },
+            source_ref: SourceRef::DagNative {
+                key: content.into(),
+            },
             content: content.as_bytes().to_vec(),
             valid_from: 1,
             valid_to: None,
@@ -1361,8 +1565,15 @@ mod resolve_in_tenant_tests {
         // MEM-B-007 — must be 404, and must NOT return the foreign node.
         let cross = resolve_in_tenant(&store, &rc, "citrate-landing", prefix);
         match cross {
-            Err(e) => assert_eq!(e.status, StatusCode::NOT_FOUND, "cross-tenant hit must be 404 (existence must not leak)"),
-            Ok((_, n)) => panic!("MEM-B-007: cross-tenant resolve leaked node from repo {:?}", n.repo),
+            Err(e) => assert_eq!(
+                e.status,
+                StatusCode::NOT_FOUND,
+                "cross-tenant hit must be 404 (existence must not leak)"
+            ),
+            Ok((_, n)) => panic!(
+                "MEM-B-007: cross-tenant resolve leaked node from repo {:?}",
+                n.repo
+            ),
         }
 
         // The owning tenant still resolves it (no false negative).

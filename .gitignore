@@ -59,3 +59,6 @@ handoffs/
 **/*EXEC_STATUS*
 **/*COUNSEL*
 **/*DEPLOY_LOG*
+# Python bytecode
+__pycache__/
+*.pyc

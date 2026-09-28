@@ -1,0 +1,23 @@
+{
+  "name": "citrate",
+  "owner": {
+    "name": "Citrate Inc.",
+    "email": "team@citrate.ai"
+  },
+  "metadata": {
+    "version": "1.0.0",
+    "description": "Citrate federation plugins for Claude Code. Includes Citrate Memories — the team's shared, always-current institutional knowledge, over MCP."
+  },
+  "plugins": [
+    {
+      "name": "citrate-memories",
+      "description": "Query the Citrate federation's shared knowledge DAG from your agent: recall, search, neighbors, verify, as_of. Sign in once at the identity layer (no key to paste); entitlement follows your email.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Citrate Inc.",
+        "email": "team@citrate.ai"
+      },
+      "source": "./clients/claude-code/citrate-memories"
+    }
+  ]
+}
