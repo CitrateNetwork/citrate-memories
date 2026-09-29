@@ -2,8 +2,15 @@
 title: Citrate Memories — Team Install Guide (non-engineer friendly)
 created: 2026-07-19
 audience: anyone on the team who uses a frontier-model agent (Claude, etc.) or a browser
-status: draft — Option B endpoints go live with the gateway rollout (P4)
+status: superseded 2026-09-28 — see below
 ---
+
+> **Superseded (2026-09-28).** Access is now by **identity/allowlist, no key to
+> paste**. Use the canonical guides instead:
+> - Connect (any client): [`../clients/README.md`](../clients/README.md)
+> - Operators (grant a teammate): [`TEAM_ACCESS.md`](TEAM_ACCESS.md)
+>
+> The token-copying flow described below is retained only as historical context.
 
 # Using Citrate Memories
 

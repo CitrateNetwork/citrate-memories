@@ -19,6 +19,7 @@
 //! the `server` feature so it stays unit-testable; the axum server and OIDC
 //! verifier live behind `#[cfg(feature = "server")]`.
 
+pub mod allowlist;
 pub mod auth;
 pub mod control;
 pub mod scene;

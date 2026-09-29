@@ -165,6 +165,36 @@ impl Control {
         });
         true
     }
+
+    /// Like [`upsert_membership`] but also sets `scopes` — used by team-allowlist
+    /// JIT provisioning, where a non-owner role (`Member`/`ReadOnly`) carries its
+    /// readable tenants. Returns `true` if it created or changed a row.
+    pub fn upsert_membership_full(
+        &mut self,
+        sub: &str,
+        org: &str,
+        role: Role,
+        scopes: Vec<Scope>,
+    ) -> bool {
+        if let Some(m) = self
+            .memberships
+            .iter_mut()
+            .find(|m| m.sub == sub && m.org == org)
+        {
+            let changed = m.role != role || m.scopes != scopes;
+            m.role = role;
+            m.scopes = scopes;
+            return changed;
+        }
+        self.memberships.push(Membership {
+            sub: sub.to_string(),
+            org: org.to_string(),
+            role,
+            scopes,
+            parent: None,
+        });
+        true
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +219,43 @@ mod tests {
         assert!(c.upsert_membership("sub-1", "citrate-federation", Role::Admin));
         let m = c.membership("sub-1", "citrate-federation").unwrap();
         assert_eq!(m.role, Role::Admin);
+    }
+
+    #[test]
+    fn upsert_membership_full_sets_and_updates_scopes() {
+        let mut c = Control::default();
+        let scopes = vec![Scope {
+            resource_id: "*".into(),
+            can_read: true,
+            can_write: false,
+        }];
+        assert!(c.upsert_membership_full(
+            "sub-9",
+            "citrate-federation",
+            Role::Member,
+            scopes.clone()
+        ));
+        let m = c.membership("sub-9", "citrate-federation").unwrap();
+        assert_eq!(m.role, Role::Member);
+        assert_eq!(m.scopes, scopes);
+        // Idempotent: same role + scopes → no change reported.
+        assert!(!c.upsert_membership_full("sub-9", "citrate-federation", Role::Member, scopes));
+        // Widening scope reports a change.
+        let wider = vec![Scope {
+            resource_id: "*".into(),
+            can_read: true,
+            can_write: true,
+        }];
+        assert!(c.upsert_membership_full(
+            "sub-9",
+            "citrate-federation",
+            Role::Member,
+            wider.clone()
+        ));
+        assert_eq!(
+            c.membership("sub-9", "citrate-federation").unwrap().scopes,
+            wider
+        );
     }
 
     #[test]

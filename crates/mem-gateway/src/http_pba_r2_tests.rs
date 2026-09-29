@@ -46,6 +46,8 @@ fn app_with(store: MemoryDagStore<MemoryNode>, members: Vec<Membership>, connect
         layout_cache: Arc::new(Mutex::new(None)),
         ingest_queue: Arc::new(Mutex::new(VecDeque::new())),
         byom_limits: Arc::new(ByomLimits::default()),
+        control_path: Arc::new("/tmp/mem-pba-test-control.json".into()),
+        team_allowlist_path: None,
     }
 }
 

@@ -42,18 +42,24 @@ fn resolve_asserter_seed(env_val: Option<String>) -> Result<String, &'static str
 /// by casually flipping one env var to "fix" a 401 in production, dev-auth also
 /// requires an explicit non-production acknowledgement
 /// (`MEM_GATEWAY_DEV_AUTH_ACK=1`). Missing it → refuse to start.
-fn dev_auth_permitted(oidc_on: bool, allow_dev_auth: bool, ack: Option<&str>) -> Result<(), String> {
+fn dev_auth_permitted(
+    oidc_on: bool,
+    allow_dev_auth: bool,
+    ack: Option<&str>,
+) -> Result<(), String> {
     if oidc_on || !allow_dev_auth {
         return Ok(());
     }
     if ack == Some("1") {
         Ok(())
     } else {
-        Err("MEM_GATEWAY_ALLOW_DEV_AUTH=1 trusts the unauthenticated x-dev-sub header \
+        Err(
+            "MEM_GATEWAY_ALLOW_DEV_AUTH=1 trusts the unauthenticated x-dev-sub header \
              (impersonate any member). Refusing to start: this is DEVELOPMENT ONLY. \
              Set MEM_GATEWAY_DEV_AUTH_ACK=1 to acknowledge a non-production deployment, \
              or configure OIDC_* for real authentication."
-            .to_string())
+                .to_string(),
+        )
     }
 }
 
@@ -111,9 +117,13 @@ fn env_opt(key: &str) -> Option<String> {
 /// shared across requests (mirrors the mcp_serve daemon). A hashing store → None.
 #[cfg(feature = "transformer")]
 fn load_query_embedder(store: &MemoryDagStore<MemoryNode>) -> Option<Arc<dyn Embedder>> {
-    let model = mem_query::detect_store_embedding_model(store).ok().flatten()?;
+    let model = mem_query::detect_store_embedding_model(store)
+        .ok()
+        .flatten()?;
     if model != mem_index::transformer::DEFAULT_MODEL_ID {
-        eprintln!("mem-gateway: store model '{model}' has no matching local embedder; search disabled");
+        eprintln!(
+            "mem-gateway: store model '{model}' has no matching local embedder; search disabled"
+        );
         return None;
     }
     eprintln!("mem-gateway: store embedded with '{model}', loading transformer embedder…");
@@ -182,7 +192,10 @@ async fn main() {
     if let Some(owner) = &args.bootstrap_owner {
         if control.upsert_membership(owner, &args.org, Role::OrgOwner) {
             control_dirty = true;
-            eprintln!("mem-gateway: bootstrapped OrgOwner '{owner}' for org '{}'", args.org);
+            eprintln!(
+                "mem-gateway: bootstrapped OrgOwner '{owner}' for org '{}'",
+                args.org
+            );
         }
     }
     if control_dirty {
@@ -220,7 +233,8 @@ async fn main() {
     let allow_dev_auth = env_opt("MEM_GATEWAY_ALLOW_DEV_AUTH").as_deref() == Some("1");
     let connect_secret = env_opt("MEM_CONNECT_SECRET").map(Arc::new);
     // MEM-B-006: fail closed when the seed is unset — no insecure default.
-    let seed = resolve_asserter_seed(env_opt("MEM_GATEWAY_ASSERTER_SEED")).unwrap_or_else(|m| fail(m));
+    let seed =
+        resolve_asserter_seed(env_opt("MEM_GATEWAY_ASSERTER_SEED")).unwrap_or_else(|m| fail(m));
 
     // --- startup summary + safety checks ---
     eprintln!("mem-gateway: org={} store={} ({node_count} nodes / {edge_count} edges, encrypted_at_rest={encrypted})", args.org, args.store);
@@ -234,7 +248,9 @@ async fn main() {
         }
     } else if allow_dev_auth {
         // MEM-B-013: refuse to start in a dev-auth posture without explicit ack.
-        if let Err(m) = dev_auth_permitted(false, true, env_opt("MEM_GATEWAY_DEV_AUTH_ACK").as_deref()) {
+        if let Err(m) =
+            dev_auth_permitted(false, true, env_opt("MEM_GATEWAY_DEV_AUTH_ACK").as_deref())
+        {
             fail(&m);
         }
         eprintln!("mem-gateway: AUTH = dev-auth (x-dev-sub) — DEVELOPMENT ONLY (acknowledged)");
@@ -262,6 +278,11 @@ async fn main() {
         oidc,
         connect_secret,
         allow_dev_auth,
+        control_path: Arc::new(control_path.clone()),
+        // Team-access JIT provisioning: an allowlisted teammate (matched by
+        // verified email or wallet) is auto-granted membership on first login.
+        // Unset → JIT off (unknown subs 403 as before). See docs/TEAM_ACCESS.md.
+        team_allowlist_path: env_opt("MEM_TEAM_ALLOWLIST").map(Arc::new),
         layout_cache: Arc::new(Mutex::new(None)),
         ingest_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         byom_limits: Arc::new(mem_gateway::http::ByomLimits::default()),
@@ -295,7 +316,10 @@ mod seed_tests {
     /// (Err), never silently fall back to a constant key.
     #[test]
     fn unset_seed_refuses_to_start() {
-        assert!(resolve_asserter_seed(None).is_err(), "unset seed must refuse to start (MEM-B-006)");
+        assert!(
+            resolve_asserter_seed(None).is_err(),
+            "unset seed must refuse to start (MEM-B-006)"
+        );
     }
 
     /// A set seed is used verbatim (operator-provided key material).

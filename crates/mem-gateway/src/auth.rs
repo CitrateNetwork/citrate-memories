@@ -138,6 +138,25 @@ mod verify {
     #[derive(Debug, Deserialize)]
     struct Claims {
         sub: String,
+        #[serde(default)]
+        email: Option<String>,
+        #[serde(default)]
+        email_verified: Option<bool>,
+        #[serde(default)]
+        wallet_address: Option<String>,
+    }
+
+    /// The verified identity of a caller — richer than a bare `sub`. `email` and
+    /// `wallet_address` are surfaced so the gateway can JIT-provision an
+    /// allowlisted teammate on first login (a human's opaque `sub` is unknown
+    /// until then). `email` is only trustworthy for authorization when
+    /// `email_verified` is true.
+    #[derive(Debug, Clone)]
+    pub struct Principal {
+        pub sub: String,
+        pub email: Option<String>,
+        pub email_verified: bool,
+        pub wallet_address: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -210,6 +229,14 @@ mod verify {
 
         /// Verify a bearer token, returning the `sub` on success.
         pub fn verify(&self, token: &str) -> Result<String, AuthError> {
+            self.verify_principal(token).map(|p| p.sub)
+        }
+
+        /// Verify a bearer token, returning the full [`Principal`] (sub plus the
+        /// email/wallet claims used for JIT provisioning) on success. Same
+        /// verification as [`verify`] — RS256 pinned, issuer + audience + expiry
+        /// enforced; the extra claims are read only after the signature checks out.
+        pub fn verify_principal(&self, token: &str) -> Result<Principal, AuthError> {
             let header = decode_header(token).map_err(|e| AuthError::Token(e.to_string()))?;
             let validation = self.validation();
 
@@ -230,7 +257,15 @@ mod verify {
             let mut last = AuthError::NoMatchingKey;
             for key in candidates {
                 match decode::<Claims>(token, key, &validation) {
-                    Ok(data) => return Ok(data.claims.sub),
+                    Ok(data) => {
+                        let c = data.claims;
+                        return Ok(Principal {
+                            sub: c.sub,
+                            email: c.email,
+                            email_verified: c.email_verified.unwrap_or(false),
+                            wallet_address: c.wallet_address,
+                        });
+                    }
                     Err(e) => last = AuthError::Token(e.to_string()),
                 }
             }
@@ -334,7 +369,7 @@ mod verify {
 }
 
 #[cfg(feature = "server")]
-pub use verify::{AuthError, ConnectClaims, OidcVerifier};
+pub use verify::{AuthError, ConnectClaims, OidcVerifier, Principal};
 #[cfg(feature = "server")]
 pub use verify::{mint_connect_token, verify_connect_token};
 
