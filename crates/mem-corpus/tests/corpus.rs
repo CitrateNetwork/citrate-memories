@@ -474,6 +474,92 @@ fn verify_refuses_an_edge_leaving_its_bundle() {
         .contains("not allowed"));
 }
 
+/// Re-seal only the manifest after an edit to it (review hardening).
+fn reseal_manifest(corpus: &Path, edit: impl Fn(&mut Manifest)) {
+    let mp = corpus.join(MANIFEST_FILE);
+    let mut m = Manifest::from_json(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+    edit(&mut m);
+    m.bundle_digest = m.compute_digest().unwrap();
+    std::fs::write(&mp, m.to_json().unwrap()).unwrap();
+}
+
+#[test]
+fn verify_refuses_each_non_plain_node_shape() {
+    // Review hardening: every clause of the node shape rule is pinned on its own,
+    // with the manifest re-sealed so only the shape check can refuse it.
+    type Edit = fn(&mut MemoryNode);
+    let cases: [(&str, Edit); 5] = [
+        ("signed", |n| n.signature = Some(vec![1u8; 64])),
+        ("superseded", |n| n.status = mem_core::Status::Superseded),
+        ("non-corpus author", |n| n.author = "agent:someone".into()),
+        ("closed validity", |n| n.valid_to = Some(1)),
+        ("agent trust tier", |n| {
+            n.trust_tier = mem_core::TrustTier::AgentAsserted
+        }),
+    ];
+    for (label, edit) in cases {
+        let dir = written(&build_fixture());
+        let corpus = dir.path().join("corpus");
+        rewrite_bundle(&corpus, "citrate-docs", |b| edit(&mut b.nodes[0]));
+        let err = verify_corpus(&corpus).unwrap_err().to_string();
+        assert!(err.contains("not a plain corpus node"), "{label}: {err}");
+    }
+}
+
+#[test]
+fn verify_refuses_quarantined_or_signed_edges() {
+    type Edit = fn(&mut mem_core::Edge);
+    let cases: [(&str, Edit); 2] = [
+        ("quarantined", |e| e.quarantined = true),
+        ("signed", |e| e.signature = Some(vec![1u8; 64])),
+    ];
+    for (label, edit) in cases {
+        let dir = written(&build_fixture());
+        let corpus = dir.path().join("corpus");
+        rewrite_bundle(&corpus, "refs", |b| edit(&mut b.edges[0]));
+        let err = verify_corpus(&corpus).unwrap_err().to_string();
+        assert!(err.contains("not allowed"), "{label}: {err}");
+    }
+}
+
+#[test]
+fn verify_refuses_a_bundle_filed_under_another_tenant() {
+    let dir = written(&build_fixture());
+    let corpus = dir.path().join("corpus");
+    rewrite_bundle(&corpus, "refs", |b| b.repo = "skills".into());
+    let err = verify_corpus(&corpus).unwrap_err().to_string();
+    assert!(err.contains("is not tenant"), "{err}");
+}
+
+#[test]
+fn verify_refuses_a_tenant_file_outside_its_fixed_path() {
+    let dir = written(&build_fixture());
+    let corpus = dir.path().join("corpus");
+    std::fs::copy(
+        corpus.join("tenants/refs.syncbundle.json"),
+        corpus.join("tenants/other.json"),
+    )
+    .unwrap();
+    reseal_manifest(&corpus, |m| {
+        let e = m.tenants.iter_mut().find(|e| e.tenant == "refs").unwrap();
+        e.file = "tenants/other.json".into();
+    });
+    let err = verify_corpus(&corpus).unwrap_err().to_string();
+    assert!(err.contains("file must be"), "{err}");
+}
+
+#[test]
+fn verify_refuses_a_skills_lock_that_differs_from_the_manifest() {
+    let dir = written(&build_fixture());
+    let corpus = dir.path().join("corpus");
+    let p = corpus.join(mem_corpus::SKILLS_LOCK_FILE);
+    let mut lock = std::fs::read(&p).unwrap();
+    lock.extend_from_slice(b"# edited\n");
+    std::fs::write(&p, lock).unwrap();
+    let err = verify_corpus(&corpus).unwrap_err().to_string();
+    assert!(err.contains("skills.lock does not match"), "{err}");
+}
+
 // ---------------------------------------------------------------- import
 
 #[test]
