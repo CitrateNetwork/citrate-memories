@@ -14,6 +14,9 @@ mem-index = { path = "../mem-index" }
 mem-query = { path = "../mem-query" }
 mem-authz = { path = "../mem-authz" }
 mem-assert = { path = "../mem-assert" }
+# HUP-S3.1: the `mem-mcp import-corpus` subcommand (first-run knowledge import),
+# so the desktop app ships one memory binary instead of two.
+mem-corpus = { path = "../mem-corpus" }
 serde_json = { workspace = true }
 ed25519-dalek = "2"
 # The `mem-mcp` daemon binary: blake3 derives its domain-separated identity from

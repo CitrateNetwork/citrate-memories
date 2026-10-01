@@ -1,0 +1,7 @@
+= Access Control
+
+Ownable gives one account exclusive access to a function.
+
+== Role-based access
+
+AccessControl defines roles, and each role has an admin role.

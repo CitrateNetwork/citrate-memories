@@ -1,0 +1,203 @@
+# Hermes knowledge corpus (HUP-S3.1). Built at release time by
+# `scripts/build-corpus.sh` into per-tenant SyncBundles + manifest.json +
+# skills.lock + NOTICE.md, then shipped inside the citrate-core app bundle and
+# imported into the member's local memory graph on first run.
+#
+# Paths are relative to the sources base: the citrate-labs federation root,
+# where each source is a checkout. `commit = "git"` records the checkout's HEAD
+# (suffixed `-dirty` when the tree differs from HEAD). Skills sources take their
+# commit and file hashes from the HUP-S3.6 skills.lock in citrate-core.
+#
+# Licence state: `licence_cleared = false` sources are listed in the manifest
+# and never read. They stay off until the owner signs off (see the
+# "pending owner sign-off" notes below).
+
+version = 1
+name = "hermes-knowledge"
+max_chunk_chars = 1200
+
+# ---- citrate-docs tenant ---------------------------------------------------
+
+[[source]]
+id = "citrate-docs"
+tenant = "citrate-docs"
+kind = "docs"
+root = "citrate-docs/content"
+upstream = "https://github.com/CitrateNetwork/citrate-docs"
+license = "Apache-2.0 (citrate-docs LICENSE)"
+licence_cleared = true
+licence_note = "first party; public tier only"
+commit = "git"
+extensions = ["md", "mdx"]
+require_frontmatter = { tier = "public" }
+
+[[source]]
+id = "gradient-papers"
+tenant = "citrate-docs"
+kind = "docs"
+root = "gradient-papers/markdown"
+upstream = "Citrate Inc., The Gradient Papers v3"
+license = "Citrate Inc. (first party)"
+licence_cleared = true
+licence_note = "first party research series"
+commit = "git"
+extensions = ["md"]
+
+# ---- methodology tenant ----------------------------------------------------
+
+[[source]]
+id = "agentile"
+tenant = "methodology"
+kind = "docs"
+root = "."
+upstream = "https://github.com/CitrateNetwork (citrate-labs AGENTILE.md)"
+license = "Citrate Inc. (first party)"
+licence_cleared = true
+commit = "git"
+include = ["AGENTILE.md"]
+
+[[source]]
+id = "agentile-docs"
+tenant = "methodology"
+kind = "docs"
+root = "agentile-skills/docs"
+upstream = "https://github.com/CitrateNetwork/agentile-skills"
+license = "Apache-2.0"
+licence_cleared = true
+commit = "git"
+extensions = ["md"]
+
+# ---- skills tenant (only what skills.lock admits; files checked by sha256) --
+
+[[source]]
+id = "trailofbits"
+tenant = "skills"
+kind = "skills"
+root = ".claude/plugins/marketplaces/trailofbits"
+upstream = "https://github.com/trailofbits/skills"
+license = "CC-BY-SA-4.0"
+licence_cleared = true
+licence_note = "D-20 (owner, 2026-09-30): cleared for redistribution with attribution and a note of changes"
+attribution = "Trail of Bits skills (https://github.com/trailofbits/skills), licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/). Changed: executables stripped, text chunked."
+skills_lock = "citrate-core/skills.lock"
+lock_source = "trailofbits"
+
+[[source]]
+id = "frontend-skills"
+tenant = "skills"
+kind = "skills"
+root = "frontend-skills"
+upstream = "https://github.com/saulbuilds/frontend-skills"
+license = "MIT (README statement); impeccable and hyperframes Apache-2.0; frontend-design Apache-2.0"
+licence_cleared = true
+licence_note = "D-20 (owner, 2026-09-30) cleared redistribution; HUP-S3.6 flags the missing upstream LICENSE file"
+attribution = "frontend-skills (https://github.com/saulbuilds/frontend-skills); impeccable and hyperframes skills Apache-2.0 with their NOTICE files."
+skills_lock = "citrate-core/skills.lock"
+lock_source = "frontend-skills"
+
+[[source]]
+id = "agentile-skills"
+tenant = "skills"
+kind = "skills"
+root = "agentile-skills"
+upstream = "https://github.com/CitrateNetwork/agentile-skills"
+license = "Apache-2.0"
+licence_cleared = true
+skills_lock = "citrate-core/skills.lock"
+lock_source = "agentile-skills"
+
+[[source]]
+id = "hermes-skills"
+tenant = "skills"
+kind = "skills"
+root = "testing-hermes-design/skills"
+upstream = "https://github.com/NousResearch/hermes-agent (via CitrateNetwork/testing-hermes-design)"
+license = "MIT"
+licence_cleared = true
+skills_lock = "citrate-core/skills.lock"
+lock_source = "hermes-skills"
+
+[[source]]
+id = "hermes-optional"
+tenant = "skills"
+kind = "skills"
+root = "testing-hermes-design/optional-skills"
+upstream = "https://github.com/NousResearch/hermes-agent (via CitrateNetwork/testing-hermes-design)"
+license = "MIT"
+licence_cleared = true
+skills_lock = "citrate-core/skills.lock"
+lock_source = "hermes-optional"
+
+# ---- refs tenant -----------------------------------------------------------
+
+[[source]]
+id = "openzeppelin"
+tenant = "refs"
+kind = "docs"
+root = "citrate-chain/contracts/lib/openzeppelin-contracts/docs/modules/ROOT/pages"
+upstream = "https://github.com/OpenZeppelin/openzeppelin-contracts"
+license = "MIT"
+licence_cleared = true
+commit = "git"
+extensions = ["adoc"]
+
+[[source]]
+id = "solady"
+tenant = "refs"
+kind = "docs"
+root = "solady"
+upstream = "https://github.com/Vectorized/solady"
+license = "MIT"
+licence_cleared = true
+optional = true
+commit = "git"
+extensions = ["md", "sol"]
+exclude_dirs = ["test", "ext", "audits"]
+
+[[source]]
+id = "forge-std"
+tenant = "refs"
+kind = "docs"
+root = "citrate-chain/contracts/lib/forge-std"
+upstream = "https://github.com/foundry-rs/forge-std"
+license = "MIT OR Apache-2.0"
+licence_cleared = true
+commit = "git"
+extensions = ["md", "sol"]
+exclude_dirs = ["test", "scripts"]
+
+[[source]]
+id = "foundry-book"
+tenant = "refs"
+kind = "docs"
+root = "foundry-book/src"
+upstream = "https://github.com/foundry-rs/book"
+license = "MIT OR Apache-2.0"
+licence_cleared = true
+optional = true
+commit = "git"
+extensions = ["md"]
+
+[[source]]
+id = "medusa-docs"
+tenant = "refs"
+kind = "docs"
+root = "medusa/docs/src"
+upstream = "https://github.com/crytic/medusa"
+license = "AGPL-3.0"
+licence_cleared = false
+licence_note = "pending owner sign-off: AGPL-3.0 project; redistribution of its docs inside the app is not cleared"
+optional = true
+extensions = ["md"]
+
+[[source]]
+id = "slither-docs"
+tenant = "refs"
+kind = "docs"
+root = "slither/docs/src"
+upstream = "https://github.com/crytic/slither"
+license = "AGPL-3.0"
+licence_cleared = false
+licence_note = "pending owner sign-off: AGPL-3.0 project; redistribution of its docs inside the app is not cleared"
+optional = true
+extensions = ["md"]

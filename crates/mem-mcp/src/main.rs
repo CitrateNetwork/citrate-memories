@@ -30,6 +30,16 @@
 //! env: CITRATE_MEM_STORE_KEY = <hex>   (optional; see "Identity" below)
 //! ```
 //!
+//! ```text
+//! mem-mcp import-corpus <store-path> <corpus-dir>      (HUP-S3.1, first run)
+//! ```
+//!
+//! The one subcommand. It opens the store (so it fails, honestly, while a daemon
+//! holds the lock), verifies the release corpus against its manifest, embeds
+//! each node with the same embedder the daemon would use for this store, merges
+//! it, and prints the `mem_corpus::progress` JSON-lines contract on stdout. Exit
+//! 0 on success, 1 on any failure (the last stdout line says why).
+//!
 //! Positional args only: `MemoryManager::build_spec` passes no lock/socket flags
 //! because the daemon owns both its singleton lock and its stale-socket cleanup.
 //! The key travels in the environment, never argv, so it cannot leak via `ps`.
@@ -250,7 +260,44 @@ fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// HUP-S3.1 — `mem-mcp import-corpus <store-path> <corpus-dir>`. Returns the exit code.
+fn import_corpus_main(args: &[String]) -> i32 {
+    let (Some(db), Some(dir)) = (args.first(), args.get(1)) else {
+        eprintln!("usage: mem-mcp import-corpus <store-path> <corpus-dir>");
+        return 2;
+    };
+    let mut stdout = std::io::stdout();
+    let store = match MemoryDagStore::<MemoryNode>::open_rocksdb_auto(db) {
+        Ok(s) => s,
+        Err(e) => {
+            let line = serde_json::json!({
+                "event": "error",
+                "stage": "open",
+                "message": format!("cannot open {db} (is the memory daemon running?): {e}"),
+            });
+            println!("{line}");
+            return 1;
+        }
+    };
+    // Same embedder choice as the daemon's write path (`embed_for_write`): the
+    // store's own model (or BGE on a fresh store when CITRATE_MEM_EMBED=bge),
+    // else the hashing baseline, so imported nodes are searchable in this store.
+    let embedder: Arc<dyn Embedder> = match load_query_embedder(&store) {
+        Some(e) => e,
+        None => Arc::new(mem_index::HashingEmbedder::new(mem_query::EMBED_DIM)),
+    };
+    let dir = std::path::Path::new(dir);
+    match mem_corpus::progress::import_dir_with_progress(&store, dir, embedder.as_ref(), &mut stdout) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("import-corpus") {
+        std::process::exit(import_corpus_main(&argv[2..]));
+    }
     let db = std::env::args().nth(1).unwrap_or_else(|| "./data/federation.memdag".to_string());
     let sock = std::env::args().nth(2).unwrap_or_else(|| "./data/memdag.sock".to_string());
 
