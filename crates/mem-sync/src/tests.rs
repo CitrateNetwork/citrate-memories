@@ -997,3 +997,40 @@ fn tripwire_no_binary_enables_the_sync_http_feature() {
     }
     assert!(checked >= 9, "scanned {checked} crate manifests");
 }
+
+/// Rule 8 tripwire: no `.unwrap()` / `.expect(` in mem-sync's production source.
+/// The test module is a separate file (`tests.rs`), so `lib.rs` up to its
+/// terminal `#[cfg(test)]` declaration is entirely production code.
+#[test]
+fn tripwire_rule8_no_unwrap_or_expect_in_production_lib() {
+    let lib = include_str!("lib.rs");
+    let cut = lib.rfind("#[cfg(test)]").unwrap_or(lib.len());
+    let prod = &lib[..cut];
+    // The cut must sit at the module tail, so nothing production-side is skipped.
+    assert!(
+        !prod.contains("#[cfg(test)]"),
+        "lib.rs has more than one cfg(test) block; widen this tripwire"
+    );
+    let unwrap = [".unwrap", "()"].concat();
+    let expect = [".expect", "("].concat();
+    let hits: Vec<(usize, &str)> = prod
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//"))
+        .filter(|(_, l)| l.contains(&unwrap) || l.contains(&expect))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "Rule 8: unwrap/expect in production lib.rs: {hits:?}"
+    );
+}
+
+#[test]
+fn trusted_local_grant_still_verifies_as_its_own_root() {
+    let g = trusted_local_grant().expect("OS randomness is available in tests");
+    assert_eq!(g.issuer_pubkey.len(), 32);
+    // Two calls draw two distinct ephemeral keys (MEM-B-018).
+    let h = trusted_local_grant().expect("OS randomness is available in tests");
+    assert_ne!(g.issuer_pubkey, h.issuer_pubkey);
+}
