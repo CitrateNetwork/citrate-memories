@@ -287,10 +287,38 @@ fn import_corpus_main(args: &[String]) -> i32 {
         None => Arc::new(mem_index::HashingEmbedder::new(mem_query::EMBED_DIM)),
     };
     let dir = std::path::Path::new(dir);
-    match mem_corpus::progress::import_dir_with_progress(&store, dir, embedder.as_ref(), &mut stdout) {
+    // Precomputed corpus vectors are reused only for the exact weights that made
+    // them: hash the pinned model file the embedder just loaded.
+    let weights = bge_weights_sha256(embedder.as_ref());
+    match mem_corpus::progress::import_dir_with_progress_reusing(
+        &store,
+        dir,
+        embedder.as_ref(),
+        weights.as_deref(),
+        &mut stdout,
+    ) {
         Ok(_) => 0,
         Err(_) => 1,
     }
+}
+
+/// sha256 of `$CITRATE_BGE_MODEL_DIR/model.safetensors` when the import embeds
+/// with BGE from that pinned directory (the app's bundled model); `None` for any
+/// other embedder or source, which makes the importer embed every node itself.
+#[cfg(feature = "transformer")]
+fn bge_weights_sha256(embedder: &dyn Embedder) -> Option<String> {
+    if embedder.model_id() != mem_index::transformer::DEFAULT_MODEL_ID {
+        return None;
+    }
+    let dir = std::env::var("CITRATE_BGE_MODEL_DIR").ok().filter(|d| !d.is_empty())?;
+    let bytes = std::fs::read(std::path::Path::new(&dir).join("model.safetensors")).ok()?;
+    Some(mem_corpus::sha256_hex(&bytes))
+}
+
+/// Without the transformer feature the importer never embeds with BGE.
+#[cfg(not(feature = "transformer"))]
+fn bge_weights_sha256(_embedder: &dyn Embedder) -> Option<String> {
+    None
 }
 
 fn main() {
