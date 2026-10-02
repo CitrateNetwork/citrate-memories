@@ -22,20 +22,33 @@
 //! bytes. Embeddings are added at import time and are not part of identity.
 
 pub mod build;
+pub mod bundle;
 pub mod chunk;
+pub mod cite;
 pub mod import;
 pub mod lock;
 pub mod manifest;
 pub mod progress;
 pub mod spec;
+pub mod vectors;
 pub mod walk;
 
 /// The tenants a knowledge corpus may write. Runtime tenants (`personal`,
 /// `chain-state`, `federation`, …) are never writable by a corpus bundle.
-pub const KNOWLEDGE_TENANTS: &[&str] = &["citrate-docs", "skills", "refs", "methodology"];
+/// Also the build (and so the import) order: Citrate knowledge lands first, the
+/// large reviewed-skills tenant last.
+pub const KNOWLEDGE_TENANTS: &[&str] = &["citrate-docs", "methodology", "refs", "skills"];
 
-/// Manifest format tag.
-pub const FORMAT: &str = "citrate-corpus/1";
+/// Manifest format tag. Format 2 (HUP-S3.1 follow-up): compact tenant files
+/// ([`bundle`]), tenant files named `tenants/<tenant>.corpus.json`, and every
+/// source carries the repository it cites as (`repo`, `repo_path`), so a node's
+/// `source_ref` is a repository-relative citation.
+pub const FORMAT: &str = "citrate-corpus/2";
+
+/// Tenant file path inside a corpus directory.
+pub fn tenant_file(tenant: &str) -> String {
+    format!("{TENANTS_DIR}/{tenant}.corpus.json")
+}
 
 /// Manifest file name inside a corpus directory.
 pub const MANIFEST_FILE: &str = "manifest.json";

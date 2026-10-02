@@ -9,6 +9,7 @@ id = "citrate-docs"
 tenant = "citrate-docs"
 kind = "docs"
 root = "docs/content"
+repo_path = "content"
 upstream = "https://github.com/CitrateNetwork/citrate-docs"
 license = "Apache-2.0"
 licence_cleared = true

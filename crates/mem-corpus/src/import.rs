@@ -23,10 +23,7 @@ use mem_store::MemoryDagStore;
 use mem_sync::SyncBundle;
 
 use crate::manifest::{Manifest, TenantEntry};
-use crate::{
-    sha256_hex, CorpusError, FORMAT, KNOWLEDGE_TENANTS, MANIFEST_FILE, SKILLS_LOCK_FILE,
-    TENANTS_DIR,
-};
+use crate::{sha256_hex, CorpusError, FORMAT, KNOWLEDGE_TENANTS, MANIFEST_FILE, SKILLS_LOCK_FILE};
 
 /// Largest manifest the importer will read.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
@@ -45,6 +42,8 @@ pub fn tenant_meta_key(tenant: &str) -> Vec<u8> {
 pub struct VerifiedCorpus {
     pub manifest: Manifest,
     pub tenants: Vec<(TenantEntry, SyncBundle)>,
+    /// Verified precomputed vectors (raw f16 file bytes) by tenant.
+    pub vectors: BTreeMap<String, Vec<u8>>,
 }
 
 fn verr(msg: impl Into<String>) -> CorpusError {
@@ -101,6 +100,7 @@ pub fn verify_corpus(dir: &Path) -> Result<VerifiedCorpus, CorpusError> {
 
     let mut seen = BTreeSet::new();
     let mut tenants = Vec::with_capacity(manifest.tenants.len());
+    let mut vectors = BTreeMap::new();
     for t in &manifest.tenants {
         if !KNOWLEDGE_TENANTS.contains(&t.tenant.as_str()) {
             return Err(verr(format!(
@@ -111,7 +111,7 @@ pub fn verify_corpus(dir: &Path) -> Result<VerifiedCorpus, CorpusError> {
         if !seen.insert(t.tenant.clone()) {
             return Err(verr(format!("tenant {:?} listed twice", t.tenant)));
         }
-        let expected_file = format!("{TENANTS_DIR}/{}.syncbundle.json", t.tenant);
+        let expected_file = crate::tenant_file(&t.tenant);
         if t.file != expected_file {
             return Err(verr(format!(
                 "tenant {:?} file must be {expected_file}",
@@ -125,11 +125,64 @@ pub fn verify_corpus(dir: &Path) -> Result<VerifiedCorpus, CorpusError> {
         let text =
             std::str::from_utf8(&bytes).map_err(|_| verr(format!("{} is not UTF-8", t.file)))?;
         let bundle =
-            SyncBundle::from_json(text.trim_end()).map_err(|e| verr(format!("{}: {e}", t.file)))?;
+            crate::bundle::decode(text.trim_end()).map_err(|e| verr(format!("{}: {e}", t.file)))?;
         check_bundle(t, &bundle)?;
+        if let Some(v) = &t.vectors {
+            vectors.insert(t.tenant.clone(), read_vectors(dir, t, v)?);
+        }
         tenants.push((t.clone(), bundle));
     }
-    Ok(VerifiedCorpus { manifest, tenants })
+    Ok(VerifiedCorpus {
+        manifest,
+        tenants,
+        vectors,
+    })
+}
+
+/// Read and check a tenant's precomputed vectors file against its manifest entry.
+fn read_vectors(
+    dir: &Path,
+    t: &TenantEntry,
+    v: &crate::vectors::VectorsEntry,
+) -> Result<Vec<u8>, CorpusError> {
+    let expected_file = crate::vectors::vectors_file(&t.tenant);
+    if v.file != expected_file {
+        return Err(verr(format!(
+            "tenant {:?} vectors file must be {expected_file}",
+            t.tenant
+        )));
+    }
+    if v.encoding != crate::vectors::ENCODING_F16LE {
+        return Err(verr(format!(
+            "tenant {:?} vectors encoding {:?} is not supported",
+            t.tenant, v.encoding
+        )));
+    }
+    if v.dim == 0 || v.dim > crate::vectors::MAX_DIM {
+        return Err(verr(format!(
+            "tenant {:?} vectors dimension {} is not supported",
+            t.tenant, v.dim
+        )));
+    }
+    let bytes = read_capped(&dir.join(&v.file), MAX_BUNDLE_BYTES)?;
+    if sha256_hex(&bytes) != v.sha256 {
+        return Err(verr(format!("{} does not match its manifest hash", v.file)));
+    }
+    let want = t
+        .nodes
+        .checked_mul(v.dim)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| verr("vectors size overflows"))?;
+    if bytes.len() != want {
+        return Err(verr(format!(
+            "{} holds {} bytes, expected {want} ({} nodes x {} dims x 2)",
+            v.file,
+            bytes.len(),
+            t.nodes,
+            v.dim
+        )));
+    }
+    Ok(bytes)
 }
 
 /// The shape rules a corpus bundle must obey (see the module docs).
@@ -216,6 +269,10 @@ pub struct ImportReport {
     pub nodes_added: usize,
     pub nodes_merged: usize,
     pub edges_added: usize,
+    /// Nodes embedded on this machine.
+    pub nodes_embedded: usize,
+    /// Nodes that took the corpus's precomputed vector instead.
+    pub vectors_reused: usize,
 }
 
 /// Embed and merge a verified corpus into `store`.
@@ -228,6 +285,31 @@ pub fn import_corpus(
     store: &MemoryDagStore<MemoryNode>,
     corpus: &VerifiedCorpus,
     embedder: &dyn Embedder,
+    on_event: impl FnMut(ImportEvent),
+) -> Result<ImportReport, CorpusError> {
+    import_corpus_with(store, corpus, embedder, None, on_event)
+}
+
+/// Whether a tenant's precomputed vectors were made by this embedder: same model
+/// id, same dimension, and the caller-proven weights hash.
+fn vectors_match(
+    v: &crate::vectors::VectorsEntry,
+    embedder: &dyn Embedder,
+    weights_sha256: Option<&str>,
+) -> bool {
+    v.model == embedder.model_id()
+        && v.dim == embedder.dim()
+        && weights_sha256.is_some_and(|w| w.eq_ignore_ascii_case(&v.weights_sha256))
+}
+
+/// [`import_corpus`], reusing a tenant's precomputed vectors when they were made
+/// by this embedder ([`crate::vectors`]). `weights_sha256` is the sha256 of the
+/// embedder's weights file as the caller measured it; `None` never reuses.
+pub fn import_corpus_with(
+    store: &MemoryDagStore<MemoryNode>,
+    corpus: &VerifiedCorpus,
+    embedder: &dyn Embedder,
+    weights_sha256: Option<&str>,
     mut on_event: impl FnMut(ImportEvent),
 ) -> Result<ImportReport, CorpusError> {
     let store_err = |e: mem_store::StoreError| CorpusError::Store(e.to_string());
@@ -254,17 +336,37 @@ pub fn import_corpus(
             edges: bundle.edges.len(),
         });
         let total = bundle.nodes.len();
+        let reuse = entry
+            .vectors
+            .as_ref()
+            .filter(|v| vectors_match(v, embedder, weights_sha256))
+            .and_then(|v| corpus.vectors.get(&entry.tenant).map(|b| (v, b)));
         let mut done = 0usize;
         for batch in bundle.nodes.chunks(IMPORT_BATCH) {
             let mut nodes = Vec::with_capacity(batch.len());
-            for n in batch {
+            for (j, n) in batch.iter().enumerate() {
                 let mut n = n.clone();
-                let text = String::from_utf8_lossy(&n.content).into_owned();
-                n.embedding = Some(
-                    embedder
-                        .embed(&text)
-                        .map_err(|e| CorpusError::Embed(e.to_string()))?,
-                );
+                n.embedding = Some(match reuse {
+                    Some((v, bytes)) => {
+                        report.vectors_reused += 1;
+                        crate::vectors::vector_at(bytes, v.dim, done + j, &v.model).ok_or_else(
+                            || {
+                                CorpusError::Verify(format!(
+                                    "{}: vector {} is unreadable",
+                                    v.file,
+                                    done + j
+                                ))
+                            },
+                        )?
+                    }
+                    None => {
+                        report.nodes_embedded += 1;
+                        let text = String::from_utf8_lossy(&n.content).into_owned();
+                        embedder
+                            .embed(&text)
+                            .map_err(|e| CorpusError::Embed(e.to_string()))?
+                    }
+                });
                 nodes.push(n);
             }
             let part = SyncBundle {
