@@ -1,0 +1,85 @@
+# Fixture corpus spec for the mem-corpus tests. Paths are relative to
+# tests/fixtures/sources.
+version = 1
+name = "fixture-knowledge"
+max_chunk_chars = 400
+
+[[source]]
+id = "citrate-docs"
+tenant = "citrate-docs"
+kind = "docs"
+root = "docs/content"
+upstream = "https://github.com/CitrateNetwork/citrate-docs"
+license = "Apache-2.0"
+licence_cleared = true
+commit = "2222222222222222222222222222222222222222"
+extensions = ["md"]
+exclude_dirs = ["_generated"]
+require_frontmatter = { tier = "public" }
+
+[[source]]
+id = "gradient-papers"
+tenant = "citrate-docs"
+kind = "docs"
+root = "papers"
+upstream = "Citrate Inc. (first party)"
+license = "Citrate Inc. (first party)"
+licence_cleared = true
+commit = "3333333333333333333333333333333333333333"
+extensions = ["md"]
+
+[[source]]
+id = "agentile"
+tenant = "methodology"
+kind = "docs"
+root = "agentile"
+upstream = "Citrate Inc. (first party)"
+license = "Apache-2.0"
+licence_cleared = true
+commit = "4444444444444444444444444444444444444444"
+include = ["AGENTILE.md"]
+
+[[source]]
+id = "demo-skills"
+tenant = "skills"
+kind = "skills"
+root = "skills"
+upstream = "https://example.invalid/demo-skills"
+license = "Apache-2.0"
+licence_cleared = true
+attribution = "Demo skills, fixture authors"
+skills_lock = "skills.lock"
+lock_source = "demo"
+
+[[source]]
+id = "openzeppelin"
+tenant = "refs"
+kind = "docs"
+root = "refs/oz"
+upstream = "https://github.com/OpenZeppelin/openzeppelin-contracts"
+license = "MIT"
+licence_cleared = true
+commit = "5555555555555555555555555555555555555555"
+extensions = ["adoc"]
+
+[[source]]
+id = "agpl-tool-docs"
+tenant = "refs"
+kind = "docs"
+root = "refs/agpl-tool"
+upstream = "https://example.invalid/agpl-tool"
+license = "AGPL-3.0"
+licence_cleared = false
+licence_note = "fixture: pending owner sign-off"
+extensions = ["md"]
+
+[[source]]
+id = "absent-book"
+tenant = "refs"
+kind = "docs"
+root = "refs/absent-book"
+upstream = "https://example.invalid/book"
+license = "MIT OR Apache-2.0"
+licence_cleared = true
+optional = true
+extensions = ["md"]

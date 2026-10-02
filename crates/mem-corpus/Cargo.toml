@@ -1,0 +1,38 @@
+[package]
+name = "mem-corpus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "citrate-memories release-time knowledge corpus: deterministic build of per-tenant SyncBundles + manifest, and a verified, idempotent first-run import."
+
+[dependencies]
+mem-core = { path = "../mem-core" }
+mem-store = { path = "../mem-store" }
+mem-index = { path = "../mem-index" }
+mem-sync = { path = "../mem-sync" }
+# Reuse the Rule-12 frontmatter parser (and its ISO-8601 `created:` reader) so a
+# corpus doc and a federation doc agree on what a doc's tier and date are.
+mem-ingest = { path = "../mem-ingest" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+# sha256 (not blake3) for every published file hash: the HUP-S3.6 `skills.lock`
+# pins SKILL.md and ref files by sha256, and the build must check against it.
+sha2 = "0.10"
+# The corpus spec and the `skills.lock` it consumes are TOML.
+toml = "0.8"
+
+[features]
+default = []
+# The `mem-corpus import` subcommand opens a durable RocksDB store.
+rocksdb = ["mem-store/rocksdb"]
+
+[[bin]]
+name = "mem-corpus"
+path = "src/bin/mem-corpus.rs"
+
+[dev-dependencies]
+tempfile = "3"

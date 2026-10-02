@@ -1,0 +1,35 @@
+# fixture skills.lock (same format as citrate-core skills.lock, HUP-S3.6)
+
+version = 1
+
+[[source]]
+label = "demo"
+upstream = "https://example.invalid/demo-skills"
+commit = "1111111111111111111111111111111111111111"
+license = "Apache-2.0"
+local = "skills"
+pin_method = "git-checkout"
+
+[[skill]]
+name = "demo-skill"
+source = "demo"
+commit = "1111111111111111111111111111111111111111"
+path = "plugins/demo/skills/demo-skill"
+verdict = "include-with-scripts-stripped"
+reason = "ships without its scripts"
+skill_md_sha256 = "d6420ceb0e61e32654de6496c67458be834639228dddb1f56580f3e629f4db83"
+refs = [
+  { path = "references/guide.md", sha256 = "63510c8ebe163899d1b23c74b2381fa4ed3b0ab2e35344fe8cfa1af7aaf4f727" },
+]
+stripped = ["scripts/run.sh"]
+
+[[skill]]
+name = "held-skill"
+source = "demo"
+commit = "1111111111111111111111111111111111111111"
+path = "plugins/demo/skills/held-skill"
+verdict = "exclude"
+reason = "fixture: excluded on review"
+skill_md_sha256 = "c9cfa4915f025d73fb388f96e91d23b29816e460a0adc6b5a5c7b6a82533ce83"
+refs = []
+stripped = []
