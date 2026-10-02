@@ -1,7 +1,7 @@
 ---
 created: 2026-10-01
 updated: 2026-10-01
-branch: hup/n5-corpus-rest
+branch: hup/m2-knowledge
 author: Larry Klosowski + Claude Opus 5.5
 status: implemented (format 2: build + verify + import + precomputed vectors); release upload pending
 wp: HUP-S3.1
@@ -99,7 +99,10 @@ fixture output byte for byte.
 - **Public tier only.** `citrate-docs` files ship only with `tier: public`
   frontmatter. Everything else is listed under `skipped` with the reason.
 - **Licences.** A source with `licence_cleared = false` is listed in the manifest
-  and NOTICE and never read.
+  and NOTICE and never read. Every source in the spec is cleared today. The Medusa and
+  Slither docs are AGPL-3.0; the owner decided on 2026-10-01 to ship them. They are
+  redistributed with attribution, the upstream link and the pinned commit in
+  `manifest.json` and `NOTICE.md`, and the only change is chunking for search.
 - **Skills come from the lock.** A skills source ships only what citrate-core's
   `skills.lock` admits (`include-as-is`, `include-with-scripts-stripped`,
   `convert-script-to-capsule`), and only `SKILL.md` plus the refs the lock pins.
@@ -171,8 +174,9 @@ import time would take about 15.5 minutes at the uncontended 1.85 nodes per seco
 
 ## Open items
 
-- Medusa and Slither are AGPL-3.0 projects. Shipping their docs inside the app is
-  not cleared; the spec keeps them off (pending owner sign-off).
+- Medusa and Slither docs (AGPL-3.0): included by owner decision (2026-10-01), fetched at
+  pinned commits by `fetch-corpus-refs.sh` (Medusa `87f65e2e`, Slither `eef5df94`). The
+  licence review of the bundled AGPL/GPL tools themselves (gate g3-licence) is separate.
 - Solady and the Foundry book: fetched at pinned commits by `fetch-corpus-refs.sh`; whether
   they ship (and whether Solady ships its `.sol` sources or only its docs) is a size call for
   the owner.

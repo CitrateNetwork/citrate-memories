@@ -12,12 +12,12 @@
 # `repo_path` is where `root` sits inside it, so every node's source_ref reads
 # `<repo>:<repo-relative path>` (the shape the Citrate QA eval checks).
 #
-# Optional reference checkouts (Solady, the Foundry book) are fetched at pinned
-# commits by `scripts/fetch-corpus-refs.sh <sources-base>`.
+# Optional reference checkouts (Solady, the Foundry book, Medusa, Slither) are
+# fetched at pinned commits by `scripts/fetch-corpus-refs.sh <sources-base>`.
 #
 # Licence state: `licence_cleared = false` sources are listed in the manifest
-# and never read. They stay off until the owner signs off (see the
-# "pending owner sign-off" notes below).
+# and never read. Every source below is cleared; Medusa and Slither docs
+# (AGPL-3.0) by owner decision on 2026-10-01.
 
 version = 1
 name = "hermes-knowledge"
@@ -214,9 +214,11 @@ repo = "medusa"
 repo_path = "docs/src"
 upstream = "https://github.com/crytic/medusa"
 license = "AGPL-3.0"
-licence_cleared = false
-licence_note = "pending owner sign-off: AGPL-3.0 project; redistribution of its docs inside the app is not cleared"
+licence_cleared = true
+licence_note = "owner decision 2026-10-01 (Larry Klosowski): include the AGPL-3.0 docs, redistributed unmodified in content with attribution and a link to the source"
+attribution = "Medusa documentation (https://github.com/crytic/medusa, docs/src), Trail of Bits, licensed AGPL-3.0 (https://www.gnu.org/licenses/agpl-3.0.html). Source: https://github.com/crytic/medusa at the commit in manifest.json. Changed: text chunked for search."
 optional = true
+commit = "git"
 extensions = ["md"]
 
 [[source]]
@@ -228,7 +230,9 @@ repo = "slither"
 repo_path = "docs/src"
 upstream = "https://github.com/crytic/slither"
 license = "AGPL-3.0"
-licence_cleared = false
-licence_note = "pending owner sign-off: AGPL-3.0 project; redistribution of its docs inside the app is not cleared"
+licence_cleared = true
+licence_note = "owner decision 2026-10-01 (Larry Klosowski): include the AGPL-3.0 docs, redistributed unmodified in content with attribution and a link to the source"
+attribution = "Slither documentation (https://github.com/crytic/slither, docs/src), Trail of Bits, licensed AGPL-3.0 (https://www.gnu.org/licenses/agpl-3.0.html). Source: https://github.com/crytic/slither at the commit in manifest.json. Changed: text chunked for search."
 optional = true
+commit = "git"
 extensions = ["md"]

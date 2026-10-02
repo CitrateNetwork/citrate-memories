@@ -8,7 +8,7 @@
 # Clones into <sources-base>/<name>. An existing checkout is accepted only when
 # its HEAD is the pinned commit and its tree is clean; anything else is an error
 # (the script never moves or deletes an existing checkout). Medusa and Slither
-# docs are not fetched: their licence is not cleared (pending owner sign-off).
+# are AGPL-3.0; their docs ship by owner decision (2026-10-01) with attribution.
 # Changing a pin is a reviewed change to this file.
 set -euo pipefail
 
@@ -19,6 +19,8 @@ base="${1:?usage: fetch-corpus-refs.sh <sources-base>}"
 REFS=(
   "solady|https://github.com/Vectorized/solady|2afba69bf67b78dd4abeadcc696052b3a6f71499|MIT"
   "foundry-book|https://github.com/foundry-rs/book|fa7c378defe66191744aa0394146a0bc763ada24|MIT OR Apache-2.0"
+  "medusa|https://github.com/crytic/medusa|87f65e2e9c2b67a95c779742cff5a33e65318600|AGPL-3.0"
+  "slither|https://github.com/crytic/slither|eef5df948b8992eff85786b6b0bb4a193933e2c9|AGPL-3.0"
 )
 
 for entry in "${REFS[@]}"; do
