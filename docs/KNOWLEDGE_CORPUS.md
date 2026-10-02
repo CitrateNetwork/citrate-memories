@@ -160,6 +160,15 @@ refs tenant grows from 1,117 to 11,466 nodes (Solady 178 files and 4,275 chunks,
 Precomputed vectors add 1,536 bytes per node: 16.3 MB for the corpus above, 32.2 MB with
 the two references.
 
+### Vectors, measured
+
+The `citrate-docs` and `methodology` tenants (1,725 nodes) were built with
+`--embed-bge` and the app's bundled BGE files (weights sha256 `c7c1988a…67d7`): 1,335 s on
+the M2 Max while other builds kept the load average between 60 and 98, writing 2,649,600
+bytes of vectors. A real `mem-mcp import-corpus` into a fresh store then took 8.4 s:
+`nodes_embedded` 0, `vectors_reused` 1,725, edges 1,611. Embedding the same 1,725 nodes at
+import time would take about 15.5 minutes at the uncontended 1.85 nodes per second.
+
 ## Open items
 
 - Medusa and Slither are AGPL-3.0 projects. Shipping their docs inside the app is
