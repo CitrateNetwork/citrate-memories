@@ -172,14 +172,41 @@ bytes of vectors. A real `mem-mcp import-corpus` into a fresh store then took 8.
 `nodes_embedded` 0, `vectors_reused` 1,725, edges 1,611. Embedding the same 1,725 nodes at
 import time would take about 15.5 minutes at the uncontended 1.85 nodes per second.
 
+## Full build of 2026-10-02 (M2: every reference, 240-skill lock, vectors)
+
+Inputs: the citrate-labs root with `fetch-corpus-refs.sh` checkouts (Solady `2afba69b`,
+Foundry book `fa7c378d`, Medusa `87f65e2e`, Slither `eef5df94`), the citrate-core
+`skills.lock` of `hup/m2-knowledge` (HUP-S3.2: 240 skills ship, 129 of them hermes-fork
+skills admitted after the intake rewrite), `--source-date-ms 1790912777000` (the merge commit HEAD
+time) and `--embed-bge` with the app's bundled BGE files (weights `c7c1988a...67d7`).
+
+| tenant | nodes | edges | corpus file bytes | vectors bytes |
+|---|---:|---:|---:|---:|
+| citrate-docs | 1,688 | 1,577 | 2,656,669 | 2,592,768 |
+| methodology | 37 | 34 | 60,706 | 56,832 |
+| refs | 12,730 | 11,684 | 18,526,451 | 19,553,280 |
+| skills | 18,247 | 18,007 | 27,468,010 | 28,027,392 |
+
+Total 99,669,598 bytes with `manifest.json` (504,529), `skills.lock` (217,967) and
+`NOTICE.md` (4,994); 58,498,298 bytes as `knowledge-corpus.tar.gz`; bundle digest
+`970966831d9cd851c36a1564bf9494c8957405f1870024cf6cb7a7e2f6426638`. Embedding took 10,010 s
+(niced, beside an LLM eval run; 2.7 nodes per second uncontended on the 1,725-node subset).
+`verify` passes. A real `mem-mcp import-corpus` into a fresh store took 224 s with
+`vectors_reused` 32,702 and `nodes_embedded` 0; a second import was a no-op in 4.9 s.
+
+The skills tenant more than doubled (7,788 to 18,247 nodes) because the hermes-fork skills
+now ship, and Medusa and Slither add 1,264 refs nodes. The corpus is the largest single
+resource after the models: whether the skills tenant should also carry every shipped skill's
+text (the skills now load through the SKILL.md loader as well) is a size call for the owner.
+
 ## Open items
 
 - Medusa and Slither docs (AGPL-3.0): included by owner decision (2026-10-01), fetched at
   pinned commits by `fetch-corpus-refs.sh` (Medusa `87f65e2e`, Slither `eef5df94`). The
   licence review of the bundled AGPL/GPL tools themselves (gate g3-licence) is separate.
-- Solady and the Foundry book: fetched at pinned commits by `fetch-corpus-refs.sh`; whether
-  they ship (and whether Solady ships its `.sol` sources or only its docs) is a size call for
-  the owner.
+- Size: the full corpus is 99.7 MB on disk with vectors. Solady (including its `.sol`
+  sources), the Foundry book and the 18,247-node skills tenant are the large parts; trimming
+  any of them is a size call for the owner (citrate-core gate g5-size).
 - The release upload: the corpus asset and a `mem-mcp` built with `import-corpus` go to the
   citrate-core `runtime-deps` prerelease together (citrate-core `docs/RELEASE.md` section 3).
 - A newer corpus adds nodes; it does not retire nodes from an older corpus.

@@ -16,9 +16,10 @@
 # EMBED_BGE_DIR=<dir holding config.json, tokenizer.json, model.safetensors>
 # also embeds every node with that BGE model (the same pinned files the app
 # bundles) and ships tenants/<tenant>.vectors.f16, so a member's first-run import
-# reuses the vectors instead of embedding about 10k nodes on their CPU. This
-# needs the transformer build and takes about as long as one CPU import (about
-# 1.8 nodes per second on an Apple M2 Max).
+# reuses the vectors instead of embedding the corpus on their CPU. This needs
+# the transformer build and takes about as long as one CPU import (2.7 to 3.7
+# nodes per second on an Apple M2 Max: about three hours for the full
+# 32,702-node corpus of 2026-10-02).
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
