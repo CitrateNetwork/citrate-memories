@@ -24,11 +24,15 @@ hex = { workspace = true }
 sha2 = "0.10"
 # The corpus spec and the `skills.lock` it consumes are TOML.
 toml = "0.8"
+# Precomputed corpus vectors ship as IEEE half floats (vectors.rs).
+half = "2"
 
 [features]
 default = []
 # The `mem-corpus import` subcommand opens a durable RocksDB store.
 rocksdb = ["mem-store/rocksdb"]
+# `mem-corpus build --embed-bge <model-dir>`: precompute BGE vectors at release time.
+transformer = ["mem-index/transformer"]
 
 [[bin]]
 name = "mem-corpus"
