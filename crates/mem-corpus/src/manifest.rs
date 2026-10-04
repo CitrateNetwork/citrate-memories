@@ -31,6 +31,11 @@ pub struct SkippedEntry {
 pub struct SourceEntry {
     pub id: String,
     pub tenant: String,
+    /// The repository the source's nodes cite (format 2).
+    pub repo: String,
+    /// Where the source root sits inside `repo`; node paths are
+    /// `repo_path/<file path>` (file paths below stay root-relative).
+    pub repo_path: String,
     pub upstream: String,
     pub commit: String,
     pub license: String,
@@ -58,6 +63,10 @@ pub struct TenantEntry {
     pub sha256: String,
     pub nodes: usize,
     pub edges: usize,
+    /// Precomputed node vectors (see [`crate::vectors`]), when the release
+    /// build embedded the corpus.
+    #[serde(default)]
+    pub vectors: Option<crate::vectors::VectorsEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

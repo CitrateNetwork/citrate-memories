@@ -72,11 +72,15 @@ fn embedder() -> HashingEmbedder {
     HashingEmbedder::new(mem_ingest::EMBED_DIM)
 }
 
-/// All node content of a tenant file, decoded (the SyncBundle wire format
-/// carries node content as a byte array, so a raw substring search would miss it).
+/// Decode a format-2 tenant file.
+fn decode(bytes: &[u8]) -> mem_sync::SyncBundle {
+    mem_corpus::bundle::decode(std::str::from_utf8(bytes).unwrap().trim_end()).unwrap()
+}
+
+/// All node content of a tenant file, decoded (a byte-array node in the file
+/// would hide its text from a raw substring search).
 fn decoded_text(t: &mem_corpus::build::TenantFile) -> String {
-    let b =
-        mem_sync::SyncBundle::from_json(std::str::from_utf8(&t.bytes).unwrap().trim_end()).unwrap();
+    let b = decode(&t.bytes);
     b.nodes
         .iter()
         .map(|n| String::from_utf8_lossy(&n.content).into_owned())
@@ -144,12 +148,8 @@ fn source_date_moves_only_timestamps_not_node_ids() {
     o.source_date_ms += 1;
     let b = build_corpus(&spec_text(), &o).unwrap();
     for (ta, tb) in a.tenants.iter().zip(&b.tenants) {
-        let ba =
-            mem_sync::SyncBundle::from_json(std::str::from_utf8(&ta.bytes).unwrap().trim_end())
-                .unwrap();
-        let bb =
-            mem_sync::SyncBundle::from_json(std::str::from_utf8(&tb.bytes).unwrap().trim_end())
-                .unwrap();
+        let ba = decode(&ta.bytes);
+        let bb = decode(&tb.bytes);
         assert_eq!(
             mem_corpus::import::node_ids(&ba),
             mem_corpus::import::node_ids(&bb)
@@ -162,7 +162,7 @@ fn source_date_moves_only_timestamps_not_node_ids() {
 fn manifest_records_sources_commits_licences_and_hashes() {
     let built = build_fixture();
     let m = &built.manifest;
-    assert_eq!(m.format, "citrate-corpus/1");
+    assert_eq!(m.format, "citrate-corpus/2");
     assert_eq!(m.bundle_digest, m.compute_digest().unwrap());
     let docs = m.sources.iter().find(|s| s.id == "citrate-docs").unwrap();
     assert!(docs.included);
@@ -348,10 +348,10 @@ fn symlinks_are_never_followed() {
 fn bundles_are_derived_plane_knowledge_tenants_only() {
     let built = build_fixture();
     let tenants: Vec<_> = built.tenants.iter().map(|t| t.tenant.as_str()).collect();
-    assert_eq!(tenants, ["citrate-docs", "skills", "refs", "methodology"]);
+    // Citrate knowledge first, the large reviewed-skills tenant last (import order).
+    assert_eq!(tenants, ["citrate-docs", "methodology", "refs", "skills"]);
     for t in &built.tenants {
-        let b = mem_sync::SyncBundle::from_json(std::str::from_utf8(&t.bytes).unwrap().trim_end())
-            .unwrap();
+        let b = decode(&t.bytes);
         assert!(b
             .nodes
             .iter()
@@ -382,7 +382,7 @@ fn verify_accepts_the_golden_bundle() {
 fn verify_refuses_a_tampered_tenant_file() {
     let dir = written(&build_fixture());
     let corpus = dir.path().join("corpus");
-    let p = corpus.join("tenants/citrate-docs.syncbundle.json");
+    let p = corpus.join("tenants/citrate-docs.corpus.json");
     let text = std::fs::read_to_string(&p).unwrap();
     let tampered = text.replacen(
         "\"exported_at_ms\":1790000000000",
@@ -414,12 +414,10 @@ fn verify_refuses_a_manifest_edited_without_its_digest() {
 /// Re-sign a manifest after editing a bundle, i.e. a coherent but rule-breaking
 /// corpus: verification must still refuse it on shape.
 fn rewrite_bundle(corpus: &Path, tenant: &str, edit: impl Fn(&mut mem_sync::SyncBundle)) {
-    let rel = format!("tenants/{tenant}.syncbundle.json");
-    let p = corpus.join(&rel);
-    let mut b =
-        mem_sync::SyncBundle::from_json(std::fs::read_to_string(&p).unwrap().trim_end()).unwrap();
+    let p = corpus.join(mem_corpus::tenant_file(tenant));
+    let mut b = decode(&std::fs::read(&p).unwrap());
     edit(&mut b);
-    let mut bytes = b.to_json().unwrap().into_bytes();
+    let mut bytes = mem_corpus::bundle::encode(&b).unwrap().into_bytes();
     bytes.push(b'\n');
     std::fs::write(&p, &bytes).unwrap();
     let mp = corpus.join(MANIFEST_FILE);
@@ -536,7 +534,7 @@ fn verify_refuses_a_tenant_file_outside_its_fixed_path() {
     let dir = written(&build_fixture());
     let corpus = dir.path().join("corpus");
     std::fs::copy(
-        corpus.join("tenants/refs.syncbundle.json"),
+        corpus.join("tenants/refs.corpus.json"),
         corpus.join("tenants/other.json"),
     )
     .unwrap();
@@ -572,8 +570,9 @@ fn import_lands_every_node_embedded_with_progress() {
     assert_eq!(r.nodes_added, expected);
     assert_eq!(
         r.tenants_imported,
-        ["citrate-docs", "skills", "refs", "methodology"]
+        ["citrate-docs", "methodology", "refs", "skills"]
     );
+    assert_eq!((r.nodes_embedded, r.vectors_reused), (expected, 0));
     assert_eq!(r.bundle_digest, v.manifest.bundle_digest);
     let nodes = s.all_nodes().unwrap();
     assert_eq!(nodes.len(), expected);
@@ -649,7 +648,7 @@ fn an_updated_corpus_imports_only_the_changed_tenant() {
     let v2 = verify_corpus(&dir.path().join("corpus")).unwrap();
     let r = import_corpus(&s, &v2, &embedder(), |_| {}).unwrap();
     assert_eq!(r.tenants_imported, ["methodology"]);
-    assert_eq!(r.tenants_skipped, ["citrate-docs", "skills", "refs"]);
+    assert_eq!(r.tenants_skipped, ["citrate-docs", "refs", "skills"]);
     assert!(r.nodes_added > 0);
 }
 
@@ -744,7 +743,7 @@ fn json_lines_import_reports_verified_progress_and_done() {
 fn json_lines_import_reports_a_verify_failure_and_writes_nothing() {
     let dir = written(&build_fixture());
     let corpus = dir.path().join("corpus");
-    std::fs::write(corpus.join("tenants/refs.syncbundle.json"), "{}\n").unwrap();
+    std::fs::write(corpus.join("tenants/refs.corpus.json"), "{}\n").unwrap();
     let s = store();
     let mut out = Vec::new();
     let r = mem_corpus::progress::import_dir_with_progress(&s, &corpus, &embedder(), &mut out);
@@ -779,4 +778,257 @@ fn an_empty_docs_source_is_not_reported_as_included() {
     assert!(build_corpus(&required, &opts(src.path())).is_err());
     let absent = m.sources.iter().find(|s| s.id == "absent-book").unwrap();
     assert_eq!(absent.commit, "unpinned");
+}
+
+// ---------------------------------------------------------------- format 2
+
+#[test]
+fn nodes_cite_their_repository_relative_source() {
+    let built = build_fixture();
+    let m = &built.manifest;
+    let docs = m.sources.iter().find(|s| s.id == "citrate-docs").unwrap();
+    assert_eq!(
+        (docs.repo.as_str(), docs.repo_path.as_str()),
+        ("citrate-docs", "content")
+    );
+    let oz = m.sources.iter().find(|s| s.id == "openzeppelin").unwrap();
+    assert_eq!(
+        (oz.repo.as_str(), oz.repo_path.as_str()),
+        ("openzeppelin", "")
+    );
+    // Manifest file paths stay root-relative; node paths are repository-relative.
+    assert!(docs.files.iter().any(|f| f.path == "chain/consensus.md"));
+    let t = built
+        .tenants
+        .iter()
+        .find(|t| t.tenant == "citrate-docs")
+        .unwrap();
+    let b = decode(&t.bytes);
+    let cites: Vec<String> = b
+        .nodes
+        .iter()
+        .filter_map(|n| mem_corpus::cite::cite(&n.source_ref, &n.content))
+        .collect();
+    assert!(
+        cites
+            .iter()
+            .any(|c| c == "citrate-docs:content/chain/consensus.md"),
+        "file-level node cites the file: {cites:?}"
+    );
+    assert!(
+        cites
+            .iter()
+            .any(|c| c.starts_with("citrate-docs:content/chain/consensus.md#")),
+        "a chunk cites its section anchor: {cites:?}"
+    );
+    assert!(
+        cites.iter().all(|c| !c.contains("docs/content")),
+        "{cites:?}"
+    );
+}
+
+#[test]
+fn tenant_files_use_the_compact_encoding() {
+    for t in &build_fixture().tenants {
+        assert_eq!(t.rel_path, mem_corpus::tenant_file(&t.tenant));
+        let text = std::str::from_utf8(&t.bytes).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        for n in v["nodes"].as_array().unwrap() {
+            assert!(n["content"].is_string(), "text content ships as a string");
+        }
+        for e in v["edges"].as_array().unwrap() {
+            assert_eq!(e["from"].as_str().unwrap().len(), 64);
+            assert_eq!(e["to"].as_str().unwrap().len(), 64);
+        }
+    }
+}
+
+#[test]
+fn verify_refuses_a_format_1_corpus() {
+    let dir = written(&build_fixture());
+    let corpus = dir.path().join("corpus");
+    reseal_manifest(&corpus, |m| m.format = "citrate-corpus/1".into());
+    let err = verify_corpus(&corpus).unwrap_err().to_string();
+    assert!(err.contains("unsupported corpus format"), "{err}");
+}
+
+// ---------------------------------------------------------------- precomputed vectors
+
+const WEIGHTS: &str = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
+
+fn embedded_fixture() -> BuiltCorpus {
+    let mut built = build_fixture();
+    let mut ticks = 0usize;
+    mem_corpus::build::embed_vectors(&mut built, &embedder(), WEIGHTS, |_, _, _| ticks += 1)
+        .unwrap();
+    let nodes: usize = built.manifest.tenants.iter().map(|t| t.nodes).sum();
+    assert_eq!(ticks, nodes, "one progress tick per node");
+    built
+}
+
+#[test]
+fn embed_vectors_records_each_tenant_file_and_reseals_the_manifest() {
+    let plain = build_fixture();
+    let built = embedded_fixture();
+    assert_ne!(built.manifest.bundle_digest, plain.manifest.bundle_digest);
+    assert_eq!(
+        built.manifest.bundle_digest,
+        built.manifest.compute_digest().unwrap()
+    );
+    assert_eq!(built.vector_files.len(), built.tenants.len());
+    for t in &built.manifest.tenants {
+        let v = t.vectors.as_ref().unwrap();
+        assert_eq!(v.file, mem_corpus::vectors::vectors_file(&t.tenant));
+        assert_eq!((v.model.as_str(), v.dim), ("hashing-v1-d256", 256));
+        assert_eq!(v.encoding, "f16le");
+        assert_eq!(v.weights_sha256, WEIGHTS);
+        let f = built
+            .vector_files
+            .iter()
+            .find(|f| f.tenant == t.tenant)
+            .unwrap();
+        assert_eq!(f.bytes.len(), t.nodes * 256 * 2);
+        assert_eq!(v.sha256, sha256_hex(&f.bytes));
+    }
+    // The tenant files themselves are unchanged: vectors never touch node identity.
+    for (a, b) in plain.tenants.iter().zip(&built.tenants) {
+        assert_eq!(a.bytes, b.bytes);
+    }
+}
+
+#[test]
+fn import_reuses_vectors_made_by_the_same_weights() {
+    let dir = written(&embedded_fixture());
+    let v = verify_corpus(&dir.path().join("corpus")).unwrap();
+    assert_eq!(v.vectors.len(), 4);
+    let s = store();
+    let r =
+        mem_corpus::import::import_corpus_with(&s, &v, &embedder(), Some(WEIGHTS), |_| {}).unwrap();
+    let total: usize = v.tenants.iter().map(|(e, _)| e.nodes).sum();
+    assert_eq!(
+        (r.nodes_embedded, r.vectors_reused, r.nodes_added),
+        (0, total, total)
+    );
+    // Each stored vector is the f16 copy of the one this embedder makes (cosine ~1).
+    use mem_index::Embedder as _;
+    for n in s.all_nodes().unwrap() {
+        let stored = n.embedding.unwrap();
+        let fresh = embedder()
+            .embed(&String::from_utf8_lossy(&n.content))
+            .unwrap();
+        assert_eq!(stored.model, fresh.model);
+        let cos: f32 = stored
+            .data
+            .iter()
+            .zip(&fresh.data)
+            .map(|(a, b)| a * b)
+            .sum();
+        let zero = fresh.data.iter().all(|x| *x == 0.0);
+        assert!(zero || cos > 0.999, "cosine {cos}");
+    }
+}
+
+#[test]
+fn import_embeds_when_the_weights_are_unproven_or_different() {
+    let dir = written(&embedded_fixture());
+    let v = verify_corpus(&dir.path().join("corpus")).unwrap();
+    let total: usize = v.tenants.iter().map(|(e, _)| e.nodes).sum();
+    for weights in [
+        None,
+        Some("1111111111111111111111111111111111111111111111111111111111111111"),
+    ] {
+        let s = store();
+        let r =
+            mem_corpus::import::import_corpus_with(&s, &v, &embedder(), weights, |_| {}).unwrap();
+        assert_eq!(
+            (r.nodes_embedded, r.vectors_reused),
+            (total, 0),
+            "{weights:?}"
+        );
+    }
+    // A different model id (another dimension) never takes the vectors either.
+    let s = store();
+    let other = HashingEmbedder::new(64);
+    let r = mem_corpus::import::import_corpus_with(&s, &v, &other, Some(WEIGHTS), |_| {}).unwrap();
+    assert_eq!(r.vectors_reused, 0);
+    // Same model id but another dimension: refused on the dimension alone.
+    struct SameIdOtherDim(HashingEmbedder);
+    impl mem_index::Embedder for SameIdOtherDim {
+        fn model_id(&self) -> &str {
+            "hashing-v1-d256"
+        }
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+        fn embed(&self, text: &str) -> Result<mem_core::VersionedVector, mem_index::EmbedError> {
+            self.0.embed(text)
+        }
+    }
+    let s = store();
+    let odd = SameIdOtherDim(HashingEmbedder::new(128));
+    let r = mem_corpus::import::import_corpus_with(&s, &v, &odd, Some(WEIGHTS), |_| {}).unwrap();
+    assert_eq!((r.nodes_embedded, r.vectors_reused), (total, 0));
+}
+
+#[test]
+fn verify_refuses_tampered_or_mis_sized_vectors() {
+    let dir = written(&embedded_fixture());
+    let corpus = dir.path().join("corpus");
+    let p = corpus.join(mem_corpus::vectors::vectors_file("refs"));
+    let mut bytes = std::fs::read(&p).unwrap();
+    bytes[0] ^= 0x01;
+    std::fs::write(&p, &bytes).unwrap();
+    let err = verify_corpus(&corpus).unwrap_err().to_string();
+    assert!(err.contains("does not match its manifest hash"), "{err}");
+
+    // Coherent but short: re-sealed hash, wrong length.
+    let dir = written(&embedded_fixture());
+    let corpus = dir.path().join("corpus");
+    let p = corpus.join(mem_corpus::vectors::vectors_file("refs"));
+    let mut bytes = std::fs::read(&p).unwrap();
+    bytes.truncate(bytes.len() - 2);
+    std::fs::write(&p, &bytes).unwrap();
+    let sha = sha256_hex(&bytes);
+    reseal_manifest(&corpus, |m| {
+        let e = m.tenants.iter_mut().find(|e| e.tenant == "refs").unwrap();
+        e.vectors.as_mut().unwrap().sha256 = sha.clone();
+    });
+    let err = verify_corpus(&corpus).unwrap_err().to_string();
+    assert!(err.contains("expected"), "{err}");
+
+    // Wrong path, unknown encoding, absurd dimension.
+    type Edit = fn(&mut mem_corpus::vectors::VectorsEntry);
+    let cases: [(&str, Edit); 3] = [
+        ("path", |v| v.file = "tenants/other.f16".into()),
+        ("encoding", |v| v.encoding = "f32le".into()),
+        ("dimension", |v| v.dim = 0),
+    ];
+    for (label, edit) in cases {
+        let dir = written(&embedded_fixture());
+        let corpus = dir.path().join("corpus");
+        reseal_manifest(&corpus, |m| {
+            let e = m.tenants.iter_mut().find(|e| e.tenant == "refs").unwrap();
+            edit(e.vectors.as_mut().unwrap());
+        });
+        assert!(verify_corpus(&corpus).is_err(), "{label} must be refused");
+    }
+}
+
+#[test]
+fn json_lines_done_reports_reused_vectors() {
+    let dir = written(&embedded_fixture());
+    let s = store();
+    let mut out = Vec::new();
+    mem_corpus::progress::import_dir_with_progress_reusing(
+        &s,
+        &dir.path().join("corpus"),
+        &embedder(),
+        Some(WEIGHTS),
+        &mut out,
+    )
+    .unwrap();
+    let last = lines(&out).pop().unwrap();
+    assert_eq!(last["event"], "done");
+    assert_eq!(last["nodes_embedded"], 0);
+    assert!(last["vectors_reused"].as_u64().unwrap() > 0);
 }
