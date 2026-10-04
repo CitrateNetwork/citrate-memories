@@ -159,10 +159,13 @@ impl<'a> MemoryMcpServer<'a> {
         self
     }
 
-    /// The session's audit chain (locked). Panics only if another thread
-    /// panicked while appending — at which point the log is suspect anyway.
-    pub fn audit(&self) -> std::sync::MutexGuard<'_, AuditChain> {
-        self.audit.lock().expect("audit chain lock poisoned")
+    /// The session's audit chain (locked). Fails closed when another thread
+    /// panicked while appending (a poisoned lock), since the log is suspect then;
+    /// the request path refuses the same way.
+    pub fn audit(&self) -> Result<std::sync::MutexGuard<'_, AuditChain>, String> {
+        self.audit
+            .lock()
+            .map_err(|_| "audit chain lock poisoned; refusing to proceed".to_string())
     }
 
     /// Handle one JSON-RPC line. Returns `Some(response)` for requests and `None`
@@ -1727,7 +1730,7 @@ mod tests {
         let v: Value = serde_json::from_str(&srv.handle_line(call).unwrap()).unwrap();
         assert_eq!(v["result"]["isError"], false);
         assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("ghostdag"));
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Read);
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Read);
 
         // Ungranted tenant is denied.
         let denied = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory.as_of","arguments":{"repo":"citrate-identity","as_of_ms":100}}}"#;
@@ -1797,7 +1800,25 @@ mod tests {
         assert_eq!(v["result"]["isError"], false);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("ghostdag"), "recall should surface the chain node");
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Read);
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Read);
+    }
+
+    #[test]
+    fn a_poisoned_audit_chain_fails_closed_instead_of_panicking() {
+        let s = store();
+        let chain = Arc::new(Mutex::new(AuditChain::new()));
+        let poison = Arc::clone(&chain);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.lock();
+            panic!("poison the audit chain lock");
+        })
+        .join();
+        assert!(chain.is_poisoned());
+        let mut srv = MemoryMcpServer::new(&s, grant()).with_audit_chain(chain);
+        assert!(srv.audit().is_err(), "the accessor refuses a suspect log");
+        let call = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-chain","budget":5}}}"#;
+        let v: Value = serde_json::from_str(&srv.handle_line(call).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], true, "an unauditable call does not run: {v}");
     }
 
     #[test]
@@ -1808,8 +1829,8 @@ mod tests {
         let resp = srv.handle_line(call).unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["isError"], true, "recall on ungranted repo must be denied");
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Denied);
-        assert_eq!(srv.audit().verify_integrity(), Ok(1));
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Denied);
+        assert_eq!(srv.audit().expect("audit lock").verify_integrity(), Ok(1));
     }
 
     /// SECREM-02 7.5: the audit chain bound via `with_audit_chain` survives a
@@ -1834,7 +1855,7 @@ mod tests {
             let deny = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#;
             srv.handle_line(ok).unwrap();
             srv.handle_line(deny).unwrap();
-            assert_eq!(srv.audit().len(), 2);
+            assert_eq!(srv.audit().expect("audit lock").len(), 2);
         } // daemon restart
         {
             let chain = AuditChain::open(&log).expect("reopen persistent chain");
@@ -1845,8 +1866,8 @@ mod tests {
             let again = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-chain"}}}"#;
             srv.handle_line(again).unwrap();
             // The chain CONTINUES from the pre-restart head, not from genesis.
-            assert_eq!(srv.audit().records()[2].sequence, 2);
-            assert_eq!(srv.audit().verify_integrity(), Ok(3));
+            assert_eq!(srv.audit().expect("audit lock").records()[2].sequence, 2);
+            assert_eq!(srv.audit().expect("audit lock").verify_integrity(), Ok(3));
         }
         let _ = std::fs::remove_file(&log);
         let _ = std::fs::remove_file(format!("{}.head", log.display()));
@@ -1891,7 +1912,7 @@ mod tests {
         let v: Value = serde_json::from_str(&srv.handle_line(ASSERT_CALL).unwrap()).unwrap();
         assert_eq!(v["result"]["isError"], false);
         assert_eq!(s.node_count().unwrap(), before + 1, "assertion appended to the store");
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Write);
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Write);
     }
 
     #[test]
@@ -1901,7 +1922,7 @@ mod tests {
         let mut srv = MemoryMcpServer::new_with_asserter(&s, grant(), asserter());
         let v: Value = serde_json::from_str(&srv.handle_line(ASSERT_CALL).unwrap()).unwrap();
         assert_eq!(v["result"]["isError"], true, "assert without write scope must be denied");
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Denied);
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Denied);
         assert_eq!(s.node_count().unwrap(), 2, "nothing written");
     }
 

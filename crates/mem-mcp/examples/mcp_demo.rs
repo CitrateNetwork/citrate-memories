@@ -86,8 +86,8 @@ fn main() {
     }
 
     println!("\n=== audit log (tamper-evident hash-chain) ===");
-    for r in srv.audit().records() {
+    for r in srv.audit().expect("audit lock").records() {
         println!("  #{} {:?}  {}  ({})", r.sequence, r.event, r.resource_id, r.detail);
     }
-    println!("integrity check: {:?}", srv.audit().verify_integrity());
+    println!("integrity check: {:?}", srv.audit().expect("audit lock").verify_integrity());
 }
