@@ -293,7 +293,9 @@ impl AuditChain {
         self.last_hash = hash;
         self.next_seq += 1;
         self.records.push(record);
-        Ok(self.records.last().expect("just pushed"))
+        self.records
+            .last()
+            .ok_or_else(|| AuditError::Corrupt("record missing right after append".into()))
     }
 
     pub fn len(&self) -> usize {

@@ -712,10 +712,9 @@ impl Ingestor {
             // No watermark, no head, or rewritten history → re-derive fully.
             _ => None,
         };
-        if since.is_none() {
+        let Some(since) = since else {
             return self.ingest(repo_path, store);
-        }
-        let since = since.expect("checked is_some");
+        };
 
         let now = now_millis();
         let recs = git::read_commits_range(&root, Some(&since))?;

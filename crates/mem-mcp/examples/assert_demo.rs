@@ -87,7 +87,7 @@ fn main() {
     }
 
     println!("\n== Agent A audit log ==");
-    for r in srv_a.audit().records() {
+    for r in srv_a.audit().expect("audit lock").records() {
         println!("  #{} {:?}  {}  ({})", r.sequence, r.event, r.resource_id, r.detail);
     }
 }
