@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use mem_core::{
     BelnapValue, ContentHash, Edge, EdgeKind, EdgeMethod, EdgeProvenance, MemoryNode, NodeKind,
-    Plane, SourceRef, Status, TrustTier, SCHEMA_VERSION,
+    Plane, SourceRef, Status, TrustTier, VersionedVector, SCHEMA_VERSION,
 };
 use mem_index::{EmbedError, Embedder, HashingEmbedder};
 use mem_store::{MemoryDagStore, StoreError, SupersessionError};
@@ -125,14 +125,49 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Embedding reuse lookup (MEM-S7 auto-ingest throughput): given a node id about
+/// to be (re)written, return the vector already stored for it, if any.
+///
+/// Sound because node identity excludes the embedding while the embed text is
+/// fully determined by identity-bearing fields — a commit's (repo, sha), a doc's
+/// (repo, path, blob sha) — so for the same model the stored vector IS the vector
+/// a re-embed would produce. Callers must only return a vector whose `model`
+/// matches the active embedder (see [`Ingestor::store_reuse`]). The node itself is
+/// still rewritten exactly as before; only the expensive embed call is skipped.
+pub(crate) type EmbedReuse<'a> = &'a dyn Fn(&ContentHash) -> Option<VersionedVector>;
+
+/// The no-reuse lookup: always embed (pure builders, tests, first backfill).
+fn no_reuse(_: &ContentHash) -> Option<VersionedVector> {
+    None
+}
+
+/// Fill `node.embedding` from `reuse` when it has a vector for this node's id,
+/// else embed `text`. Identity is computed with the embedding unset (it never
+/// enters identity — see `MemoryNode::compute_id`).
+fn embed_or_reuse(
+    mut node: MemoryNode,
+    text: &str,
+    embedder: &dyn Embedder,
+    reuse: EmbedReuse<'_>,
+) -> Result<MemoryNode, IngestError> {
+    let reused = reuse(&node.compute_id())
+        .filter(|v| v.model == embedder.model_id() && v.data.len() == embedder.dim());
+    node.embedding = Some(match reused {
+        Some(v) => v,
+        None => embedder.embed(text)?,
+    });
+    Ok(node)
+}
+
 fn commit_node(
     repo: &str,
     rec: &CommitRecord,
     now_ms: u64,
     embedder: &dyn Embedder,
+    reuse: EmbedReuse<'_>,
 ) -> Result<MemoryNode, IngestError> {
     let embed_text = format!("{}\n{}", rec.subject, rec.body);
-    Ok(MemoryNode {
+    let node = MemoryNode {
         schema_version: SCHEMA_VERSION,
         plane: Plane::Derived,
         kind: NodeKind::Commit,
@@ -149,11 +184,12 @@ fn commit_node(
         observed_at: now_ms,
         trust_tier: TrustTier::DerivedDeterministic,
         signature: None,
-        embedding: Some(embedder.embed(&embed_text)?),
+        embedding: None,
         confidence: vec![BelnapValue::True], // a commit's existence is a known-true fact
         anchors: vec![],
         status: Status::Active,
-    })
+    };
+    embed_or_reuse(node, &embed_text, embedder, reuse)
 }
 
 /// Best-effort kind for an unresolved trailer target (resolution/unification with
@@ -283,13 +319,26 @@ pub fn build_graph_gated(
     embedder: &dyn Embedder,
     authoritative: &HashSet<String>,
 ) -> Result<(Vec<MemoryNode>, Vec<Edge>), IngestError> {
+    build_graph_gated_reuse(repo, recs, now_ms, embedder, authoritative, &no_reuse)
+}
+
+/// As [`build_graph_gated`], reusing stored vectors via `reuse` (identical output
+/// for the same model; only skips redundant embed calls).
+fn build_graph_gated_reuse(
+    repo: &str,
+    recs: &[CommitRecord],
+    now_ms: u64,
+    embedder: &dyn Embedder,
+    authoritative: &HashSet<String>,
+    reuse: EmbedReuse<'_>,
+) -> Result<(Vec<MemoryNode>, Vec<Edge>), IngestError> {
     let mut sha_to_id: HashMap<String, ContentHash> = HashMap::new();
     let mut ref_ids: HashMap<String, ContentHash> = HashMap::new();
     let mut nodes: Vec<MemoryNode> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
     for rec in recs {
-        let node = commit_node(repo, rec, now_ms, embedder)?;
+        let node = commit_node(repo, rec, now_ms, embedder, reuse)?;
         let id = node.compute_id();
         sha_to_id.insert(rec.sha.clone(), id);
         nodes.push(node);
@@ -387,6 +436,7 @@ fn build_branch_graph(
     recs: &[CommitRecord],
     now_ms: u64,
     embedder: &dyn Embedder,
+    reuse: EmbedReuse<'_>,
 ) -> Result<(Vec<MemoryNode>, Vec<Edge>), IngestError> {
     let mut sha_to_id: HashMap<String, ContentHash> = HashMap::new();
     let mut nodes: Vec<MemoryNode> = Vec::new();
@@ -397,7 +447,7 @@ fn build_branch_graph(
     nodes.push(branch);
 
     for rec in recs {
-        let node = commit_node(repo, rec, now_ms, embedder)?;
+        let node = commit_node(repo, rec, now_ms, embedder, reuse)?;
         let id = node.compute_id();
         sha_to_id.insert(rec.sha.clone(), id);
         nodes.push(node);
@@ -430,6 +480,7 @@ fn doc_node(
     body: &str,
     now_ms: u64,
     embedder: &dyn Embedder,
+    reuse: EmbedReuse<'_>,
 ) -> Result<MemoryNode, IngestError> {
     let preview: String = body.chars().take(512).collect();
     let embed_text = format!("{title}\n{preview}");
@@ -437,7 +488,7 @@ fn doc_node(
     // so it lands in the storyline at its real time rather than clustering at
     // ingest time (finding F-3). Falls back to ingest time when no date is present.
     let valid_from = frontmatter::created_ms(fm).unwrap_or(now_ms);
-    Ok(MemoryNode {
+    let node = MemoryNode {
         schema_version: SCHEMA_VERSION,
         plane: Plane::Derived,
         kind,
@@ -462,11 +513,17 @@ fn doc_node(
         observed_at: now_ms,
         trust_tier: TrustTier::DerivedDeterministic,
         signature: None,
-        embedding: Some(embedder.embed(&embed_text)?),
+        embedding: None,
         confidence: vec![BelnapValue::True],
         anchors: vec![],
         status: docs::status_from_fm(fm),
-    })
+    };
+    // Reuse is only sound when identity pins the bytes: an empty blob sha (git
+    // reported none) would let different content share an id — always embed then.
+    if blob_sha.is_empty() {
+        return embed_or_reuse(node, &embed_text, embedder, &no_reuse);
+    }
+    embed_or_reuse(node, &embed_text, embedder, reuse)
 }
 
 /// Largest tracked markdown doc the ingestor will read (PBA-L6b-004). Real docs
@@ -512,6 +569,7 @@ fn build_doc_graph(
     repo_root: &Path,
     now_ms: u64,
     embedder: &dyn Embedder,
+    reuse: EmbedReuse<'_>,
 ) -> Result<(Vec<MemoryNode>, Vec<Edge>, usize), IngestError> {
     let paths = docs::list_md_files(repo_root)?;
     // MEM-B-014: blob shas from the index give each doc a git-pure identity.
@@ -545,7 +603,7 @@ fn build_doc_graph(
         // MEM-B-014: identity uses the git blob sha (empty only if git did not
         // report one for this path, which cannot happen for a tracked file).
         let blob_sha = blobs.get(rel.as_str()).map(String::as_str).unwrap_or("");
-        let node = doc_node(repo, rel, &title, blob_sha, &fm, kind, body, now_ms, embedder)?;
+        let node = doc_node(repo, rel, &title, blob_sha, &fm, kind, body, now_ms, embedder, reuse)?;
         let id = node.compute_id();
         nodes.push(node);
         doc_count += 1;
@@ -628,18 +686,21 @@ impl Ingestor {
 
         // Derived plane = commits + markdown docs, committed atomically.
         let recs = git::read_commits(&root)?;
-        let (mut nodes, mut edges) = build_graph_gated(
+        let reuse = self.store_reuse(store);
+        let (mut nodes, mut edges) = build_graph_gated_reuse(
             &self.repo_name,
             &recs,
             now,
             self.embedder.as_ref(),
             &self.authoritative_authors,
+            &reuse,
         )?;
         let (doc_nodes, doc_edges, doc_count) = build_doc_graph(
             &self.repo_name,
             &root,
             now,
             self.embedder.as_ref(),
+            &reuse,
         )?;
         nodes.extend(doc_nodes);
         edges.extend(doc_edges);
@@ -669,6 +730,26 @@ impl Ingestor {
             supersessions_rejected,
             watermark,
         })
+    }
+
+    /// A store-backed [`EmbedReuse`]: the vector already stored for a node id,
+    /// when its model tag and dimension match this ingestor's embedder. Turns a
+    /// re-ingest of already-known commits/docs (incremental doc refresh, a force-
+    /// push full re-derive, an advanced in-flight branch) from O(nodes) embed calls
+    /// into O(nodes) point reads, with byte-identical nodes. A lookup failure
+    /// simply falls back to embedding (never fails the ingest).
+    fn store_reuse<'s>(
+        &'s self,
+        store: &'s MemoryDagStore<MemoryNode>,
+    ) -> impl Fn(&ContentHash) -> Option<VersionedVector> + 's {
+        move |id: &ContentHash| {
+            store
+                .get_node(id)
+                .ok()
+                .flatten()
+                .and_then(|n| n.embedding)
+                .filter(|v| v.model == self.embedder.model_id() && v.data.len() == self.embedder.dim())
+        }
     }
 
     /// Read back the freshness watermark (None if never ingested).
@@ -720,12 +801,14 @@ impl Ingestor {
         let recs = git::read_commits_range(&root, Some(&since))?;
 
         // Commit nodes/edges for ONLY the new commits.
-        let (mut nodes, mut edges) = build_graph_gated(
+        let reuse = self.store_reuse(store);
+        let (mut nodes, mut edges) = build_graph_gated_reuse(
             &self.repo_name,
             &recs,
             now,
             self.embedder.as_ref(),
             &self.authoritative_authors,
+            &reuse,
         )?;
         // Refresh docs against the current tree (idempotent on unchanged docs).
         let (doc_nodes, doc_edges, doc_count) = build_doc_graph(
@@ -733,6 +816,7 @@ impl Ingestor {
             &root,
             now,
             self.embedder.as_ref(),
+            &reuse,
         )?;
         nodes.extend(doc_nodes);
         edges.extend(doc_edges);
@@ -782,6 +866,7 @@ impl Ingestor {
         let branches = git::list_branches(&root, &default_ref)?;
         let now = now_millis();
         let mut report = BranchIngestReport::default();
+        let reuse = self.store_reuse(store);
 
         for br in branches {
             // Idempotent skip: tip unchanged since the last branch ingest.
@@ -818,6 +903,7 @@ impl Ingestor {
                 &recs,
                 now,
                 self.embedder.as_ref(),
+                &reuse,
             )?;
             // No trailers in the branch subgraph → no Supersedes edges → a plain commit.
             store.commit(&nodes, &edges)?;
@@ -962,7 +1048,7 @@ mod tests {
             rec("f1", &["base"], "wip one", ""),
             rec("f2", &["f1"], "wip two", "Supersedes: ADR-01"),
         ];
-        let (nodes, edges) = build_branch_graph("r", "feat/x", "f2", &recs, 1, &embedder()).unwrap();
+        let (nodes, edges) = build_branch_graph("r", "feat/x", "f2", &recs, 1, &embedder(), &no_reuse).unwrap();
 
         assert_eq!(nodes.iter().filter(|n| n.kind == NodeKind::Branch).count(), 1, "one branch node");
         assert_eq!(nodes.iter().filter(|n| n.kind == NodeKind::Commit).count(), 2, "two in-flight commits");

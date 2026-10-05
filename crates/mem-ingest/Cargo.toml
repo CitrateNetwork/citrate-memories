@@ -35,6 +35,10 @@ name = "backfill"
 required-features = ["rocksdb"]
 
 [[example]]
+name = "freshness"
+required-features = ["rocksdb"]
+
+[[example]]
 name = "meta_ingest"
 required-features = ["rocksdb"]
 
