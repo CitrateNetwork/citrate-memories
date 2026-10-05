@@ -159,10 +159,13 @@ impl<'a> MemoryMcpServer<'a> {
         self
     }
 
-    /// The session's audit chain (locked). Panics only if another thread
-    /// panicked while appending — at which point the log is suspect anyway.
-    pub fn audit(&self) -> std::sync::MutexGuard<'_, AuditChain> {
-        self.audit.lock().expect("audit chain lock poisoned")
+    /// The session's audit chain (locked). Fails closed when another thread
+    /// panicked while appending (a poisoned lock), since the log is suspect then;
+    /// the request path refuses the same way.
+    pub fn audit(&self) -> Result<std::sync::MutexGuard<'_, AuditChain>, String> {
+        self.audit
+            .lock()
+            .map_err(|_| "audit chain lock poisoned; refusing to proceed".to_string())
     }
 
     /// Handle one JSON-RPC line. Returns `Some(response)` for requests and `None`
@@ -392,6 +395,11 @@ impl<'a> MemoryMcpServer<'a> {
             recall = recall.with_index_cache(Arc::clone(cache));
         }
         let result = recall.with_in_flight(in_flight).search(&repo, &query, budget).map_err(store_err)?;
+        // HUP-S3.1: `passages: true` returns each hit's text and citation, so an
+        // agent can answer from (and cite) the bundled knowledge corpus.
+        if arg_bool(args, "passages", false) {
+            return Ok(tool_text(render_passages(&result)));
+        }
         Ok(tool_text(render_result(&result)))
     }
 
@@ -1155,7 +1163,8 @@ fn tools_list() -> Value {
                     "repo": { "type": "string" },
                     "query": { "type": "string" },
                     "budget": { "type": "integer", "default": 10 },
-                    "include_in_flight": { "type": "boolean", "description": "also search unmerged feature-branch work, each hit labeled [in-flight: <branch>]; default off", "default": false }
+                    "include_in_flight": { "type": "boolean", "description": "also search unmerged feature-branch work, each hit labeled [in-flight: <branch>]; default off", "default": false },
+                    "passages": { "type": "boolean", "description": "also return each hit's text and, for documents, a citation (<repo>:<path>#<anchor>) to quote when answering; default off = titles only", "default": false }
                 },
                 "required": ["repo", "query"]
             }
@@ -1334,6 +1343,46 @@ fn render_result(r: &RecallResult) -> String {
             .map(|b| format!(" [in-flight: {b}]"))
             .unwrap_or_default();
         s.push_str(&format!("  {} {}[{}{}] {}{}\n", &i.id.to_hex()[..10], score, i.kind.discriminant(), status, title, in_flight));
+    }
+    s
+}
+
+/// Most characters of one hit's text that `memory.search {passages: true}`
+/// returns (a corpus chunk is at most about 1,300).
+pub const PASSAGE_MAX_CHARS: usize = 2000;
+
+/// [`render_result`] plus, under each hit, its citation (artifact nodes only:
+/// `cite: <repo>:<path>[#<anchor>]`, see `mem_corpus::cite`) and its text quoted
+/// line by line (`    > `), capped at [`PASSAGE_MAX_CHARS`]. The header and hit
+/// lines are unchanged, so a parser of the default rendering still reads them.
+fn render_passages(r: &RecallResult) -> String {
+    let base = render_result(r);
+    let mut lines = base.lines();
+    let mut s = String::new();
+    // Header lines (freshness + tenant) come first, then one line per item.
+    for _ in 0..2 {
+        if let Some(l) = lines.next() {
+            s.push_str(l);
+            s.push('\n');
+        }
+    }
+    for (item, line) in r.items.iter().zip(lines) {
+        s.push_str(line);
+        s.push('\n');
+        if let Some(c) = mem_corpus::cite::cite(&item.source, item.title.as_bytes()) {
+            s.push_str(&format!("    cite: {c}\n"));
+        }
+        let mut text: String = item.title.chars().take(PASSAGE_MAX_CHARS).collect();
+        if item.title.chars().count() > PASSAGE_MAX_CHARS {
+            text.push('\u{2026}');
+        }
+        for l in text.lines() {
+            if l.trim().is_empty() {
+                s.push_str("    >\n");
+            } else {
+                s.push_str(&format!("    > {l}\n"));
+            }
+        }
     }
     s
 }
@@ -1727,7 +1776,7 @@ mod tests {
         let v: Value = serde_json::from_str(&srv.handle_line(call).unwrap()).unwrap();
         assert_eq!(v["result"]["isError"], false);
         assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("ghostdag"));
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Read);
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Read);
 
         // Ungranted tenant is denied.
         let denied = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory.as_of","arguments":{"repo":"citrate-identity","as_of_ms":100}}}"#;
@@ -1797,7 +1846,25 @@ mod tests {
         assert_eq!(v["result"]["isError"], false);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("ghostdag"), "recall should surface the chain node");
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Read);
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Read);
+    }
+
+    #[test]
+    fn a_poisoned_audit_chain_fails_closed_instead_of_panicking() {
+        let s = store();
+        let chain = Arc::new(Mutex::new(AuditChain::new()));
+        let poison = Arc::clone(&chain);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.lock();
+            panic!("poison the audit chain lock");
+        })
+        .join();
+        assert!(chain.is_poisoned());
+        let mut srv = MemoryMcpServer::new(&s, grant()).with_audit_chain(chain);
+        assert!(srv.audit().is_err(), "the accessor refuses a suspect log");
+        let call = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-chain","budget":5}}}"#;
+        let v: Value = serde_json::from_str(&srv.handle_line(call).unwrap()).unwrap();
+        assert_eq!(v["result"]["isError"], true, "an unauditable call does not run: {v}");
     }
 
     #[test]
@@ -1808,8 +1875,8 @@ mod tests {
         let resp = srv.handle_line(call).unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["isError"], true, "recall on ungranted repo must be denied");
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Denied);
-        assert_eq!(srv.audit().verify_integrity(), Ok(1));
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Denied);
+        assert_eq!(srv.audit().expect("audit lock").verify_integrity(), Ok(1));
     }
 
     /// SECREM-02 7.5: the audit chain bound via `with_audit_chain` survives a
@@ -1834,7 +1901,7 @@ mod tests {
             let deny = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-identity"}}}"#;
             srv.handle_line(ok).unwrap();
             srv.handle_line(deny).unwrap();
-            assert_eq!(srv.audit().len(), 2);
+            assert_eq!(srv.audit().expect("audit lock").len(), 2);
         } // daemon restart
         {
             let chain = AuditChain::open(&log).expect("reopen persistent chain");
@@ -1845,8 +1912,8 @@ mod tests {
             let again = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory.recall","arguments":{"repo":"citrate-chain"}}}"#;
             srv.handle_line(again).unwrap();
             // The chain CONTINUES from the pre-restart head, not from genesis.
-            assert_eq!(srv.audit().records()[2].sequence, 2);
-            assert_eq!(srv.audit().verify_integrity(), Ok(3));
+            assert_eq!(srv.audit().expect("audit lock").records()[2].sequence, 2);
+            assert_eq!(srv.audit().expect("audit lock").verify_integrity(), Ok(3));
         }
         let _ = std::fs::remove_file(&log);
         let _ = std::fs::remove_file(format!("{}.head", log.display()));
@@ -1891,7 +1958,7 @@ mod tests {
         let v: Value = serde_json::from_str(&srv.handle_line(ASSERT_CALL).unwrap()).unwrap();
         assert_eq!(v["result"]["isError"], false);
         assert_eq!(s.node_count().unwrap(), before + 1, "assertion appended to the store");
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Write);
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Write);
     }
 
     #[test]
@@ -1901,7 +1968,7 @@ mod tests {
         let mut srv = MemoryMcpServer::new_with_asserter(&s, grant(), asserter());
         let v: Value = serde_json::from_str(&srv.handle_line(ASSERT_CALL).unwrap()).unwrap();
         assert_eq!(v["result"]["isError"], true, "assert without write scope must be denied");
-        assert_eq!(srv.audit().records()[0].event, MemoryEvent::Denied);
+        assert_eq!(srv.audit().expect("audit lock").records()[0].event, MemoryEvent::Denied);
         assert_eq!(s.node_count().unwrap(), 2, "nothing written");
     }
 
@@ -2100,6 +2167,94 @@ mod tests {
 
     fn text_of(result: &Value) -> String {
         result["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    /// HUP-S3.1: a knowledge passage (corpus format 2) in `citrate-chain`, cited
+    /// as a repository-relative file and section.
+    fn passage_node(text: &str) -> MemoryNode {
+        let mut n = node("citrate-chain", text);
+        n.kind = NodeKind::Doc;
+        n.source_ref = SourceRef::Artifact {
+            repo: "citrate-docs".into(),
+            path: "content/chain/genesis.md".into(),
+            git_sha: "ab".repeat(32),
+            byte_start: 10,
+            byte_end: 200,
+        };
+        n
+    }
+
+    #[test]
+    fn search_passages_return_the_text_and_a_citation() {
+        let s = store();
+        let body = "Genesis \u{203a} What it is\n\nThe chain id is 40204; eth_chainId returns 0x9d0c.\nSecond line.";
+        s.commit(&[passage_node(body)], &[]).unwrap();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let args = json!({ "repo": "citrate-chain", "query": "chain id eth_chainId 40204", "budget": 3, "passages": true });
+        let r = call_json(&mut srv, "memory.search", args);
+        assert_eq!(r["isError"], false);
+        let text = text_of(&r);
+        assert!(text.contains("    cite: citrate-docs:content/chain/genesis.md#what-it-is"), "{text}");
+        assert!(text.contains("    > The chain id is 40204; eth_chainId returns 0x9d0c."), "{text}");
+        assert!(text.contains("    > Second line."), "{text}");
+        // The header and hit lines keep the default shape, so older parsers still read them.
+        assert!(text.contains("tenant 'citrate-chain'"), "{text}");
+        assert!(text.lines().any(|l| l.starts_with("  ") && l.contains("[doc] Genesis")), "{text}");
+    }
+
+    #[test]
+    fn search_without_passages_keeps_the_title_only_rendering() {
+        let s = store();
+        s.commit(&[passage_node("Genesis \u{203a} What it is\n\nThe chain id is 40204.")], &[]).unwrap();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let text = text_of(&call_json(
+            &mut srv,
+            "memory.search",
+            json!({ "repo": "citrate-chain", "query": "chain id 40204", "budget": 3 }),
+        ));
+        assert!(!text.contains("cite:"), "{text}");
+        assert!(!text.contains("    > "), "{text}");
+    }
+
+    #[test]
+    fn passages_are_capped_and_non_artifacts_have_no_citation() {
+        let long = format!("Title \u{203a} Long\n\n{}", "x".repeat(PASSAGE_MAX_CHARS * 2));
+        let s = store();
+        s.commit(&[passage_node(&long)], &[]).unwrap();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let text = text_of(&call_json(
+            &mut srv,
+            "memory.search",
+            json!({ "repo": "citrate-chain", "query": "ghostdag tip selection title long", "budget": 5, "passages": true }),
+        ));
+        // The long passage's own quoted lines (the store's commit nodes are hits too).
+        let quoted: usize = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("    > "))
+            .filter(|l| l.starts_with("Title") || l.starts_with('x'))
+            .map(|l| l.chars().count())
+            .sum();
+        assert!(quoted <= PASSAGE_MAX_CHARS + 1, "passage capped, got {quoted} chars");
+        assert!(text.contains('\u{2026}'), "a capped passage says so: {text}");
+        // The commit node (GitCommit source) is shown without a cite line.
+        let commit_hit = text.lines().position(|l| l.contains("ghostdag tip selection")).unwrap();
+        let next = text.lines().nth(commit_hit + 1).unwrap_or("");
+        assert!(!next.contains("cite:"), "{text}");
+    }
+
+    #[test]
+    fn search_advertises_passages_default_off() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let v: Value = serde_json::from_str(
+            &srv.handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap(),
+        )
+        .unwrap();
+        let tools = v["result"]["tools"].as_array().unwrap();
+        let t = tools.iter().find(|t| t["name"] == "memory.search").unwrap();
+        let prop = &t["inputSchema"]["properties"]["passages"];
+        assert_eq!(prop["type"], "boolean");
+        assert_eq!(prop["default"], false);
     }
 
     /// WP-4.2 (F-6/R3): a cross-tenant neighbour is shown iff the grant reads

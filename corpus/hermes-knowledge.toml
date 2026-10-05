@@ -8,9 +8,16 @@
 # (suffixed `-dirty` when the tree differs from HEAD). Skills sources take their
 # commit and file hashes from the HUP-S3.6 skills.lock in citrate-core.
 #
+# Citations (format 2): `repo` is the repository a source's nodes cite and
+# `repo_path` is where `root` sits inside it, so every node's source_ref reads
+# `<repo>:<repo-relative path>` (the shape the Citrate QA eval checks).
+#
+# Optional reference checkouts (Solady, the Foundry book, Medusa, Slither) are
+# fetched at pinned commits by `scripts/fetch-corpus-refs.sh <sources-base>`.
+#
 # Licence state: `licence_cleared = false` sources are listed in the manifest
-# and never read. They stay off until the owner signs off (see the
-# "pending owner sign-off" notes below).
+# and never read. Every source below is cleared; Medusa and Slither docs
+# (AGPL-3.0) by owner decision on 2026-10-01.
 
 version = 1
 name = "hermes-knowledge"
@@ -23,6 +30,8 @@ id = "citrate-docs"
 tenant = "citrate-docs"
 kind = "docs"
 root = "citrate-docs/content"
+repo = "citrate-docs"
+repo_path = "content"
 upstream = "https://github.com/CitrateNetwork/citrate-docs"
 license = "Apache-2.0 (citrate-docs LICENSE)"
 licence_cleared = true
@@ -36,6 +45,8 @@ id = "gradient-papers"
 tenant = "citrate-docs"
 kind = "docs"
 root = "gradient-papers/markdown"
+repo = "gradient-papers"
+repo_path = "markdown"
 upstream = "Citrate Inc., The Gradient Papers v3"
 license = "Citrate Inc. (first party)"
 licence_cleared = true
@@ -50,6 +61,7 @@ id = "agentile"
 tenant = "methodology"
 kind = "docs"
 root = "."
+repo = "citrate-labs"
 upstream = "https://github.com/CitrateNetwork (citrate-labs AGENTILE.md)"
 license = "Citrate Inc. (first party)"
 licence_cleared = true
@@ -61,6 +73,8 @@ id = "agentile-docs"
 tenant = "methodology"
 kind = "docs"
 root = "agentile-skills/docs"
+repo = "agentile-skills"
+repo_path = "docs"
 upstream = "https://github.com/CitrateNetwork/agentile-skills"
 license = "Apache-2.0"
 licence_cleared = true
@@ -74,6 +88,7 @@ id = "trailofbits"
 tenant = "skills"
 kind = "skills"
 root = ".claude/plugins/marketplaces/trailofbits"
+repo = "trailofbits-skills"
 upstream = "https://github.com/trailofbits/skills"
 license = "CC-BY-SA-4.0"
 licence_cleared = true
@@ -87,6 +102,7 @@ id = "frontend-skills"
 tenant = "skills"
 kind = "skills"
 root = "frontend-skills"
+repo = "frontend-skills"
 upstream = "https://github.com/saulbuilds/frontend-skills"
 license = "MIT (README statement); impeccable and hyperframes Apache-2.0; frontend-design Apache-2.0"
 licence_cleared = true
@@ -100,6 +116,7 @@ id = "agentile-skills"
 tenant = "skills"
 kind = "skills"
 root = "agentile-skills"
+repo = "agentile-skills"
 upstream = "https://github.com/CitrateNetwork/agentile-skills"
 license = "Apache-2.0"
 licence_cleared = true
@@ -111,6 +128,8 @@ id = "hermes-skills"
 tenant = "skills"
 kind = "skills"
 root = "testing-hermes-design/skills"
+repo = "testing-hermes-design"
+repo_path = "skills"
 upstream = "https://github.com/NousResearch/hermes-agent (via CitrateNetwork/testing-hermes-design)"
 license = "MIT"
 licence_cleared = true
@@ -122,6 +141,8 @@ id = "hermes-optional"
 tenant = "skills"
 kind = "skills"
 root = "testing-hermes-design/optional-skills"
+repo = "testing-hermes-design"
+repo_path = "optional-skills"
 upstream = "https://github.com/NousResearch/hermes-agent (via CitrateNetwork/testing-hermes-design)"
 license = "MIT"
 licence_cleared = true
@@ -135,6 +156,8 @@ id = "openzeppelin"
 tenant = "refs"
 kind = "docs"
 root = "citrate-chain/contracts/lib/openzeppelin-contracts/docs/modules/ROOT/pages"
+repo = "openzeppelin-contracts"
+repo_path = "docs/modules/ROOT/pages"
 upstream = "https://github.com/OpenZeppelin/openzeppelin-contracts"
 license = "MIT"
 licence_cleared = true
@@ -146,19 +169,21 @@ id = "solady"
 tenant = "refs"
 kind = "docs"
 root = "solady"
+repo = "solady"
 upstream = "https://github.com/Vectorized/solady"
 license = "MIT"
 licence_cleared = true
 optional = true
 commit = "git"
 extensions = ["md", "sol"]
-exclude_dirs = ["test", "ext", "audits"]
+exclude_dirs = ["test", "ext", "audits", ".github"]
 
 [[source]]
 id = "forge-std"
 tenant = "refs"
 kind = "docs"
 root = "citrate-chain/contracts/lib/forge-std"
+repo = "forge-std"
 upstream = "https://github.com/foundry-rs/forge-std"
 license = "MIT OR Apache-2.0"
 licence_cleared = true
@@ -170,24 +195,30 @@ exclude_dirs = ["test", "scripts"]
 id = "foundry-book"
 tenant = "refs"
 kind = "docs"
-root = "foundry-book/src"
+root = "foundry-book/src/pages"
+repo = "foundry-book"
+repo_path = "src/pages"
 upstream = "https://github.com/foundry-rs/book"
 license = "MIT OR Apache-2.0"
 licence_cleared = true
 optional = true
 commit = "git"
-extensions = ["md"]
+extensions = ["md", "mdx"]
 
 [[source]]
 id = "medusa-docs"
 tenant = "refs"
 kind = "docs"
 root = "medusa/docs/src"
+repo = "medusa"
+repo_path = "docs/src"
 upstream = "https://github.com/crytic/medusa"
 license = "AGPL-3.0"
-licence_cleared = false
-licence_note = "pending owner sign-off: AGPL-3.0 project; redistribution of its docs inside the app is not cleared"
+licence_cleared = true
+licence_note = "owner decision 2026-10-01 (Larry Klosowski): include the AGPL-3.0 docs, redistributed unmodified in content with attribution and a link to the source"
+attribution = "Medusa documentation (https://github.com/crytic/medusa, docs/src), Trail of Bits, licensed AGPL-3.0 (https://www.gnu.org/licenses/agpl-3.0.html). Source: https://github.com/crytic/medusa at the commit in manifest.json. Changed: text chunked for search."
 optional = true
+commit = "git"
 extensions = ["md"]
 
 [[source]]
@@ -195,9 +226,13 @@ id = "slither-docs"
 tenant = "refs"
 kind = "docs"
 root = "slither/docs/src"
+repo = "slither"
+repo_path = "docs/src"
 upstream = "https://github.com/crytic/slither"
 license = "AGPL-3.0"
-licence_cleared = false
-licence_note = "pending owner sign-off: AGPL-3.0 project; redistribution of its docs inside the app is not cleared"
+licence_cleared = true
+licence_note = "owner decision 2026-10-01 (Larry Klosowski): include the AGPL-3.0 docs, redistributed unmodified in content with attribution and a link to the source"
+attribution = "Slither documentation (https://github.com/crytic/slither, docs/src), Trail of Bits, licensed AGPL-3.0 (https://www.gnu.org/licenses/agpl-3.0.html). Source: https://github.com/crytic/slither at the commit in manifest.json. Changed: text chunked for search."
 optional = true
+commit = "git"
 extensions = ["md"]
