@@ -318,7 +318,7 @@ fn build_source(
         ));
     }
     let commit = if pinned == "git" {
-        resolve_git(&root)
+        resolve_git(&root, &source.include)
     } else {
         pinned
     };
@@ -383,10 +383,15 @@ fn build_source(
     })
 }
 
-/// `HEAD` of the work tree holding `root`, suffixed `-dirty` when anything under
-/// `root` differs from `HEAD` (including untracked files). `"unpinned"` if `root`
-/// is not in a git work tree.
-fn resolve_git(root: &Path) -> String {
+/// `HEAD` of the work tree holding `root`, suffixed `-dirty` when anything the
+/// source reads differs from `HEAD` (including untracked files). `"unpinned"` if
+/// `root` is not in a git work tree.
+///
+/// The dirty check covers exactly what the source reads: its `include` list when
+/// it has one, else the whole `root`. A source that reads one file from a
+/// metarepo root (`agentile` reads `AGENTILE.md`) is then not marked dirty by
+/// untracked child checkouts beside that file, which it never reads.
+fn resolve_git(root: &Path, include: &[String]) -> String {
     let head = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -399,10 +404,20 @@ fn resolve_git(root: &Path) -> String {
         return "unpinned".into();
     }
     let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    let dirty = Command::new("git")
+    let mut status = Command::new("git");
+    status
         .arg("-C")
         .arg(root)
-        .args(["status", "--porcelain", "--", "."])
+        .args(["status", "--porcelain", "--"]);
+    if include.is_empty() {
+        status.arg(".");
+    } else {
+        // Literal pathspecs: an included name is a file, never a glob.
+        for f in include {
+            status.arg(format!(":(literal){f}"));
+        }
+    }
+    let dirty = status
         .output()
         .map(|o| !o.status.success() || !o.stdout.is_empty())
         .unwrap_or(true);

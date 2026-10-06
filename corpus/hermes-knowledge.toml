@@ -40,19 +40,25 @@ commit = "git"
 extensions = ["md", "mdx"]
 require_frontmatter = { tier = "public" }
 
-[[source]]
-id = "gradient-papers"
-tenant = "citrate-docs"
-kind = "docs"
-root = "gradient-papers/markdown"
-repo = "gradient-papers"
-repo_path = "markdown"
-upstream = "Citrate Inc., The Gradient Papers v3"
-license = "Citrate Inc. (first party)"
-licence_cleared = true
-licence_note = "first party research series"
-commit = "git"
-extensions = ["md"]
+# gradient-papers: DEFERRED to 0.5.1 by owner decision 2026-10-06. The papers are not
+# under version control yet (no repository holds gradient-papers/markdown), so the corpus
+# cannot record a fetchable commit for them (citrate-core docs/LICENCE_REVIEW.md 4.8).
+# The v0.5.0 corpus ships without this source. Restore the block below once the papers
+# have their own repository:
+#
+# [[source]]
+# id = "gradient-papers"
+# tenant = "citrate-docs"
+# kind = "docs"
+# root = "gradient-papers/markdown"
+# repo = "gradient-papers"
+# repo_path = "markdown"
+# upstream = "Citrate Inc., The Gradient Papers v3"
+# license = "Citrate Inc. (first party)"
+# licence_cleared = true
+# licence_note = "first party research series"
+# commit = "git"
+# extensions = ["md"]
 
 # ---- methodology tenant ----------------------------------------------------
 
