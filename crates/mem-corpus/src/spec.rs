@@ -38,6 +38,15 @@ pub struct SourceSpec {
     pub kind: SourceKind,
     /// Directory relative to the sources base.
     pub root: String,
+    /// The repository this source is cited as (corpus format 2): every node's
+    /// `source_ref.repo`. Defaults to `id`.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Where `root` sits inside that repository (e.g. `content` for the
+    /// citrate-docs pages), so node paths are repository-relative citations.
+    /// Empty when `root` is the repository root.
+    #[serde(default)]
+    pub repo_path: String,
     /// Upstream location, for the manifest and NOTICE.
     pub upstream: String,
     /// SPDX-style licence expression or a short description of it.
@@ -79,6 +88,13 @@ pub struct SourceSpec {
     /// `skills`: the `[[source]].label` in the lock this source corresponds to.
     #[serde(default)]
     pub lock_source: Option<String>,
+}
+
+impl SourceSpec {
+    /// The repository this source's nodes cite (`repo`, else `id`).
+    pub fn cite_repo(&self) -> &str {
+        self.repo.as_deref().unwrap_or(&self.id)
+    }
 }
 
 /// A whole corpus spec.
@@ -139,6 +155,19 @@ impl CorpusSpec {
             }
             crate::walk::check_relative(&s.root)
                 .map_err(|e| CorpusError::Spec(format!("source {:?} root: {e}", s.id)))?;
+            let repo = s.cite_repo();
+            if repo.is_empty()
+                || repo.contains(|c: char| c == ':' || c == '#' || c == '|' || c.is_whitespace())
+            {
+                return Err(CorpusError::Spec(format!(
+                    "source {:?}: repo {repo:?} must be a plain name (no ':', '#', '|' or spaces)",
+                    s.id
+                )));
+            }
+            if !s.repo_path.is_empty() {
+                crate::walk::check_relative(&s.repo_path)
+                    .map_err(|e| CorpusError::Spec(format!("source {:?} repo_path: {e}", s.id)))?;
+            }
             for f in &s.include {
                 crate::walk::check_relative(f)
                     .map_err(|e| CorpusError::Spec(format!("source {:?} include: {e}", s.id)))?;
@@ -216,6 +245,40 @@ extensions = ["md"]
         assert!(CorpusSpec::from_toml(&format!("{MIN}\nsurprise = 1\n")).is_err());
         let dup = format!("{MIN}\n{}", &MIN[MIN.find("[[source]]").unwrap()..]);
         assert!(CorpusSpec::from_toml(&dup).is_err());
+    }
+
+    #[test]
+    fn cite_repo_defaults_to_the_id_and_must_be_plain() {
+        let s = CorpusSpec::from_toml(MIN).unwrap();
+        assert_eq!(s.sources[0].cite_repo(), "docs");
+        assert_eq!(s.sources[0].repo_path, "");
+        let named = MIN.replace(
+            "root = \"docs\"",
+            "root = \"docs\"\nrepo = \"citrate-docs\"\nrepo_path = \"content\"",
+        );
+        let s = CorpusSpec::from_toml(&named).unwrap();
+        assert_eq!(s.sources[0].cite_repo(), "citrate-docs");
+        assert_eq!(s.sources[0].repo_path, "content");
+        for bad in ["a:b", "a#b", "a b", "", "a|b"] {
+            let t = MIN.replace(
+                "root = \"docs\"",
+                &format!("root = \"docs\"\nrepo = {bad:?}"),
+            );
+            assert!(
+                CorpusSpec::from_toml(&t).is_err(),
+                "repo {bad:?} must be refused"
+            );
+        }
+        for bad in ["../up", "/abs"] {
+            let t = MIN.replace(
+                "root = \"docs\"",
+                &format!("root = \"docs\"\nrepo_path = {bad:?}"),
+            );
+            assert!(
+                CorpusSpec::from_toml(&t).is_err(),
+                "repo_path {bad:?} must be refused"
+            );
+        }
     }
 
     #[test]

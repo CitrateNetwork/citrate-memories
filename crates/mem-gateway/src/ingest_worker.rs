@@ -132,6 +132,13 @@ fn mirror_base() -> PathBuf {
 /// Drain every queued event once: coalesce to unique repos, then mirror + ingest
 /// each under the write lock. A failure on one repo is logged and skipped; it does
 /// not block the others or crash the worker.
+///
+/// **Canonical first.** Two passes: (1) the default-branch ingest of EVERY queued
+/// repo, then (2) the in-flight branch layer (ADR-09) for each. The canonical
+/// graph is what recall serves by default and what the freshness banner reports;
+/// the branch layer can be large (dozens of stacked feature branches) and used to
+/// run between repos, so one busy repo's branches delayed every other repo's
+/// default-branch freshness by minutes. Each step still holds `write_gate`.
 pub fn drain_once(state: &AppState, base: &Path) -> usize {
     let repos: Vec<String> = {
         let mut q = match state.ingest_queue.lock() {
@@ -147,7 +154,14 @@ pub fn drain_once(state: &AppState, base: &Path) -> usize {
         }
         out
     };
+    let ingestor_for = |repo: &str| match &state.embedder {
+        Some(e) => Ingestor::with_embedder(repo.to_string(), Box::new(SharedEmbedder(e.clone()))),
+        None => Ingestor::new(repo.to_string()),
+    };
+
+    // Pass 1 — canonical (default branch) for every queued repo.
     let mut ingested = 0;
+    let mut mirrored: Vec<(String, PathBuf)> = Vec::new();
     for repo in repos {
         let path = match ensure_mirror(base, &repo) {
             Ok(p) => p,
@@ -156,33 +170,41 @@ pub fn drain_once(state: &AppState, base: &Path) -> usize {
                 continue;
             }
         };
-        let ingestor = match &state.embedder {
-            Some(e) => Ingestor::with_embedder(repo.clone(), Box::new(SharedEmbedder(e.clone()))),
-            None => Ingestor::new(repo.clone()),
-        };
-        // Single-writer: hold the write gate across the ingest.
+        let ingestor = ingestor_for(&repo);
+        {
+            // Single-writer: hold the write gate across the ingest.
+            let _w = match state.write_gate.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            match ingestor.ingest_incremental(&path, &state.store) {
+                Ok(rep) => {
+                    ingested += 1;
+                    tracing::info!(
+                        "mem-ingest: {repo} +{} commits (+{} docs); store now {} nodes, head_count {}, head {}",
+                        rep.commits,
+                        rep.docs,
+                        rep.nodes_in_store,
+                        rep.watermark.head_count,
+                        rep.watermark.head.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("-")
+                    );
+                }
+                Err(e) => tracing::error!("mem-ingest: ingest {repo} failed: {e}"),
+            }
+        }
+        mirrored.push((repo, path));
+    }
+
+    // Pass 2 — ADR-09 B.3 in-flight branch layer, under the same write gate. Ingest
+    // non-default branches, then reap merged/deleted/advanced Branch nodes so
+    // canonical recall promotes merged work automatically. Best-effort: a branch
+    // failure never blocks the canonical ingest above.
+    for (repo, path) in mirrored {
+        let ingestor = ingestor_for(&repo);
         let _w = match state.write_gate.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        match ingestor.ingest_incremental(&path, &state.store) {
-            Ok(rep) => {
-                ingested += 1;
-                tracing::info!(
-                    "mem-ingest: {repo} +{} commits (+{} docs); store now {} nodes, head_count {}",
-                    rep.commits,
-                    rep.docs,
-                    rep.nodes_in_store,
-                    rep.watermark.head_count
-                );
-            }
-            Err(e) => tracing::error!("mem-ingest: ingest {repo} failed: {e}"),
-        }
-
-        // ADR-09 B.3: in-flight branch layer, under the same write gate. Ingest
-        // non-default branches, then reap merged/deleted/advanced Branch nodes so
-        // canonical recall promotes merged work automatically. Best-effort: a branch
-        // failure never blocks the canonical ingest above.
         match ingestor.ingest_branches(&path, &state.store) {
             Ok(r) if r.branches_ingested > 0 => tracing::info!(
                 "mem-ingest: {repo} in-flight +{} branch(es) (+{} commits)",
@@ -217,11 +239,83 @@ fn safe_repo(name: &str) -> Option<String> {
     crate::webhook::allowed_repo(&format!("{}/{}", allowed_owner(), name.trim()))
 }
 
+/// The control-plane repo whose `manifest.toml` names every federation repo.
+const MANIFEST_REPO: &str = "citrate-federation";
+
+/// Parse the federation `manifest.toml` for the repos the reconciler should keep
+/// current: every `[repos.<name>]` / `[repos."<name>"]` table that is NOT marked
+/// `archived = true` (frozen repos never move; ingesting a never-ingested archive
+/// would only burn embedder time). Names are validated by the caller via
+/// `safe_repo`, so a hostile manifest line can never reach `git` or a path.
+///
+/// A deliberately tiny line parser (no TOML dependency): the manifest's repo
+/// tables are flat `key = value` blocks, and only the header + `archived` key
+/// matter here. Anything unrecognized is ignored — fail-safe toward "fewer repos",
+/// never toward an unvalidated name.
+pub fn manifest_repos(manifest: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<(String, bool)> = None;
+    let flush = |cur: &mut Option<(String, bool)>, out: &mut Vec<String>| {
+        if let Some((name, archived)) = cur.take() {
+            if !archived {
+                out.push(name);
+            }
+        }
+    };
+    for raw in manifest.lines() {
+        // Strip trailing comments (repo names / `archived` never contain '#').
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            flush(&mut current, &mut out);
+            let header = line.trim_start_matches('[').trim_end_matches(']').trim();
+            if line.starts_with("[[") {
+                continue; // array-of-tables ([[drift]]) — not a repo
+            }
+            if let Some(name) = header.strip_prefix("repos.") {
+                let name = name.trim().trim_matches('"').trim();
+                if !name.is_empty() {
+                    current = Some((name.to_string(), false));
+                }
+            }
+            continue;
+        }
+        if let Some((_, archived)) = current.as_mut() {
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim() == "archived" && v.trim() == "true" {
+                    *archived = true;
+                }
+            }
+        }
+    }
+    flush(&mut current, &mut out);
+    out
+}
+
+/// Repos named by the federation manifest, read from the gateway's OWN mirror of
+/// `citrate-federation` (kept fresh by the same sweep) or from
+/// `MEM_INGEST_MANIFEST` (a file path; `off` disables manifest discovery). This is
+/// what makes a repo newly added to the manifest get its FIRST ingest with no
+/// webhook and no operator action (design §Trigger 2: "the very first ingest of a
+/// new repo"). Missing/unreadable manifest → empty (the other sources still apply).
+fn manifest_repo_set(base: &Path) -> Vec<String> {
+    let path = match std::env::var("MEM_INGEST_MANIFEST") {
+        Ok(v) if v.trim() == "off" => return Vec::new(),
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
+        _ => base.join(MANIFEST_REPO).join("manifest.toml"),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) => manifest_repos(&s),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// The set of federation repos to keep current: every repo we've already mirrored
-/// (i.e. ingested at least once) plus an explicit `MEM_INGEST_REPOS` list (comma or
-/// whitespace separated). The env list is how repos that have *no webhook* — or
-/// were never touched — still get swept, which is what makes coverage complete
-/// rather than best-effort. New repos also enter naturally on their first webhook.
+/// (i.e. ingested at least once), every non-archived repo in the federation
+/// manifest (Rule 11: the manifest is canonical), plus an explicit
+/// `MEM_INGEST_REPOS` list (comma or whitespace separated). The manifest + env
+/// sources are how repos that have *no webhook* — or were never touched — still
+/// get swept, which is what makes coverage complete rather than best-effort. The
+/// control-plane repo itself is always included so the manifest stays fresh.
 fn federation_repos(base: &Path) -> Vec<String> {
     let mut set = std::collections::BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(base) {
@@ -239,6 +333,16 @@ fn federation_repos(base: &Path) -> Vec<String> {
                 if let Some(name) = safe_repo(name) {
                     set.insert(name);
                 }
+            }
+        }
+    }
+    if std::env::var("MEM_INGEST_MANIFEST").map(|v| v.trim() != "off").unwrap_or(true) {
+        if let Some(name) = safe_repo(MANIFEST_REPO) {
+            set.insert(name);
+        }
+        for name in manifest_repo_set(base) {
+            if let Some(name) = safe_repo(&name) {
+                set.insert(name);
             }
         }
     }
@@ -480,6 +584,172 @@ mod tests {
 
         std::env::remove_var("MEM_INGEST_GIT_BASE");
         std::env::remove_var("MEM_INGEST_REPOS");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const MANIFEST_FIXTURE: &str = r#"
+version = "1"
+[federation]
+org = "CitrateNetwork"
+org_defaults = ".github"
+
+[repos.citrate-chain]
+tier = "1"
+rev = "abc"  # pinned
+
+[repos.".github"]
+tier = "meta"
+
+[repos.citrate-monorepo-archive]
+tier = "archive"
+archived = true   # frozen
+
+[repos.citrate-new-thing]
+role = "added later"
+
+[repos."../../etc"]
+role = "hostile"
+
+[[drift]]
+consumer = "citrate-sdk-js"
+dep_repo = "citrate-chain"
+"#;
+
+    #[test]
+    fn manifest_repos_parses_active_tables_only() {
+        let got = manifest_repos(MANIFEST_FIXTURE);
+        // Raw parse keeps order and does NOT validate (the caller does); archived
+        // tables, [federation], and [[drift]] arrays never appear.
+        assert_eq!(got, vec!["citrate-chain", ".github", "citrate-new-thing", "../../etc"]);
+        assert!(!got.iter().any(|r| r == "citrate-monorepo-archive"), "archived repos are excluded");
+        assert!(manifest_repos("").is_empty());
+        assert!(manifest_repos("[repos.]\narchived = false\n").is_empty(), "empty name ignored");
+    }
+
+    #[test]
+    fn federation_repos_includes_manifest_and_rejects_unsafe_names() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("mem-manifest-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&base);
+        // The manifest lives in the gateway's own citrate-federation mirror.
+        std::fs::create_dir_all(base.join(MANIFEST_REPO)).unwrap();
+        std::fs::write(base.join(MANIFEST_REPO).join("manifest.toml"), MANIFEST_FIXTURE).unwrap();
+        std::env::remove_var("MEM_INGEST_REPOS");
+        std::env::remove_var("MEM_INGEST_MANIFEST");
+
+        let repos = federation_repos(&base);
+        assert!(repos.contains(&"citrate-new-thing".to_string()), "never-mirrored manifest repo is swept");
+        assert!(repos.contains(&".github".to_string()));
+        assert!(repos.contains(&MANIFEST_REPO.to_string()), "control plane always swept");
+        assert!(!repos.contains(&"citrate-monorepo-archive".to_string()));
+        assert!(!repos.iter().any(|r| r.contains('/')), "path-traversal name never reaches git: {repos:?}");
+
+        // Opt-out: MEM_INGEST_MANIFEST=off restores the mirrors+env-only behaviour.
+        std::env::set_var("MEM_INGEST_MANIFEST", "off");
+        let repos = federation_repos(&base);
+        assert!(!repos.contains(&"citrate-new-thing".to_string()));
+        std::env::remove_var("MEM_INGEST_MANIFEST");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reconcile_enqueues_manifest_repo_with_no_mirror_or_webhook() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("mem-manifest-rec-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&root);
+        let remotes = root.join("remotes");
+        make_remote(&remotes, "citrate-fresh");
+        let manifest = root.join("manifest.toml");
+        std::fs::write(&manifest, "[repos.citrate-fresh]\ntier = \"2\"\n").unwrap();
+
+        std::env::set_var("MEM_INGEST_GIT_BASE", remotes.to_string_lossy().to_string());
+        std::env::set_var("MEM_INGEST_MANIFEST", manifest.to_string_lossy().to_string());
+        std::env::remove_var("MEM_INGEST_REPOS");
+
+        let store = MemoryDagStore::new(Box::new(mem_store::kv::InMemoryKv::new()));
+        let queue: Mutex<VecDeque<PushEvent>> = Mutex::new(VecDeque::new());
+        let base = root.join("mirrors");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // No mirror, no env list, no webhook — the manifest alone gets it its first
+        // ingest. (citrate-federation has no local remote here → logged + skipped.)
+        assert_eq!(reconcile_into_queue(&store, &queue, &base), 1);
+        assert_eq!(queue.lock().unwrap().front().unwrap().repo, "citrate-fresh");
+
+        std::env::remove_var("MEM_INGEST_GIT_BASE");
+        std::env::remove_var("MEM_INGEST_MANIFEST");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A minimal gateway state over an in-memory store (no auth surface is used).
+    fn drain_state() -> AppState {
+        use std::sync::RwLock;
+        AppState {
+            store: Arc::new(MemoryDagStore::new(Box::new(mem_store::kv::InMemoryKv::new()))),
+            embedder: None,
+            index_cache: Arc::new(mem_query::TenantIndexCache::new()),
+            write_gate: Arc::new(Mutex::new(())),
+            audit: Arc::new(Mutex::new(mem_authz::AuditChain::new())),
+            signing_key: crate::auth::signing_key_from_seed("drain-test-seed"),
+            control: Arc::new(RwLock::new(crate::control::Control { orgs: vec![], memberships: vec![] })),
+            org_id: Arc::new("o".into()),
+            store_path: Arc::new("mem".into()),
+            chain_rpc: None,
+            issuer: Arc::new("drain".into()),
+            oidc: None,
+            connect_secret: None,
+            allow_dev_auth: false,
+            control_path: Arc::new("/nonexistent/control.json".into()),
+            team_allowlist_path: None,
+            layout_cache: Arc::new(Mutex::new(None)),
+            ingest_queue: Arc::new(Mutex::new(VecDeque::new())),
+            byom_limits: Arc::new(crate::http::ByomLimits::default()),
+        }
+    }
+
+    #[test]
+    fn drain_ingests_canonical_for_all_repos_then_branch_layer() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("mem-drain-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&root);
+        let remotes = root.join("remotes");
+        // Repo A carries an in-flight feature branch; repo B is default-only.
+        let a = make_remote(&remotes, "citrate-a");
+        run(&["-C", &a, "checkout", "-q", "-b", "feat/z"]);
+        std::fs::write(remotes.join("citrate-a.git").join("z.txt"), "z").unwrap();
+        run(&["-C", &a, "add", "."]);
+        run(&["-C", &a, "commit", "-q", "-m", "wip z"]);
+        run(&["-C", &a, "checkout", "-q", "-"]);
+        make_remote(&remotes, "citrate-b");
+        std::env::set_var("MEM_INGEST_GIT_BASE", remotes.to_string_lossy().to_string());
+
+        let state = drain_state();
+        for r in ["citrate-a", "citrate-b", "citrate-a"] {
+            state.ingest_queue.lock().unwrap().push_back(PushEvent {
+                repo: r.into(),
+                git_ref: "refs/heads/HEAD".into(),
+                after: String::new(),
+            });
+        }
+        let base = root.join("mirrors");
+        assert_eq!(drain_once(&state, &base), 2, "duplicates coalesce; both repos ingested");
+        assert!(state.ingest_queue.lock().unwrap().is_empty());
+        for r in ["citrate-a", "citrate-b"] {
+            let wm = Ingestor::new(r.to_string()).read_watermark(&state.store).unwrap();
+            assert!(wm.and_then(|w| w.head).is_some(), "{r} canonical watermark stamped");
+        }
+        let bw = Ingestor::new("citrate-a".to_string())
+            .read_branch_watermark(&state.store, "feat/z")
+            .unwrap();
+        assert!(bw.is_some(), "branch layer still runs after the canonical pass");
+
+        std::env::remove_var("MEM_INGEST_GIT_BASE");
         let _ = std::fs::remove_dir_all(&root);
     }
 

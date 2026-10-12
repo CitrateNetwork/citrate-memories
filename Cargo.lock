@@ -1744,6 +1744,7 @@ dependencies = [
 name = "mem-corpus"
 version = "0.0.1"
 dependencies = [
+ "half",
  "hex",
  "mem-core",
  "mem-index",

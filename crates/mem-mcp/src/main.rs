@@ -119,8 +119,9 @@ const STORE_KEY_ENV: &str = "CITRATE_MEM_STORE_KEY";
 const IDENTITY_LABEL: &[u8] = b"mem-mcp:daemon-identity:v1";
 
 /// The daemon's signing identity, derived from the keyring-held wrapping key, or
-/// ephemeral when the seam is unset. See "Identity" in the module docs.
-fn daemon_identity() -> SigningKey {
+/// ephemeral when the seam is unset. See "Identity" in the module docs. Fails only
+/// when the OS random source cannot seed the ephemeral identity.
+fn daemon_identity() -> Result<SigningKey, String> {
     match std::env::var(STORE_KEY_ENV).ok().and_then(|k| {
         let raw = hex::decode(k.trim()).ok()?;
         (!raw.is_empty()).then_some(raw)
@@ -130,7 +131,7 @@ fn daemon_identity() -> SigningKey {
             h.update(IDENTITY_LABEL);
             h.update(&(raw.len() as u64).to_le_bytes());
             h.update(&raw);
-            SigningKey::from_bytes(h.finalize().as_bytes())
+            Ok(SigningKey::from_bytes(h.finalize().as_bytes()))
         }
         None => {
             eprintln!(
@@ -138,8 +139,9 @@ fn daemon_identity() -> SigningKey {
                  (reads unaffected; authored writes get a per-process author)"
             );
             let mut seed = [0u8; 32];
-            getrandom::getrandom(&mut seed).expect("OS randomness");
-            SigningKey::from_bytes(&seed)
+            getrandom::getrandom(&mut seed)
+                .map_err(|e| format!("OS randomness unavailable: {e}"))?;
+            Ok(SigningKey::from_bytes(&seed))
         }
     }
 }
@@ -287,10 +289,38 @@ fn import_corpus_main(args: &[String]) -> i32 {
         None => Arc::new(mem_index::HashingEmbedder::new(mem_query::EMBED_DIM)),
     };
     let dir = std::path::Path::new(dir);
-    match mem_corpus::progress::import_dir_with_progress(&store, dir, embedder.as_ref(), &mut stdout) {
+    // Precomputed corpus vectors are reused only for the exact weights that made
+    // them: hash the pinned model file the embedder just loaded.
+    let weights = bge_weights_sha256(embedder.as_ref());
+    match mem_corpus::progress::import_dir_with_progress_reusing(
+        &store,
+        dir,
+        embedder.as_ref(),
+        weights.as_deref(),
+        &mut stdout,
+    ) {
         Ok(_) => 0,
         Err(_) => 1,
     }
+}
+
+/// sha256 of `$CITRATE_BGE_MODEL_DIR/model.safetensors` when the import embeds
+/// with BGE from that pinned directory (the app's bundled model); `None` for any
+/// other embedder or source, which makes the importer embed every node itself.
+#[cfg(feature = "transformer")]
+fn bge_weights_sha256(embedder: &dyn Embedder) -> Option<String> {
+    if embedder.model_id() != mem_index::transformer::DEFAULT_MODEL_ID {
+        return None;
+    }
+    let dir = std::env::var("CITRATE_BGE_MODEL_DIR").ok().filter(|d| !d.is_empty())?;
+    let bytes = std::fs::read(std::path::Path::new(&dir).join("model.safetensors")).ok()?;
+    Some(mem_corpus::sha256_hex(&bytes))
+}
+
+/// Without the transformer feature the importer never embeds with BGE.
+#[cfg(not(feature = "transformer"))]
+fn bge_weights_sha256(_embedder: &dyn Embedder) -> Option<String> {
+    None
 }
 
 fn main() {
@@ -302,7 +332,13 @@ fn main() {
     let sock = std::env::args().nth(2).unwrap_or_else(|| "./data/memdag.sock".to_string());
 
     // One identity for this daemon process (see "Identity" in the module docs).
-    let identity = daemon_identity();
+    let identity = match daemon_identity() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("mem-mcp: cannot create the daemon identity: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // DB first: this is the singleton lock. If another daemon is live, we exit
     // here and never touch its socket.

@@ -78,6 +78,10 @@ pub enum SyncError {
     /// (MEM-B-001). Fail closed: the whole bundle is refused.
     #[error("merge denied: grant issuer is not the trusted grant root")]
     UntrustedIssuer,
+    /// The OS random source could not seed the ephemeral trusted-ingest key
+    /// (`trusted_local_grant`). Nothing is merged.
+    #[error("OS randomness unavailable: {0}")]
+    Entropy(String),
 }
 
 /// Map a tenant `repo` to the capability-grant resource id. MUST match the MCP
@@ -369,7 +373,7 @@ pub fn merge_bundle(
 /// deterministic git/markdown ingestor). Naming the trust decision keeps it
 /// auditable and greppable — a federation/transport caller must NEVER use this;
 /// it must pass the connecting peer's real [`CapabilityGrant`] to [`merge_bundle`].
-pub fn trusted_local_grant() -> CapabilityGrant {
+pub fn trusted_local_grant() -> Result<CapabilityGrant, SyncError> {
     use ed25519_dalek::SigningKey;
     use mem_authz::{PolicyProfile, ResourceScope};
     // A throwaway, process-local signing key — the grant is self-issued and
@@ -382,7 +386,7 @@ pub fn trusted_local_grant() -> CapabilityGrant {
     // key is functionally identical while removing a hardcoded, known signing key
     // from the tree. Mirrors `mem-mcp`'s ephemeral-identity fallback.
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).expect("OS randomness for trusted-local grant key");
+    getrandom::getrandom(&mut seed).map_err(|e| SyncError::Entropy(e.to_string()))?;
     let sk = SigningKey::from_bytes(&seed);
     let mut g = CapabilityGrant {
         id: "mem-sync:trusted-local-ingest".into(),
@@ -401,7 +405,7 @@ pub fn trusted_local_grant() -> CapabilityGrant {
         signature: vec![],
     };
     g.sign_with(&sk);
-    g
+    Ok(g)
 }
 
 /// Convenience for in-process, already-trusted ingest: [`merge_bundle`] with the
@@ -413,7 +417,7 @@ pub fn merge_bundle_trusted(
     bundle: &SyncBundle,
 ) -> Result<MergeOutcome, SyncError> {
     // Self-issued grant: it IS its own trust root (MEM-B-004).
-    let grant = trusted_local_grant();
+    let grant = trusted_local_grant()?;
     let root = grant.issuer_pubkey.clone();
     merge_bundle(store, bundle, &grant, &root, 0)
 }

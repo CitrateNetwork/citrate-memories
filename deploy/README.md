@@ -103,6 +103,52 @@ curl -s -o /dev/null -w '%{http_code}\n' https://<PUBLIC_HOSTNAME>/api/orgs/<ORG
 curl -s https://<PUBLIC_HOSTNAME>/api/orgs/<ORG>/layout -H "Authorization: Bearer <id_token>" | jq .node_count
 ```
 
+## 8. Auto-ingest — keeping the graph current (MEM-S7)
+
+There is **no separate cron/timer to install**: the poller ("Trigger 2" in
+`PLANSET/06_AUTO_INGEST_FEED.md`) runs *inside* mem-gateway, because the gateway
+is the store's single RocksDB writer. An external timer would either have to
+stop the gateway to take the lock (recurring downtime) or duplicate this loop.
+
+- **Reconciler (WP-7.4):** at startup and every `MEM_INGEST_RECONCILE_SECS`
+  (default 300 s) it `git ls-remote`s each federation repo's `HEAD` + branch tips
+  and compares them to the stored per-tenant `Watermark.head` / branch watermarks.
+  Drifted repos are enqueued.
+- **Repo set:** every repo already mirrored, every non-`archived` `[repos.*]`
+  table in the federation manifest (read from the gateway's own
+  `citrate-federation` mirror, or `MEM_INGEST_MANIFEST=<path>`; `off` disables),
+  plus `MEM_INGEST_REPOS` (comma/space list). Names are validated against
+  `MEM_ALLOWED_OWNER` (default `CitrateNetwork`) and a strict charset before
+  reaching `git`. So a repo added to the manifest gets its first ingest within
+  one sweep, with no webhook needed.
+- **Drain (WP-7.3):** every 15 s the single writer coalesces the queue, then
+  runs a **canonical pass** (default-branch `ingest_incremental` for every queued
+  repo), then the in-flight **branch pass** (ADR-09). The branch pass can't delay
+  default-branch freshness. Vectors already stored for a node id are reused
+  (same model tag + dim), so re-deriving known commits/docs costs point reads,
+  not embed calls.
+- **Mirrors:** `MEM_INGEST_MIRROR_DIR` (default `~/.cache/mem-gateway/mirrors`),
+  cloned from `MEM_INGEST_GIT_BASE` (default `git@github.com:CitrateNetwork`),
+  hard-reset to `origin/HEAD`. Ingest never reads an operator's working clone.
+- **Webhook (WP-7.2, optional, real-time):** `POST /webhook/github`, HMAC-verified
+  with `MEM_INGEST_WEBHOOK_SECRET` (fail-closed when unset). This is optional:
+  the reconciler alone bounds staleness to about one sweep plus the drain time.
+- **Logs:** journald (`journalctl -u mem-gateway | grep -E 'reconcile|mem-ingest'`).
+  Each canonical ingest logs `head <sha12>`. No secrets are logged.
+
+**Freshness check (read-only, never touches the live lock):**
+
+```bash
+cargo build -p mem-ingest --example freshness --features rocksdb --release
+SNAP=$(mktemp -d)/snap; cp -r ./data/federation.bge.memdag "$SNAP" && rm -f "$SNAP/LOCK"
+./target/release/examples/freshness "$SNAP"     # repo<TAB>head<TAB>head_count<TAB>ingested_at_ms
+git ls-remote git@github.com:CitrateNetwork/<repo>.git refs/heads/main   # compare
+```
+
+**Backup before maintenance:** stop the gateway (about 2 s), `cp -a` the store dir to
+a timestamped sibling, then start it again. Never `cargo clean` or delete `target/`: the
+unit's `ExecStart` is the dev build.
+
 ## Job 2 — inference credential (optional)
 
 If you front an OpenAI-compatible inference endpoint, mint a key there and read

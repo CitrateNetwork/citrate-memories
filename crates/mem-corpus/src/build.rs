@@ -17,7 +17,7 @@ use crate::lock::{Ship, SkillsLock};
 use crate::manifest::{FileEntry, Manifest, SkippedEntry, SourceEntry, TenantEntry};
 use crate::spec::{CorpusSpec, SourceKind, SourceSpec};
 use crate::walk::{self, Refusal};
-use crate::{sha256_hex, CorpusError, FORMAT, KNOWLEDGE_TENANTS, TENANTS_DIR};
+use crate::{sha256_hex, CorpusError, FORMAT, KNOWLEDGE_TENANTS};
 
 /// Edge asserter recorded on every corpus edge.
 pub const CORPUS_ASSERTER: &str = "corpus";
@@ -45,6 +45,8 @@ pub struct TenantFile {
 pub struct BuiltCorpus {
     pub manifest: Manifest,
     pub tenants: Vec<TenantFile>,
+    /// Precomputed vectors per tenant ([`embed_vectors`]); empty unless embedded.
+    pub vector_files: Vec<TenantFile>,
     /// The exact bytes of the skills.lock the build checked against.
     pub skills_lock: Option<Vec<u8>>,
 }
@@ -121,18 +123,16 @@ pub fn build_corpus(spec_text: &str, opts: &BuildOptions) -> Result<BuiltCorpus,
             nodes: g.nodes.into_values().collect(),
             edges: g.edges.into_values().collect(),
         };
-        let mut bytes = bundle
-            .to_json()
-            .map_err(|e| CorpusError::Serde(e.to_string()))?
-            .into_bytes();
+        let mut bytes = crate::bundle::encode(&bundle)?.into_bytes();
         bytes.push(b'\n');
-        let rel_path = format!("{TENANTS_DIR}/{tenant}.syncbundle.json");
+        let rel_path = crate::tenant_file(tenant);
         tenant_entries.push(TenantEntry {
             tenant: (*tenant).to_string(),
             file: rel_path.clone(),
             sha256: sha256_hex(&bytes),
             nodes: bundle.nodes.len(),
             edges: bundle.edges.len(),
+            vectors: None,
         });
         tenants.push(TenantFile {
             tenant: (*tenant).to_string(),
@@ -156,8 +156,70 @@ pub fn build_corpus(spec_text: &str, opts: &BuildOptions) -> Result<BuiltCorpus,
     Ok(BuiltCorpus {
         manifest,
         tenants,
+        vector_files: Vec::new(),
         skills_lock: lock_bytes,
     })
+}
+
+/// Embed every node of a built corpus with `embedder` and attach the vectors
+/// (see [`crate::vectors`]): one `tenants/<tenant>.vectors.f16` per tenant, in
+/// the tenant file's node order, recorded in the manifest with the model id,
+/// dimension and `weights_sha256` (the sha256 of the model weights file), and
+/// the manifest digest recomputed. Node text is embedded exactly as the importer
+/// would embed it. `on_progress(tenant, done, total)` reports each node.
+pub fn embed_vectors(
+    built: &mut BuiltCorpus,
+    embedder: &dyn mem_index::Embedder,
+    weights_sha256: &str,
+    mut on_progress: impl FnMut(&str, usize, usize),
+) -> Result<(), CorpusError> {
+    let dim = embedder.dim();
+    if dim == 0 || dim > crate::vectors::MAX_DIM {
+        return Err(CorpusError::Embed(format!(
+            "unsupported embedding dimension {dim}"
+        )));
+    }
+    let mut files = Vec::with_capacity(built.tenants.len());
+    for t in &built.tenants {
+        let text = std::str::from_utf8(&t.bytes).map_err(|e| CorpusError::Serde(e.to_string()))?;
+        let bundle = crate::bundle::decode(text.trim_end())?;
+        let total = bundle.nodes.len();
+        let mut vectors = Vec::with_capacity(total);
+        for (i, n) in bundle.nodes.iter().enumerate() {
+            let text = String::from_utf8_lossy(&n.content);
+            let v = embedder
+                .embed(&text)
+                .map_err(|e| CorpusError::Embed(e.to_string()))?;
+            vectors.push(v.data);
+            on_progress(&t.tenant, i + 1, total);
+        }
+        let bytes = crate::vectors::encode(&vectors, dim)?;
+        let entry = built
+            .manifest
+            .tenants
+            .iter_mut()
+            .find(|e| e.tenant == t.tenant)
+            .ok_or_else(|| {
+                CorpusError::Serde(format!("tenant {} not in the manifest", t.tenant))
+            })?;
+        let rel_path = crate::vectors::vectors_file(&t.tenant);
+        entry.vectors = Some(crate::vectors::VectorsEntry {
+            file: rel_path.clone(),
+            sha256: sha256_hex(&bytes),
+            encoding: crate::vectors::ENCODING_F16LE.to_string(),
+            model: embedder.model_id().to_string(),
+            dim,
+            weights_sha256: weights_sha256.to_string(),
+        });
+        files.push(TenantFile {
+            tenant: t.tenant.clone(),
+            rel_path,
+            bytes,
+        });
+    }
+    built.vector_files = files;
+    built.manifest.bundle_digest = built.manifest.compute_digest()?;
+    Ok(())
 }
 
 /// Write a built corpus into `out_dir`, which must not exist or be empty.
@@ -169,8 +231,8 @@ pub fn write_corpus(built: &BuiltCorpus, out_dir: &Path) -> Result<(), CorpusErr
             out_dir.display()
         )));
     }
-    std::fs::create_dir_all(out_dir.join(TENANTS_DIR)).map_err(io)?;
-    for t in &built.tenants {
+    std::fs::create_dir_all(out_dir.join(crate::TENANTS_DIR)).map_err(io)?;
+    for t in built.tenants.iter().chain(&built.vector_files) {
         std::fs::write(out_dir.join(&t.rel_path), &t.bytes).map_err(io)?;
     }
     if let Some(lock) = &built.skills_lock {
@@ -195,6 +257,8 @@ fn excluded_entry(source: &SourceSpec, commit: String, reason: String) -> Source
     SourceEntry {
         id: source.id.clone(),
         tenant: source.tenant.clone(),
+        repo: source.cite_repo().to_string(),
+        repo_path: source.repo_path.clone(),
         upstream: source.upstream.clone(),
         commit,
         license: source.license.clone(),
@@ -254,7 +318,7 @@ fn build_source(
         ));
     }
     let commit = if pinned == "git" {
-        resolve_git(&root)
+        resolve_git(&root, &source.include)
     } else {
         pinned
     };
@@ -304,6 +368,8 @@ fn build_source(
     Ok(SourceEntry {
         id: source.id.clone(),
         tenant: source.tenant.clone(),
+        repo: source.cite_repo().to_string(),
+        repo_path: source.repo_path.clone(),
         upstream: source.upstream.clone(),
         commit,
         license: source.license.clone(),
@@ -317,10 +383,15 @@ fn build_source(
     })
 }
 
-/// `HEAD` of the work tree holding `root`, suffixed `-dirty` when anything under
-/// `root` differs from `HEAD` (including untracked files). `"unpinned"` if `root`
-/// is not in a git work tree.
-fn resolve_git(root: &Path) -> String {
+/// `HEAD` of the work tree holding `root`, suffixed `-dirty` when anything the
+/// source reads differs from `HEAD` (including untracked files). `"unpinned"` if
+/// `root` is not in a git work tree.
+///
+/// The dirty check covers exactly what the source reads: its `include` list when
+/// it has one, else the whole `root`. A source that reads one file from a
+/// metarepo root (`agentile` reads `AGENTILE.md`) is then not marked dirty by
+/// untracked child checkouts beside that file, which it never reads.
+fn resolve_git(root: &Path, include: &[String]) -> String {
     let head = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -333,10 +404,20 @@ fn resolve_git(root: &Path) -> String {
         return "unpinned".into();
     }
     let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    let dirty = Command::new("git")
+    let mut status = Command::new("git");
+    status
         .arg("-C")
         .arg(root)
-        .args(["status", "--porcelain", "--", "."])
+        .args(["status", "--porcelain", "--"]);
+    if include.is_empty() {
+        status.arg(".");
+    } else {
+        // Literal pathspecs: an included name is a file, never a glob.
+        for f in include {
+            status.arg(format!(":(literal){f}"));
+        }
+    }
+    let dirty = status
         .output()
         .map(|o| !o.status.success() || !o.stdout.is_empty())
         .unwrap_or(true);
@@ -583,9 +664,10 @@ fn node(
         author: format!("corpus:{}", source.id),
         // `git_sha` carries the file's sha256: the content hash of the exact
         // bytes chunked, which is what makes the id a pure function of the source.
+        // Format 2: a repository-relative citation (`<repo>:<path>`), see `cite`.
         source_ref: SourceRef::Artifact {
-            repo: source.id.clone(),
-            path: rel.to_string(),
+            repo: source.cite_repo().to_string(),
+            path: crate::cite::repo_relative(&source.repo_path, rel),
             git_sha: file_sha.to_string(),
             byte_start: span.0,
             byte_end: span.1,

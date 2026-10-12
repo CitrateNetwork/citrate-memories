@@ -1,14 +1,16 @@
 {
-  "format": "citrate-corpus/1",
+  "format": "citrate-corpus/2",
   "name": "fixture-knowledge",
   "source_date_ms": 1790000000000,
   "builder": "mem-corpus 0.0.1",
-  "spec_sha256": "4a722c0891844b89b53f3991af9db0e394e4e393bdb20f7f07d0f17d8870d8d9",
+  "spec_sha256": "1c37d85f235336badd7ef1fc4c18dc2d0c4d071fa053089aa65083544edbe354",
   "skills_lock_sha256": "6f0fd2d3b53fedcc3a830f06b89acd5a573eb2c52df4ca8849f0d3d1d4404b74",
   "sources": [
     {
       "id": "citrate-docs",
       "tenant": "citrate-docs",
+      "repo": "citrate-docs",
+      "repo_path": "content",
       "upstream": "https://github.com/CitrateNetwork/citrate-docs",
       "commit": "2222222222222222222222222222222222222222",
       "license": "Apache-2.0",
@@ -41,6 +43,8 @@
     {
       "id": "gradient-papers",
       "tenant": "citrate-docs",
+      "repo": "gradient-papers",
+      "repo_path": "",
       "upstream": "Citrate Inc. (first party)",
       "commit": "3333333333333333333333333333333333333333",
       "license": "Citrate Inc. (first party)",
@@ -62,6 +66,8 @@
     {
       "id": "agentile",
       "tenant": "methodology",
+      "repo": "agentile",
+      "repo_path": "",
       "upstream": "Citrate Inc. (first party)",
       "commit": "4444444444444444444444444444444444444444",
       "license": "Apache-2.0",
@@ -83,6 +89,8 @@
     {
       "id": "demo-skills",
       "tenant": "skills",
+      "repo": "demo-skills",
+      "repo_path": "",
       "upstream": "https://example.invalid/demo-skills",
       "commit": "1111111111111111111111111111111111111111",
       "license": "Apache-2.0",
@@ -115,6 +123,8 @@
     {
       "id": "openzeppelin",
       "tenant": "refs",
+      "repo": "openzeppelin",
+      "repo_path": "",
       "upstream": "https://github.com/OpenZeppelin/openzeppelin-contracts",
       "commit": "5555555555555555555555555555555555555555",
       "license": "MIT",
@@ -136,6 +146,8 @@
     {
       "id": "agpl-tool-docs",
       "tenant": "refs",
+      "repo": "agpl-tool-docs",
+      "repo_path": "",
       "upstream": "https://example.invalid/agpl-tool",
       "commit": "unpinned",
       "license": "AGPL-3.0",
@@ -150,6 +162,8 @@
     {
       "id": "absent-book",
       "tenant": "refs",
+      "repo": "absent-book",
+      "repo_path": "",
       "upstream": "https://example.invalid/book",
       "commit": "unpinned",
       "license": "MIT OR Apache-2.0",
@@ -165,32 +179,36 @@
   "tenants": [
     {
       "tenant": "citrate-docs",
-      "file": "tenants/citrate-docs.syncbundle.json",
-      "sha256": "a99ce18ebbb72311fb80e9cc46ec23bb359f1703a8b7ab86e46fc6379f40e458",
+      "file": "tenants/citrate-docs.corpus.json",
+      "sha256": "e3f111794abe1391b9337f29d0d665fe1b42272730dece0ee00a287e7ffb22aa",
       "nodes": 9,
-      "edges": 6
-    },
-    {
-      "tenant": "skills",
-      "file": "tenants/skills.syncbundle.json",
-      "sha256": "b789a4a891817d46f9064088b2c33ca159f2f789b52f90c1d9281285828189b9",
-      "nodes": 5,
-      "edges": 4
-    },
-    {
-      "tenant": "refs",
-      "file": "tenants/refs.syncbundle.json",
-      "sha256": "1e5a00e323367458eb5928e316d68fa574b7261dcbcfc072e55382e89a4559ce",
-      "nodes": 3,
-      "edges": 2
+      "edges": 6,
+      "vectors": null
     },
     {
       "tenant": "methodology",
-      "file": "tenants/methodology.syncbundle.json",
-      "sha256": "a68bcc9eeb9bcca302a2af59d493b4ac8545069ffad86832c238468fb7138446",
+      "file": "tenants/methodology.corpus.json",
+      "sha256": "6b287bd0a95a823b50d2481664077a0211b334fbfda0da56b904dd6116acd1c0",
       "nodes": 2,
-      "edges": 1
+      "edges": 1,
+      "vectors": null
+    },
+    {
+      "tenant": "refs",
+      "file": "tenants/refs.corpus.json",
+      "sha256": "5117826d3da6520647ccf4b004f9c8051b6572c35c05e1893a3c347de449fdbf",
+      "nodes": 3,
+      "edges": 2,
+      "vectors": null
+    },
+    {
+      "tenant": "skills",
+      "file": "tenants/skills.corpus.json",
+      "sha256": "b755f5efc93facbeab50dfcb21e7d21ebe9aa322e6556d2c93ae63105367b61e",
+      "nodes": 5,
+      "edges": 4,
+      "vectors": null
     }
   ],
-  "bundle_digest": "9dfc0e4e64edf264b92c0a86678d21e32efc86d787526c049997ab01003505fe"
+  "bundle_digest": "ab4e8407b2bcf76090b8d2952ae0f81d48b6e6ab8f35d6d874bce036607283b8"
 }

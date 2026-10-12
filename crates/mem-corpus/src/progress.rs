@@ -10,7 +10,7 @@
 //! {"event":"progress","tenant":"citrate-docs","done":9,"total":9}
 //! {"event":"tenant_skipped","tenant":"skills","reason":"already-imported"}
 //! {"event":"tenant_done","tenant":"citrate-docs"}
-//! {"event":"done","bundle_digest":"…","embed_model":"…","nodes_added":19,"nodes_merged":0,"edges_added":13,"tenants_imported":[…],"tenants_skipped":[…]}
+//! {"event":"done","bundle_digest":"…","embed_model":"…","nodes_added":19,"nodes_merged":0,"edges_added":13,"tenants_imported":[…],"tenants_skipped":[…],"nodes_embedded":19,"vectors_reused":0}
 //! {"event":"error","stage":"verify"|"import","message":"…"}
 //! ```
 //!
@@ -25,7 +25,7 @@ use mem_index::Embedder;
 use mem_store::MemoryDagStore;
 use serde_json::{json, Value};
 
-use crate::import::{import_corpus, verify_corpus, ImportEvent, ImportReport};
+use crate::import::{import_corpus_with, verify_corpus, ImportEvent, ImportReport};
 use crate::CorpusError;
 
 fn emit(out: &mut dyn Write, v: Value) {
@@ -40,6 +40,18 @@ pub fn import_dir_with_progress(
     store: &MemoryDagStore<MemoryNode>,
     dir: &Path,
     embedder: &dyn Embedder,
+    out: &mut dyn Write,
+) -> Result<ImportReport, CorpusError> {
+    import_dir_with_progress_reusing(store, dir, embedder, None, out)
+}
+
+/// [`import_dir_with_progress`], reusing precomputed corpus vectors made by the
+/// same embedder weights (`weights_sha256`, see `import::import_corpus_with`).
+pub fn import_dir_with_progress_reusing(
+    store: &MemoryDagStore<MemoryNode>,
+    dir: &Path,
+    embedder: &dyn Embedder,
+    weights_sha256: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<ImportReport, CorpusError> {
     let corpus = match verify_corpus(dir) {
@@ -62,7 +74,7 @@ pub fn import_dir_with_progress(
             "edges": corpus.tenants.iter().map(|(t, _)| t.edges).sum::<usize>(),
         }),
     );
-    let result = import_corpus(store, &corpus, embedder, |ev| {
+    let result = import_corpus_with(store, &corpus, embedder, weights_sha256, |ev| {
         let v = match ev {
             ImportEvent::TenantStart {
                 tenant,
@@ -100,6 +112,8 @@ pub fn import_dir_with_progress(
                     "edges_added": r.edges_added,
                     "tenants_imported": r.tenants_imported,
                     "tenants_skipped": r.tenants_skipped,
+                    "nodes_embedded": r.nodes_embedded,
+                    "vectors_reused": r.vectors_reused,
                 }),
             );
             Ok(r)

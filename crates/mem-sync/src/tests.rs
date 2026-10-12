@@ -997,3 +997,117 @@ fn tripwire_no_binary_enables_the_sync_http_feature() {
     }
     assert!(checked >= 9, "scanned {checked} crate manifests");
 }
+
+/// Rule 8 tripwire: no `.unwrap()` / `.expect(` in mem-sync's production source.
+/// The test module is a separate file (`tests.rs`), so `lib.rs` up to its
+/// terminal `#[cfg(test)]` declaration is entirely production code.
+#[test]
+fn tripwire_rule8_no_unwrap_or_expect_in_production_lib() {
+    let lib = include_str!("lib.rs");
+    let cut = lib.rfind("#[cfg(test)]").unwrap_or(lib.len());
+    let prod = &lib[..cut];
+    // The cut must sit at the module tail, so nothing production-side is skipped.
+    assert!(
+        !prod.contains("#[cfg(test)]"),
+        "lib.rs has more than one cfg(test) block; widen this tripwire"
+    );
+    let unwrap = [".unwrap", "()"].concat();
+    let expect = [".expect", "("].concat();
+    let hits: Vec<(usize, &str)> = prod
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim_start().starts_with("//"))
+        .filter(|(_, l)| l.contains(&unwrap) || l.contains(&expect))
+        .map(|(i, l)| (i + 1, l.trim()))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "Rule 8: unwrap/expect in production lib.rs: {hits:?}"
+    );
+}
+
+#[test]
+fn trusted_local_grant_still_verifies_as_its_own_root() {
+    let g = trusted_local_grant().expect("OS randomness is available in tests");
+    assert_eq!(g.issuer_pubkey.len(), 32);
+    // Two calls draw two distinct ephemeral keys (MEM-B-018).
+    let h = trusted_local_grant().expect("OS randomness is available in tests");
+    assert_ne!(g.issuer_pubkey, h.issuer_pubkey);
+}
+
+/// Rule 8 tripwire across the workspace: no `.unwrap()` / `.expect(` in any crate's
+/// production source (`crates/*/src/**/*.rs`). Test files (`tests.rs`, `*_tests.rs`,
+/// anything under a `tests` directory) are skipped. A file's scan stops at its inline
+/// `#[cfg(test)] mod ... {` (test modules sit at the file tail, and their string
+/// literals make brace counting unreliable); any other `#[cfg(test)]` item (a
+/// test-only helper, or a `mod x;` declaration) is skipped by brace depth, and
+/// production code after it is still checked.
+#[test]
+fn tripwire_rule8_no_unwrap_or_expect_in_workspace_production_sources() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let p = entry.expect("entry").path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if p.is_dir() {
+                if name != "tests" {
+                    walk(&p, out);
+                }
+            } else if name.ends_with(".rs") && name != "tests.rs" && !name.ends_with("_tests.rs") {
+                out.push(p);
+            }
+        }
+    }
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&crates_dir).expect("crates dir") {
+        let src = entry.expect("entry").path().join("src");
+        if src.is_dir() {
+            walk(&src, &mut files);
+        }
+    }
+    assert!(files.len() >= 30, "scanned only {} files", files.len());
+    let unwrap = [".unwrap", "()"].concat();
+    let expect = [".expect", "("].concat();
+    let mut hits = Vec::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f).expect("read source");
+        // Skipping state: None = scanning; Some(depth) = inside a cfg(test) item,
+        // with `depth` open braces (0 until its body opens).
+        let mut skip: Option<(i64, bool)> = None;
+        for (i, l) in text.lines().enumerate() {
+            let t = l.trim();
+            if let Some((depth, opened)) = skip.as_mut() {
+                for c in t.chars() {
+                    match c {
+                        '{' => {
+                            *depth += 1;
+                            *opened = true;
+                        }
+                        '}' => *depth -= 1,
+                        _ => {}
+                    }
+                }
+                // `mod x;` (or any body-less item) ends at its semicolon.
+                if (*opened && *depth <= 0) || (!*opened && t.ends_with(';')) {
+                    skip = None;
+                }
+                continue;
+            }
+            if t == "#[cfg(test)]" {
+                let rest = text.lines().skip(i + 1).map(str::trim).find(|s| !s.is_empty());
+                if rest.is_some_and(|n| n.starts_with("mod ") && n.ends_with('{')) {
+                    break;
+                }
+                skip = Some((0, false));
+                continue;
+            }
+            if t.starts_with("//") {
+                continue;
+            }
+            if l.contains(&unwrap) || l.contains(&expect) {
+                hits.push(format!("{}:{}: {}", f.display(), i + 1, t));
+            }
+        }
+    }
+    assert!(hits.is_empty(), "Rule 8: unwrap/expect in production source:\n{}", hits.join("\n"));
+}
