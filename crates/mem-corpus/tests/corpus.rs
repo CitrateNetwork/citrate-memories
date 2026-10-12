@@ -1032,3 +1032,84 @@ fn json_lines_done_reports_reused_vectors() {
     assert_eq!(last["nodes_embedded"], 0);
     assert!(last["vectors_reused"].as_u64().unwrap() > 0);
 }
+
+// ------------------------------------------------- git provenance (A9, v0.5.0)
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A metarepo root holding one committed file the source reads plus untracked
+/// child checkouts it never reads.
+fn metarepo_spec() -> String {
+    "version = 1\nname = \"git-provenance\"\nmax_chunk_chars = 400\n\n[[source]]\nid = \"agentile\"\ntenant = \"methodology\"\nkind = \"docs\"\nroot = \".\"\nupstream = \"u\"\nlicense = \"MIT\"\nlicence_cleared = true\ncommit = \"git\"\ninclude = [\"AGENTILE.md\"]\n".to_string()
+}
+
+fn metarepo() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTILE.md"),
+        "# Agentile\n\nRead before writing.\n",
+    )
+    .unwrap();
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["add", "AGENTILE.md"]);
+    git(dir.path(), &["commit", "-q", "-m", "init"]);
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    // An untracked child checkout beside the included file.
+    std::fs::create_dir_all(dir.path().join("child-repo")).unwrap();
+    std::fs::write(dir.path().join("child-repo/README.md"), "child\n").unwrap();
+    (dir, head)
+}
+
+fn agentile_commit(spec: &str, base: &Path) -> String {
+    let m = build_corpus(spec, &opts(base)).unwrap().manifest;
+    m.sources
+        .iter()
+        .find(|s| s.id == "agentile")
+        .unwrap()
+        .commit
+        .clone()
+}
+
+#[test]
+fn include_source_ignores_untracked_siblings_it_never_reads() {
+    let (dir, head) = metarepo();
+    assert_eq!(agentile_commit(&metarepo_spec(), dir.path()), head);
+}
+
+#[test]
+fn include_source_is_dirty_when_an_included_file_changes() {
+    let (dir, head) = metarepo();
+    std::fs::write(dir.path().join("AGENTILE.md"), "# Agentile\n\nEdited.\n").unwrap();
+    assert_eq!(
+        agentile_commit(&metarepo_spec(), dir.path()),
+        format!("{head}-dirty")
+    );
+}
+
+#[test]
+fn root_source_without_include_still_sees_untracked_files() {
+    let (dir, head) = metarepo();
+    let spec = metarepo_spec().replace("include = [\"AGENTILE.md\"]\n", "extensions = [\"md\"]\n");
+    assert_eq!(agentile_commit(&spec, dir.path()), format!("{head}-dirty"));
+}
