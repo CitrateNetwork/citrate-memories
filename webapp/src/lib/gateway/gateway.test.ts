@@ -130,6 +130,20 @@ describe("gateway client", () => {
     expect(r.orgs[0].name).toBe("Citrate Federation");
   });
 
+  // Without a verified bearer and without the explicit dev opt-in, the client
+  // must send NEITHER credential header, so the gateway fails closed (401)
+  // instead of being handed an unauthenticated impersonation string.
+  it("sends no credential header when the caller has no bearer and dev-sub is off", async () => {
+    delete process.env.MEM_GATEWAY_DEV_SUB;
+    lastDevSub = null;
+    lastAuth = null;
+    const { gateway } = await import("./client");
+    await gateway.listOrgs({ sub: "did:citrate:aleia" }).catch(() => undefined);
+    await gateway.listOrgs({ sub: "did:citrate:aleia", token: null }).catch(() => undefined);
+    expect(lastDevSub, "no x-dev-sub fallback when the bearer is missing").toBeNull();
+    expect(lastAuth).toBeNull();
+  });
+
   it("uses x-dev-sub ONLY when MEM_GATEWAY_DEV_SUB=1 is set", async () => {
     process.env.MEM_GATEWAY_DEV_SUB = "1";
     lastDevSub = null;
