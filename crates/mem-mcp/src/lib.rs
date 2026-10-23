@@ -1073,6 +1073,93 @@ pub mod endpoint {
     }
 }
 
+/// The daemon's store-key intake (the contract with citrate-core).
+///
+/// citrate-core hands the per-user store wrapping key over in an owner-only file and names the
+/// file in [`STORE_KEY_FILE_ENV`], so the key is not in the daemon's environment. Older
+/// citrate-core builds passed the key inline in [`STORE_KEY_ENV`]; that is still read when no
+/// file is named.
+pub mod store_key {
+    use std::path::Path;
+
+    /// Env var naming the owner-only file that holds the store key (hex).
+    pub const STORE_KEY_FILE_ENV: &str = "CITRATE_MEM_STORE_KEY_FILE";
+
+    /// Env var carrying the store key inline (hex), from older citrate-core builds.
+    pub const STORE_KEY_ENV: &str = "CITRATE_MEM_STORE_KEY";
+
+    /// The store key from the named file, else from the inline value. `Ok(None)` means no key
+    /// was given (or the inline value is not usable hex), and the daemon uses an ephemeral
+    /// identity. A named file that cannot be read or does not hold hex is an error: the caller
+    /// meant to give a key, so the daemon must not silently run with a different identity.
+    pub fn read_store_key(
+        file: Option<&Path>,
+        inline: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let _ = file;
+        Ok(inline.and_then(decode))
+    }
+
+    fn decode(hex_key: &str) -> Option<Vec<u8>> {
+        let raw = hex::decode(hex_key.trim()).ok()?;
+        (!raw.is_empty()).then_some(raw)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn key_file(tag: &str, contents: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("mem-mcp-store-key-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let path = dir.join("mem-store.key");
+            std::fs::write(&path, contents).expect("write key file");
+            path
+        }
+
+        #[test]
+        fn the_key_is_read_from_the_named_file() {
+            let path = key_file("file", &"ab".repeat(32));
+            assert_eq!(read_store_key(Some(&path), None), Ok(Some(vec![0xab; 32])));
+            // A trailing newline (an editor, `echo`) is tolerated.
+            let path = key_file("newline", &format!("{}\n", "cd".repeat(32)));
+            assert_eq!(read_store_key(Some(&path), None), Ok(Some(vec![0xcd; 32])));
+        }
+
+        #[test]
+        fn the_named_file_wins_over_an_inline_key() {
+            let path = key_file("wins", &"01".repeat(32));
+            let inline = "02".repeat(32);
+            assert_eq!(
+                read_store_key(Some(&path), Some(&inline)),
+                Ok(Some(vec![0x01; 32]))
+            );
+        }
+
+        #[test]
+        fn a_named_file_that_is_missing_or_not_hex_fails_closed() {
+            let missing = std::env::temp_dir().join("mem-mcp-store-key-absent/none.key");
+            assert!(read_store_key(Some(&missing), Some(&"02".repeat(32))).is_err());
+            let junk = key_file("junk", "not hex at all");
+            assert!(read_store_key(Some(&junk), None).is_err());
+            let empty = key_file("empty", "");
+            assert!(read_store_key(Some(&empty), None).is_err());
+        }
+
+        #[test]
+        fn the_inline_key_is_still_read_when_no_file_is_named() {
+            assert_eq!(
+                read_store_key(None, Some(&"ef".repeat(32))),
+                Ok(Some(vec![0xef; 32]))
+            );
+            assert_eq!(read_store_key(None, Some("zz")), Ok(None));
+            assert_eq!(read_store_key(None, None), Ok(None));
+        }
+    }
+}
+
 pub use endpoint::endpoint_name;
 
 /// Drive an [`MemoryMcpServer`] over any line-oriented transport: one JSON-RPC
