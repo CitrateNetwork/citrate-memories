@@ -42,7 +42,20 @@ def parse(text: str) -> tuple[list[str], date | None]:
 
 def evaluate(text: str, reported: set[str], today: date) -> list[str]:
     """Every reason the ignore file is not honest. Empty means ok."""
-    return []  # stub: no rule enforced yet
+    ignored, expiry = parse(text)
+    if not ignored:
+        return []
+    problems = []
+    if expiry is None:
+        problems.append("audit.toml has ignores but no `# EXPIRES: YYYY-MM-DD` line")
+    elif today > expiry:
+        problems.append(f"the accepted advisories EXPIRED on {expiry}: re-decide each "
+                        f"one, then move the date. Do not renew by reflex.")
+    stale = [i for i in ignored if i not in reported]
+    if stale:
+        problems.append("ignored but no longer reported, delete from .cargo/audit.toml: "
+                        + ", ".join(stale))
+    return problems
 
 
 def unfiltered_report() -> set[str]:
