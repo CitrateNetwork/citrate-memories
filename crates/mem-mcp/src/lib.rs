@@ -1101,9 +1101,12 @@ pub mod store_key {
         };
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read the store key file {}: {e}", path.display()))?;
-        decode(&text)
-            .map(Some)
-            .ok_or_else(|| format!("the store key file {} does not hold a hex key", path.display()))
+        decode(&text).map(Some).ok_or_else(|| {
+            format!(
+                "the store key file {} does not hold a hex key",
+                path.display()
+            )
+        })
     }
 
     fn decode(hex_key: &str) -> Option<Vec<u8>> {
@@ -1122,7 +1125,67 @@ pub mod store_key {
             std::fs::create_dir_all(&dir).expect("temp dir");
             let path = dir.join("mem-store.key");
             std::fs::write(&path, contents).expect("write key file");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("owner-only");
+            }
             path
+        }
+
+        /// A key file that is readable by group or others is refused, whatever it holds.
+        #[cfg(unix)]
+        #[test]
+        fn a_key_file_open_to_group_or_others_is_refused() {
+            use std::os::unix::fs::PermissionsExt;
+            for mode in [0o644, 0o640, 0o604, 0o660, 0o666] {
+                let path = key_file(&format!("mode{mode:o}"), &"ab".repeat(32));
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+                let r = read_store_key(Some(&path), None);
+                assert!(r.is_err(), "mode {mode:o} accepted: {r:?}");
+            }
+        }
+
+        /// A symbolic link at the key path is refused (even to an owner-only key file), and so is
+        /// anything that is not a regular file.
+        #[cfg(unix)]
+        #[test]
+        fn a_key_path_that_is_a_link_or_not_a_regular_file_is_refused() {
+            let real = key_file("link-target", &"ab".repeat(32));
+            let link = real.with_file_name("link.key");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(
+                read_store_key(Some(&link), None).is_err(),
+                "a link was followed"
+            );
+            let dir = real.parent().unwrap().join("a-dir");
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(
+                read_store_key(Some(&dir), None).is_err(),
+                "a directory was read"
+            );
+            // The owner-only regular file itself is still accepted.
+            assert_eq!(read_store_key(Some(&real), None), Ok(Some(vec![0xab; 32])));
+        }
+
+        /// The key is exactly 32 bytes (what citrate-core writes); any other length is refused
+        /// from a file, and ignored inline (ephemeral identity).
+        #[test]
+        fn a_key_that_is_not_32_bytes_is_refused() {
+            for len in [1usize, 16, 31, 33, 64] {
+                let path = key_file(&format!("len{len}"), &"ab".repeat(len));
+                assert!(
+                    read_store_key(Some(&path), None).is_err(),
+                    "{len} bytes accepted"
+                );
+                assert_eq!(
+                    read_store_key(None, Some(&"ab".repeat(len))),
+                    Ok(None),
+                    "{len} inline"
+                );
+            }
         }
 
         #[test]
