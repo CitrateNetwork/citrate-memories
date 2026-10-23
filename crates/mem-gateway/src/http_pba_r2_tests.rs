@@ -755,3 +755,116 @@ async fn ghsa_p545_puppet_signed_proposal_cannot_be_self_confirmed() {
         tool_rpc("memory.confirm_edge", json!({"from_prefix": pnode.compute_id().to_hex()[..16], "to_prefix": v3id.to_hex()[..16], "kind": "supersedes"}))).await;
     assert_eq!(app.store.get_node(&v3id).unwrap().unwrap().status, Status::Active, "GHSA-p545 variant: puppet node + proposal");
 }
+
+// ---------------------------------------------------------------------------
+// Audit fail-closed at the HTTP entry point
+// ---------------------------------------------------------------------------
+
+/// An allowed read whose audit record cannot be persisted must NOT be served:
+/// the handler returns 500 and no tenant content leaves the gateway. The audit
+/// chain is a real on-disk chain in a private temp dir; making that dir
+/// read-only makes the head-sidecar write (part of every append) fail.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_is_refused_when_the_audit_append_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("mem-gw-audit-{}-{}", std::process::id(), now_ms()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let chain = AuditChain::open(dir.join("audit.jsonl")).expect("open audit chain");
+
+    let (store, _a) = cross_tenant_store();
+    let mut app = app_with(store, vec![member("alice", &["tenant-a"], false)], None);
+    app.audit = Arc::new(Mutex::new(chain));
+
+    // Control: with a writable audit dir the read is served and audited.
+    let ok = recall(State(app.clone()), Path(ORG.into()), q(&[("repo", "tenant-a")]), dev("alice")).await;
+    assert!(ok.is_ok(), "control: audited read is served");
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Running as a user that ignores directory permissions (root) cannot
+    // exercise the failure; detect that and skip rather than pass vacuously.
+    let probe = dir.join("probe");
+    let perms_enforced = std::fs::File::create(&probe).is_err();
+    let res = if perms_enforced {
+        Some(recall(State(app.clone()), Path(ORG.into()), q(&[("repo", "tenant-a")]), dev("alice")).await)
+    } else {
+        let _ = std::fs::remove_file(&probe);
+        None
+    };
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    match res {
+        None => eprintln!("skipped: directory permissions not enforced for this user"),
+        Some(r) => {
+            let status = r.err().map(|e| e.status);
+            assert_eq!(status, Some(StatusCode::INTERNAL_SERVER_ERROR), "an unauditable read must fail closed");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BYOM entry point: connect-token attenuation and subject binding
+// ---------------------------------------------------------------------------
+
+fn assert_rpc(repo: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"memory.assert","arguments":{"repo": repo, "content":"owner note via byom","kind":"rationale"}}})
+}
+
+/// An OrgOwner (full `*` read+write membership) presenting a READ-scoped connect
+/// token must not be able to write through `/mcp/u/:sub`: the handler applies
+/// the token's attenuation, not the bare membership grant.
+#[tokio::test]
+async fn byom_read_token_cannot_write_even_for_an_owner() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let owner = Membership { sub: "olga".into(), org: ORG.into(), role: Role::OrgOwner, scopes: vec![], parent: None };
+    let app = app_with(store, vec![owner], Some(secret));
+    let before = app.store.node_count().unwrap();
+    let body = byom_call(&app, "olga", byom_headers(secret, "olga", "read"), assert_rpc("tenant-a")).await;
+    assert!(body.contains("\"isError\":true"), "a read-scoped token must not write: {body}");
+    assert_eq!(app.store.node_count().unwrap(), before, "nothing was written");
+    // Control: the same owner with a write-capable token can write.
+    let body = byom_call(&app, "olga", byom_headers(secret, "olga", "read,propose"), assert_rpc("tenant-a")).await;
+    assert!(body.contains("\"isError\":false"), "control: write-scoped token writes: {body}");
+}
+
+/// A valid connect token for one principal cannot be used on another
+/// principal's BYOM path (no acting-as another member).
+#[tokio::test]
+async fn byom_token_subject_must_match_the_path() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let app = app_with(
+        store,
+        vec![member("mallory", &["tenant-a"], false), member("alice", &["tenant-a", "tenant-b"], false)],
+        Some(secret),
+    );
+    let r = byom(State(app.clone()), Path("alice".into()), byom_headers(secret, "mallory", "read"), recall_line(1)).await;
+    assert_eq!(r.err().map(|e| e.status), Some(StatusCode::FORBIDDEN), "mallory's token on alice's path");
+}
+
+/// The gateway-minted connect token is read-only and short-lived (15 minutes).
+#[tokio::test]
+async fn connect_token_route_mints_read_only_short_lived_token() {
+    let (store, _) = cross_tenant_store();
+    let secret = "connect-secret";
+    let app = app_with(store, vec![member("alice", &["tenant-a"], true)], Some(secret));
+    let before_s = now_ms() / 1000;
+    let v = match connect_token(State(app.clone()), dev("alice")).await {
+        Ok(j) => j.0,
+        Err(e) => panic!("connect_token failed: {}", e.status),
+    };
+    assert_eq!(v["scope"], "read");
+    assert_eq!(v["expires_in"], 15 * 60);
+    let tok = v["connect_token"].as_str().unwrap();
+    let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    val.validate_aud = false;
+    let claims = jsonwebtoken::decode::<Value>(tok, &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()), &val)
+        .unwrap()
+        .claims;
+    assert_eq!(claims["scope"], "read", "minted token claims read only: {claims}");
+    let exp = claims["exp"].as_u64().unwrap();
+    assert!(exp <= before_s + 15 * 60 + 5, "token lifetime must be ~15 minutes, exp={exp} now={before_s}");
+}
