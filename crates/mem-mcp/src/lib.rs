@@ -1096,8 +1096,14 @@ pub mod store_key {
         file: Option<&Path>,
         inline: Option<&str>,
     ) -> Result<Option<Vec<u8>>, String> {
-        let _ = file;
-        Ok(inline.and_then(decode))
+        let Some(path) = file else {
+            return Ok(inline.and_then(decode));
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read the store key file {}: {e}", path.display()))?;
+        decode(&text)
+            .map(Some)
+            .ok_or_else(|| format!("the store key file {} does not hold a hex key", path.display()))
     }
 
     fn decode(hex_key: &str) -> Option<Vec<u8>> {
