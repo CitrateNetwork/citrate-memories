@@ -1073,6 +1073,212 @@ pub mod endpoint {
     }
 }
 
+/// The daemon's store-key intake (the contract with citrate-core).
+///
+/// citrate-core hands the per-user store wrapping key over in an owner-only file and names the
+/// file in [`STORE_KEY_FILE_ENV`], so the key is not in the daemon's environment. Older
+/// citrate-core builds passed the key inline in [`STORE_KEY_ENV`]; that is still read when no
+/// file is named.
+pub mod store_key {
+    use std::path::Path;
+
+    /// Env var naming the owner-only file that holds the store key (hex).
+    pub const STORE_KEY_FILE_ENV: &str = "CITRATE_MEM_STORE_KEY_FILE";
+
+    /// Env var carrying the store key inline (hex), from older citrate-core builds.
+    pub const STORE_KEY_ENV: &str = "CITRATE_MEM_STORE_KEY";
+
+    /// The store key from the named file, else from the inline value. `Ok(None)` means no key
+    /// was given (or the inline value is not usable hex), and the daemon uses an ephemeral
+    /// identity. A named file that cannot be read or does not hold hex is an error: the caller
+    /// meant to give a key, so the daemon must not silently run with a different identity.
+    pub fn read_store_key(
+        file: Option<&Path>,
+        inline: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let Some(path) = file else {
+            return Ok(inline.and_then(decode));
+        };
+        let text = read_owner_only(path)?;
+        decode(&text).map(Some).ok_or_else(|| {
+            format!(
+                "the store key file {} does not hold a {KEY_LEN}-byte hex key",
+                path.display()
+            )
+        })
+    }
+
+    /// The store key length citrate-core writes (`STORE_KEY_LEN`).
+    pub const KEY_LEN: usize = 32;
+
+    fn decode(hex_key: &str) -> Option<Vec<u8>> {
+        let raw = hex::decode(hex_key.trim()).ok()?;
+        (raw.len() == KEY_LEN).then_some(raw)
+    }
+
+    /// Read the key file, refusing anything but a regular file (a symbolic link is not followed)
+    /// that, on Unix, belongs to this user and is closed to group and others. The checks run on
+    /// the opened file itself, so the path cannot be swapped between the check and the read.
+    fn read_owner_only(path: &Path) -> Result<String, String> {
+        use std::io::Read as _;
+        let shown = path.display();
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        if std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!("the store key file {shown} is a link"));
+        }
+        let f = opts
+            .open(path)
+            .map_err(|e| format!("cannot open the store key file {shown}: {e}"))?;
+        let meta = f
+            .metadata()
+            .map_err(|e| format!("cannot read the store key file {shown}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("the store key file {shown} is not a regular file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            if meta.uid() != euid {
+                return Err(format!("the store key file {shown} belongs to another user"));
+            }
+            if meta.mode() & 0o077 != 0 {
+                return Err(format!("the store key file {shown} is readable by other users"));
+            }
+        }
+        let mut text = String::new();
+        f.take(4096)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("cannot read the store key file {shown}: {e}"))?;
+        Ok(text)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn key_file(tag: &str, contents: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir()
+                .join(format!("mem-mcp-store-key-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let path = dir.join("mem-store.key");
+            std::fs::write(&path, contents).expect("write key file");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("owner-only");
+            }
+            path
+        }
+
+        /// A key file that is readable by group or others is refused, whatever it holds.
+        #[cfg(unix)]
+        #[test]
+        fn a_key_file_open_to_group_or_others_is_refused() {
+            use std::os::unix::fs::PermissionsExt;
+            for mode in [0o644, 0o640, 0o604, 0o660, 0o666] {
+                let path = key_file(&format!("mode{mode:o}"), &"ab".repeat(32));
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+                let r = read_store_key(Some(&path), None);
+                assert!(r.is_err(), "mode {mode:o} accepted: {r:?}");
+            }
+        }
+
+        /// A symbolic link at the key path is refused (even to an owner-only key file), and so is
+        /// anything that is not a regular file.
+        #[cfg(unix)]
+        #[test]
+        fn a_key_path_that_is_a_link_or_not_a_regular_file_is_refused() {
+            let real = key_file("link-target", &"ab".repeat(32));
+            let link = real.with_file_name("link.key");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(
+                read_store_key(Some(&link), None).is_err(),
+                "a link was followed"
+            );
+            let dir = real.parent().unwrap().join("a-dir");
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(
+                read_store_key(Some(&dir), None).is_err(),
+                "a directory was read"
+            );
+            // The owner-only regular file itself is still accepted.
+            assert_eq!(read_store_key(Some(&real), None), Ok(Some(vec![0xab; 32])));
+        }
+
+        /// The key is exactly 32 bytes (what citrate-core writes); any other length is refused
+        /// from a file, and ignored inline (ephemeral identity).
+        #[test]
+        fn a_key_that_is_not_32_bytes_is_refused() {
+            for len in [1usize, 16, 31, 33, 64] {
+                let path = key_file(&format!("len{len}"), &"ab".repeat(len));
+                assert!(
+                    read_store_key(Some(&path), None).is_err(),
+                    "{len} bytes accepted"
+                );
+                assert_eq!(
+                    read_store_key(None, Some(&"ab".repeat(len))),
+                    Ok(None),
+                    "{len} inline"
+                );
+            }
+        }
+
+        #[test]
+        fn the_key_is_read_from_the_named_file() {
+            let path = key_file("file", &"ab".repeat(32));
+            assert_eq!(read_store_key(Some(&path), None), Ok(Some(vec![0xab; 32])));
+            // A trailing newline (an editor, `echo`) is tolerated.
+            let path = key_file("newline", &format!("{}\n", "cd".repeat(32)));
+            assert_eq!(read_store_key(Some(&path), None), Ok(Some(vec![0xcd; 32])));
+        }
+
+        #[test]
+        fn the_named_file_wins_over_an_inline_key() {
+            let path = key_file("wins", &"01".repeat(32));
+            let inline = "02".repeat(32);
+            assert_eq!(
+                read_store_key(Some(&path), Some(&inline)),
+                Ok(Some(vec![0x01; 32]))
+            );
+        }
+
+        #[test]
+        fn a_named_file_that_is_missing_or_not_hex_fails_closed() {
+            let missing = std::env::temp_dir().join("mem-mcp-store-key-absent/none.key");
+            assert!(read_store_key(Some(&missing), Some(&"02".repeat(32))).is_err());
+            let junk = key_file("junk", "not hex at all");
+            assert!(read_store_key(Some(&junk), None).is_err());
+            let empty = key_file("empty", "");
+            assert!(read_store_key(Some(&empty), None).is_err());
+        }
+
+        #[test]
+        fn the_inline_key_is_still_read_when_no_file_is_named() {
+            assert_eq!(
+                read_store_key(None, Some(&"ef".repeat(32))),
+                Ok(Some(vec![0xef; 32]))
+            );
+            assert_eq!(read_store_key(None, Some("zz")), Ok(None));
+            assert_eq!(read_store_key(None, None), Ok(None));
+        }
+    }
+}
+
 pub use endpoint::endpoint_name;
 
 /// Drive an [`MemoryMcpServer`] over any line-oriented transport: one JSON-RPC

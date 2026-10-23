@@ -1824,6 +1824,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "interprocess",
+ "libc",
  "mem-assert",
  "mem-authz",
  "mem-core",
