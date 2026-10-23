@@ -868,3 +868,49 @@ async fn connect_token_route_mints_read_only_short_lived_token() {
     let exp = claims["exp"].as_u64().unwrap();
     assert!(exp <= before_s + 15 * 60 + 5, "token lifetime must be ~15 minutes, exp={exp} now={before_s}");
 }
+
+// ---------------------------------------------------------------------------
+// HTTP read budget clamp and per-principal authorship at /assert
+// ---------------------------------------------------------------------------
+
+/// An out-of-range `budget` (above the 500 cap) falls back to the handler's
+/// default instead of returning the whole tenant.
+#[tokio::test]
+async fn recall_budget_above_cap_falls_back_to_default() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let owner = Asserter::for_principal(&gw, "owner");
+    for i in 0..20 {
+        store.put_node(&owner.assert_node("tenant-a", NodeKind::Rationale, &format!("note {i}"), 1 + i)).unwrap();
+    }
+    let app = app_with(store, vec![member("alice", &["tenant-a"], false)], None);
+    let v = match recall(State(app.clone()), Path(ORG.into()), q(&[("repo", "tenant-a"), ("budget", "100000")]), dev("alice")).await {
+        Ok(j) => j.0,
+        Err(e) => panic!("recall failed: {}", e.status),
+    };
+    assert_eq!(v["count"], 15, "budget above the cap must fall back to the default: {}", v["count"]);
+    let v = match recall(State(app), Path(ORG.into()), q(&[("repo", "tenant-a"), ("budget", "3")]), dev("alice")).await {
+        Ok(j) => j.0,
+        Err(e) => panic!("recall failed: {}", e.status),
+    };
+    assert_eq!(v["count"], 3, "an in-range budget is honoured");
+}
+
+/// `/assert` signs under the authenticated principal's sub-identity, never the
+/// shared gateway key, so authorship names the actor.
+#[tokio::test]
+async fn http_assert_is_authored_by_the_principal_not_the_gateway() {
+    let store = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+    let app = app_with(store, vec![member("alice", &["tenant-a"], true)], None);
+    let body = AssertBody { repo: "tenant-a".into(), content: "alice's rationale".into(), kind: None, valid_from: None };
+    let v = match assert(State(app.clone()), Path(ORG.into()), dev("alice"), Json(body)).await {
+        Ok(j) => j.0,
+        Err(e) => panic!("assert failed: {}", e.status),
+    };
+    let nodes = app.store.all_nodes().unwrap();
+    assert_eq!(nodes.len(), 1, "{v}");
+    let gw = signing_key_from_seed("l6b-test-seed");
+    let want = Asserter::for_principal(&gw, "alice");
+    assert_eq!(nodes[0].author, want.pubkey_hex(), "author must be alice's sub-identity");
+    assert_ne!(nodes[0].author, hex::encode(gw.verifying_key().to_bytes()), "author must not be the gateway key");
+}

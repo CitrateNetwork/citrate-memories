@@ -1319,4 +1319,18 @@ mod tests {
         assert!(!needs_second_party(EdgeKind::AnalogousTo));
         assert!(!needs_second_party(EdgeKind::References));
     }
+
+    /// The per-principal sub-identity depends on every byte of the subject (not
+    /// just its length) and on the gateway secret: equal-length subjects and
+    /// different gateway keys all yield distinct authors.
+    #[test]
+    fn principal_subkey_binds_subject_bytes_and_gateway_secret() {
+        let gw1 = SigningKey::from_bytes(&[9u8; 32]);
+        let gw2 = SigningKey::from_bytes(&[10u8; 32]);
+        let a = Asserter::for_principal(&gw1, "did:alice");
+        let b = Asserter::for_principal(&gw1, "did:alicf"); // same length, one byte apart
+        assert_ne!(a.pubkey_hex(), b.pubkey_hex(), "equal-length subjects must not share an author");
+        let a2 = Asserter::for_principal(&gw2, "did:alice");
+        assert_ne!(a.pubkey_hex(), a2.pubkey_hex(), "the sub-identity must depend on the gateway secret");
+    }
 }

@@ -772,4 +772,46 @@ mod transport_tests {
         let ok = PeerAuth::new(&root, PEER_ID, &r).expect("valid");
         assert_eq!(ok.audience, PEER_ID);
     }
+
+    /// A credential the trust root itself signed AS revoked is refused, even
+    /// though its signature is valid.
+    #[test]
+    fn issuer_signed_revoked_credential_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        peer.commit(&[derived_node("citrate-chain", "private tip")], &[]).unwrap();
+        let root = crate::tests::trust_root();
+        let mut g = peer_grant(&["citrate-chain"], false);
+        g.revoked = true;
+        g.sign_with(&ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]));
+        assert!(g.verify_signature().is_ok(), "precondition: validly signed");
+        let get = format!("GET /bundle/citrate-chain HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n", encode_credential(&g).unwrap());
+        let c = raw_request(addr, get);
+        serve_one(&listener, &peer, &auth(&root, &none())).unwrap();
+        let resp = c.join().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 401"), "revoked credential served: {resp}");
+        assert!(!resp.contains("private tip"));
+    }
+
+    /// A merge whose declared body exceeds the cap is refused with 413 before
+    /// any body is read, even for an authorized peer.
+    #[test]
+    fn oversized_merge_is_refused_before_reading() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let peer = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+        let root = crate::tests::trust_root();
+        let g = peer_grant(&["citrate-chain"], true);
+        let req = format!(
+            "POST /merge HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+            encode_credential(&g).unwrap(),
+            MAX_BODY_BYTES + 1
+        );
+        let c = raw_request(addr, req);
+        let label = serve_one(&listener, &peer, &auth(&root, &none())).unwrap();
+        let resp = c.join().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 413"), "oversized merge not refused: {resp}");
+        assert_eq!(label.as_deref(), Some("POST /merge (rejected: too large)"));
+    }
 }

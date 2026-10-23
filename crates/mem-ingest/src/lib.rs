@@ -1482,4 +1482,21 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Refutes is authority-bearing exactly like Supersedes: from an author not
+    /// on the authoritative list it is recorded but quarantined, and from an
+    /// authoritative author it is load-bearing.
+    #[test]
+    fn refutes_trailer_is_authority_gated() {
+        let body = "details\n\nAgentile-Refutes: adr:001";
+        let recs = vec![rec("aaa", &[], "contest an earlier decision", body)];
+        let (_, edges) = build_graph("r", &recs, 1, &embedder()).unwrap();
+        let refutes: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Refutes).collect();
+        assert_eq!(refutes.len(), 1, "the edge is recorded");
+        assert!(refutes[0].quarantined, "an unauthoritative refutation is quarantined");
+        let (_, edges) = build_graph_gated("r", &recs, 1, &embedder(), &authoritative()).unwrap();
+        let refutes: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Refutes).collect();
+        assert_eq!(refutes.len(), 1);
+        assert!(!refutes[0].quarantined, "control: an authoritative refutation is load-bearing");
+    }
 }
