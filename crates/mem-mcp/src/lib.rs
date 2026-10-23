@@ -2772,4 +2772,167 @@ mod tests {
         assert_eq!(call_json(&mut as_mal, "memory.propose_edge", a.clone())["isError"], false);
         assert_eq!(call_json(&mut as_mal, "memory.confirm_edge", a)["isError"], false);
     }
+
+    /// A presented grant whose embedded issuer key IS the trust root but whose
+    /// signature does not cover its (widened) contents must be rejected: the
+    /// issuer-key comparison alone is not proof the trust root signed it.
+    #[test]
+    fn meta_grant_naming_trust_root_with_tampered_body_is_rejected() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let mut g = grant_scoped("repo:citrate-chain/memory", "agent:test", &trust_key());
+        // Widen after signing: issuer_pubkey and recipient still match the session.
+        g.allowed_resources[0].resource_id = "*".into();
+        g.allowed_resources[0].can_write = true;
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "memory.recall",
+                "arguments": { "repo": "citrate-chain" },
+                "_meta": { "ai.citrate/grant": g }
+            }
+        })
+        .to_string();
+        let v: Value = serde_json::from_str(&srv.handle_line(&call).unwrap()).unwrap();
+        assert_eq!(v["error"]["code"], GRANT_REJECTED, "tampered trust-root grant must be rejected: {v}");
+    }
+
+    /// A self-signed grant that names the session principal (so the recipient
+    /// check passes) must still be rejected because its issuer is not the trust
+    /// root.
+    #[test]
+    fn self_signed_meta_grant_for_the_session_principal_is_rejected() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let rogue = SigningKey::from_bytes(&[9u8; 32]);
+        let g = grant_scoped("repo:citrate-chain/memory", "agent:test", &rogue);
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "memory.recall",
+                "arguments": { "repo": "citrate-chain" },
+                "_meta": { "ai.citrate/grant": g }
+            }
+        })
+        .to_string();
+        let v: Value = serde_json::from_str(&srv.handle_line(&call).unwrap()).unwrap();
+        assert_eq!(v["error"]["code"], GRANT_REJECTED, "untrusted issuer must be rejected: {v}");
+    }
+
+    /// With a NARROW session grant (citrate-chain only), a legitimate trust-root
+    /// grant for the same principal that claims `*` must not widen the session:
+    /// the effective authority is the intersection, so citrate-identity stays
+    /// denied while citrate-chain stays allowed.
+    #[test]
+    fn meta_grant_cannot_widen_a_narrow_session_grant() {
+        let s = store();
+        let mut srv = MemoryMcpServer::new(&s, grant());
+        let wide = grant_scoped("*", "agent:test", &trust_key());
+        let call = |repo: &str| {
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "memory.recall",
+                    "arguments": { "repo": repo },
+                    "_meta": { "ai.citrate/grant": wide.clone() }
+                }
+            })
+            .to_string()
+        };
+        let other: Value = serde_json::from_str(&srv.handle_line(&call("citrate-identity")).unwrap()).unwrap();
+        assert_eq!(other["result"]["isError"], true, "a wider _meta grant must not reach citrate-identity: {other}");
+        let own: Value = serde_json::from_str(&srv.handle_line(&call("citrate-chain")).unwrap()).unwrap();
+        assert_eq!(own["result"]["isError"], false, "the in-scope repo stays readable: {own}");
+    }
+
+    /// A zero-node diff whose edge touches a tenant the session cannot write must
+    /// be refused by the endpoint authorization, and nothing may land.
+    #[test]
+    fn merge_diff_edge_into_unwritable_tenant_is_denied() {
+        let s = store();
+        let nodes = s.all_nodes().unwrap();
+        let chain = nodes.iter().find(|n| n.repo == "citrate-chain").unwrap().compute_id();
+        let ident = nodes.iter().find(|n| n.repo == "citrate-identity").unwrap().compute_id();
+        let a = asserter();
+        let mut diff = MemoryDiff::new(a.pubkey_hex(), 1);
+        diff.edges.push(a.propose_edge(chain, ident, EdgeKind::AnalogousTo, EdgeMethod::Nlp, None, 1));
+        // write on citrate-chain only
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": diff.to_json().unwrap()}));
+        assert_eq!(r["isError"], true, "{}", text_of(&r));
+        assert!(text_of(&r).starts_with("authorization denied"), "{}", text_of(&r));
+        assert!(s.out_edges(&chain).unwrap().is_empty(), "no edge may land in a tenant the caller cannot write");
+    }
+
+    /// An edge whose endpoint is neither in the diff nor in the store cannot be
+    /// attributed to a tenant, so it cannot be authorized: refuse, write nothing.
+    #[test]
+    fn merge_diff_edge_to_unknown_node_is_refused() {
+        let s = store();
+        let chain = s.all_nodes().unwrap().into_iter().find(|n| n.repo == "citrate-chain").unwrap().compute_id();
+        let unknown = mem_core::ContentHash([0xEE; 32]);
+        let a = asserter();
+        let mut diff = MemoryDiff::new(a.pubkey_hex(), 1);
+        diff.edges.push(a.propose_edge(chain, unknown, EdgeKind::AnalogousTo, EdgeMethod::Nlp, None, 1));
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": diff.to_json().unwrap()}));
+        assert!(text_of(&r).starts_with("edge references unknown node"), "{}", text_of(&r));
+        assert!(s.out_edges(&chain).unwrap().is_empty());
+    }
+
+    /// The node-count cap is enforced even when the payload is under the byte cap.
+    #[test]
+    fn merge_diff_node_count_cap() {
+        let s = store();
+        let a = asserter();
+        let mut diff = MemoryDiff::new(a.pubkey_hex(), 1);
+        for i in 0..10_001u32 {
+            let mut n = node("c", "");
+            n.content = i.to_le_bytes().to_vec();
+            n.embedding = None;
+            diff.nodes.push(n);
+        }
+        let js = diff.to_json().unwrap();
+        assert!(js.len() <= 4 * 1024 * 1024, "precondition: under the byte cap ({} bytes)", js.len());
+        let before = s.node_count().unwrap();
+        let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+        let r = call_json(&mut srv, "memory.merge_diff", json!({"diff": js}));
+        assert!(text_of(&r).starts_with("diff exceeds size cap"), "{}", text_of(&r));
+        assert_eq!(s.node_count().unwrap(), before);
+    }
+
+    /// Prefix resolution for propose_edge must ignore tenants the session cannot
+    /// read: a foreign node sharing the prefix must not change the outcome.
+    #[test]
+    fn propose_edge_prefix_resolution_ignores_unreadable_tenants() {
+        let own = node("citrate-chain", "own chain note");
+        let other = node("citrate-chain", "second chain note");
+        let own_hex = own.compute_id().to_hex();
+        let mut i = 0;
+        let foreign = loop {
+            let n = node("citrate-identity", &format!("foreign identity note {i}"));
+            if n.compute_id().to_hex()[..3] == own_hex[..3] {
+                break n;
+            }
+            i += 1;
+        };
+        let mut outcomes = Vec::new();
+        for with_foreign in [false, true] {
+            let s = MemoryDagStore::new(Box::new(InMemoryKv::new()));
+            s.put_node(&own).unwrap();
+            s.put_node(&other).unwrap();
+            if with_foreign {
+                s.put_node(&foreign).unwrap();
+            }
+            let mut srv = MemoryMcpServer::new_with_asserter(&s, write_grant(), asserter());
+            let r = call_json(
+                &mut srv,
+                "memory.propose_edge",
+                json!({"from_prefix": &own_hex[..3], "to_prefix": &other.compute_id().to_hex()[..12], "kind": "analogous_to"}),
+            );
+            assert_eq!(r["isError"], false, "foreign={with_foreign}: {}", text_of(&r));
+            outcomes.push(text_of(&r));
+        }
+        assert_eq!(outcomes[0], outcomes[1], "outcome must not depend on unreadable tenants");
+    }
 }

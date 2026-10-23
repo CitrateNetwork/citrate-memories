@@ -1570,4 +1570,28 @@ mod tests {
             ConfirmOutcome::NotFound
         );
     }
+
+    /// The batch path (`commit`, used by diff merges and ingest ticks) must not
+    /// let a quarantined copy demote a confirmed edge either.
+    #[test]
+    fn batch_commit_cannot_demote_a_confirmed_edge() {
+        let s = store();
+        let (a, b) = (node("a"), node("b"));
+        s.put_node(&a).unwrap();
+        s.put_node(&b).unwrap();
+        let mut canonical = edge(&a, &b, EdgeKind::Implements);
+        canonical.provenance.asserter = "ingest".into();
+        s.add_edge(&canonical).unwrap();
+
+        let mut proposal = edge(&a, &b, EdgeKind::Implements);
+        proposal.quarantined = true;
+        proposal.trust_tier = TrustTier::InferredAdvisory;
+        proposal.provenance.asserter = "mallory".into();
+        s.commit(&[], &[proposal]).unwrap();
+
+        let stored = s.out_edges(&a.compute_id()).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(!stored[0].quarantined, "confirmed edge must not be re-quarantined by a batch commit");
+        assert_eq!(stored[0].provenance.asserter, "ingest", "canonical provenance preserved");
+    }
 }
