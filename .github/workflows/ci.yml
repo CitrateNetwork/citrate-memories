@@ -60,6 +60,12 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: cargo audit
         run: cargo audit
+      # Accepted advisories in .cargo/audit.toml expire and must still be
+      # reported; this fails the job otherwise.
+      - name: audit ignores are honest
+        run: |
+          python3 scripts/check_audit_ignores.py --self-test
+          python3 scripts/check_audit_ignores.py
 
   tla-model-check:
     # WP-0.5 gate: TLC over SupersededDag / Ingestion / Authz. This is where a
