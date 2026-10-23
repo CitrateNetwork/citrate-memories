@@ -1099,19 +1099,69 @@ pub mod store_key {
         let Some(path) = file else {
             return Ok(inline.and_then(decode));
         };
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read the store key file {}: {e}", path.display()))?;
+        let text = read_owner_only(path)?;
         decode(&text).map(Some).ok_or_else(|| {
             format!(
-                "the store key file {} does not hold a hex key",
+                "the store key file {} does not hold a {KEY_LEN}-byte hex key",
                 path.display()
             )
         })
     }
 
+    /// The store key length citrate-core writes (`STORE_KEY_LEN`).
+    pub const KEY_LEN: usize = 32;
+
     fn decode(hex_key: &str) -> Option<Vec<u8>> {
         let raw = hex::decode(hex_key.trim()).ok()?;
-        (!raw.is_empty()).then_some(raw)
+        (raw.len() == KEY_LEN).then_some(raw)
+    }
+
+    /// Read the key file, refusing anything but a regular file (a symbolic link is not followed)
+    /// that, on Unix, belongs to this user and is closed to group and others. The checks run on
+    /// the opened file itself, so the path cannot be swapped between the check and the read.
+    fn read_owner_only(path: &Path) -> Result<String, String> {
+        use std::io::Read as _;
+        let shown = path.display();
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        if std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!("the store key file {shown} is a link"));
+        }
+        let f = opts
+            .open(path)
+            .map_err(|e| format!("cannot open the store key file {shown}: {e}"))?;
+        let meta = f
+            .metadata()
+            .map_err(|e| format!("cannot read the store key file {shown}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("the store key file {shown} is not a regular file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            if meta.uid() != euid {
+                return Err(format!("the store key file {shown} belongs to another user"));
+            }
+            if meta.mode() & 0o077 != 0 {
+                return Err(format!("the store key file {shown} is readable by other users"));
+            }
+        }
+        let mut text = String::new();
+        f.take(4096)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("cannot read the store key file {shown}: {e}"))?;
+        Ok(text)
     }
 
     #[cfg(test)]
