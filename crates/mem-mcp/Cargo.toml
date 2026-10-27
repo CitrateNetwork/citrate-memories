@@ -31,6 +31,10 @@ getrandom = { workspace = true }
 # so the on-wire transport is byte-identical to the old std UnixListener.
 interprocess = "2"
 
+# The store key file is opened without following a link and checked for owner and mode.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 rocksdb = ["mem-store/rocksdb"]

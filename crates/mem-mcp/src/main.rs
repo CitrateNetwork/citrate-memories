@@ -27,7 +27,9 @@
 //!
 //! ```text
 //! mem-mcp <store-path> <sock-path>
-//! env: CITRATE_MEM_STORE_KEY = <hex>   (optional; see "Identity" below)
+//! env: CITRATE_MEM_STORE_KEY_FILE = <path of an owner-only file holding the hex key>
+//!      (optional; see "Identity" below. CITRATE_MEM_STORE_KEY = <hex> from older
+//!      citrate-core builds is still read when no file is named)
 //! ```
 //!
 //! ```text
@@ -42,7 +44,8 @@
 //!
 //! Positional args only: `MemoryManager::build_spec` passes no lock/socket flags
 //! because the daemon owns both its singleton lock and its stale-socket cleanup.
-//! The key travels in the environment, never argv, so it cannot leak via `ps`.
+//! The key travels in an owner-only file named in the environment, never in argv
+//! or the environment itself, so it cannot leak via `ps` or an inherited env.
 //!
 //! # Identity — the shipped binary must not carry a hardcoded key
 //!
@@ -52,8 +55,8 @@
 //! two users apart and any copy of the binary could mint that issuer's grants.
 //!
 //! `citrate-core` mints a per-user store wrapping key in the OS keyring and
-//! passes it as `CITRATE_MEM_STORE_KEY`, documenting it as a "forward-compatible
-//! seam — honoured IFF/when the daemon grows a key intake". This is that intake.
+//! hands it over in the file named by `CITRATE_MEM_STORE_KEY_FILE`
+//! (`mem_mcp::store_key`). This is that intake.
 //! The key is NOT used for encryption (mem-store seals each tenant with its own
 //! key inside the `KEYS` CF; `open_rocksdb_auto` takes only a path) — it seeds a
 //! **domain-separated** ed25519 identity via the same blake3 idiom
@@ -108,11 +111,9 @@ use mem_assert::Asserter;
 use mem_authz::{CapabilityGrant, PolicyProfile, ResourceScope};
 use mem_core::MemoryNode;
 use mem_index::Embedder;
+use mem_mcp::store_key::{read_store_key, STORE_KEY_ENV, STORE_KEY_FILE_ENV};
 use mem_mcp::{endpoint_name, serve_connection, MemoryMcpServer};
 use mem_store::MemoryDagStore;
-
-/// Env var carrying the per-user store wrapping key (hex), set by citrate-core.
-const STORE_KEY_ENV: &str = "CITRATE_MEM_STORE_KEY";
 
 /// Domain separator for the daemon's ed25519 identity. Changing it rotates every
 /// local daemon identity, so treat it as a constant.
@@ -122,10 +123,9 @@ const IDENTITY_LABEL: &[u8] = b"mem-mcp:daemon-identity:v1";
 /// ephemeral when the seam is unset. See "Identity" in the module docs. Fails only
 /// when the OS random source cannot seed the ephemeral identity.
 fn daemon_identity() -> Result<SigningKey, String> {
-    match std::env::var(STORE_KEY_ENV).ok().and_then(|k| {
-        let raw = hex::decode(k.trim()).ok()?;
-        (!raw.is_empty()).then_some(raw)
-    }) {
+    let file = std::env::var_os(STORE_KEY_FILE_ENV).map(std::path::PathBuf::from);
+    let inline = std::env::var(STORE_KEY_ENV).ok();
+    match read_store_key(file.as_deref(), inline.as_deref())? {
         Some(raw) => {
             let mut h = blake3::Hasher::new();
             h.update(IDENTITY_LABEL);
@@ -135,7 +135,7 @@ fn daemon_identity() -> Result<SigningKey, String> {
         }
         None => {
             eprintln!(
-                "mem-mcp: {STORE_KEY_ENV} unset — using an ephemeral daemon identity \
+                "mem-mcp: {STORE_KEY_FILE_ENV} unset — using an ephemeral daemon identity \
                  (reads unaffected; authored writes get a per-process author)"
             );
             let mut seed = [0u8; 32];
