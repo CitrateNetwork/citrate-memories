@@ -1,0 +1,23 @@
+# citrate-memories: accepted advisories, with reasons and an expiry.
+#
+# `cargo audit` stops reporting an advisory once it is listed here, so
+# scripts/check_audit_ignores.py runs in the CI audit step and fails when the
+# expiry passes or when an ignored advisory is no longer reported (stale).
+#
+# EXPIRES: 2026-11-09  (start of audit phase A; re-decide, do not renew by reflex)
+#
+# BLOCKER: candle-core requires zip ^7.2 (0.10.x) and ^8.6 (0.11.0); the fix is
+# zip >= 9.0.0, which no published candle release accepts yet.
+#
+# zip is compiled only with the optional `transformer` feature (mem-index, via
+# the gateway / corpus / ingest / query / mcp features). candle uses it to read
+# .npz and .pth archives by entry name and to write .npz; nothing in candle-core,
+# candle-nn or candle-transformers calls `extract`, and this repo loads
+# model.safetensors. Approved by the owner 2026-10-23.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0367", # not reachable: setuid/setgid bits kept by zip extract(); no extract() caller in the graph
+    "RUSTSEC-2026-0368", # not reachable: extract() symlink target outside the destination; no extract() caller in the graph
+    "RUSTSEC-2026-0369", # not reachable: extract() applies permissions through symlinks; no extract() caller in the graph
+]
