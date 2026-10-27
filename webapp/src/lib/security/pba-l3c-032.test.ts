@@ -41,6 +41,18 @@ describe("PBA-L3c-032 — BYOM connect token", () => {
     expect(claims.sub).toBe("did:citrate:mallory");
   });
 
+  it("mints a short-lived token: exp - iat is exactly 15 minutes", async () => {
+    process.env.MEM_CONNECT_SECRET = "test-secret";
+    const { POST } = await import("../../app/api/orgs/[org]/connect/token/route");
+    const res = await POST(new Request(url, { method: "POST", headers: auth("did:citrate:alice") }), params);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { token: string; ttlMinutes: number };
+    const claims = decodeJwt(body.token);
+    expect(typeof claims.iat).toBe("number");
+    expect((claims.exp as number) - (claims.iat as number), "connect token lifetime").toBe(15 * 60);
+    expect(body.ttlMinutes).toBe(15);
+  });
+
   it("mints a write-capable (`read,propose`) token only on explicit opt-in", async () => {
     process.env.MEM_CONNECT_SECRET = "test-secret";
     const { POST } = await import("../../app/api/orgs/[org]/connect/token/route");
