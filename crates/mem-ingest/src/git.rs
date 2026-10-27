@@ -355,4 +355,17 @@ mod tests {
         // Subjects are populated.
         assert!(!commits[0].subject.is_empty());
     }
+
+    /// A record whose leading field is not a 40-hex sha is a hard error, never
+    /// a parsed commit.
+    #[test]
+    fn record_without_a_sha_is_rejected() {
+        let us = '\u{1f}';
+        let good = format!("{}{us}{us}alice{us}1{us}subject{us}body\u{0}", "a".repeat(40));
+        assert_eq!(parse_commit_log(&good).unwrap().len(), 1, "control: a well-formed record parses");
+        let bad = format!("not-a-sha{us}{us}alice{us}1{us}subject{us}body\u{0}");
+        assert!(parse_commit_log(&bad).is_err(), "a non-sha leading field must be rejected");
+        let upper = format!("{}{us}{us}alice{us}1{us}subject{us}body\u{0}", "A".repeat(40));
+        assert!(parse_commit_log(&upper).is_err(), "only lowercase hex is a sha");
+    }
 }
