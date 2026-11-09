@@ -4,20 +4,14 @@
 # scripts/check_audit_ignores.py runs in the CI audit step and fails when the
 # expiry passes or when an ignored advisory is no longer reported (stale).
 #
-# EXPIRES: 2026-11-09  (start of audit phase A; re-decide, do not renew by reflex)
+# 2026-11-08: empty. The zip extract() advisories RUSTSEC-2026-0367/-0368/-0369
+# (accepted 2026-10-23, expiring 2026-11-09) and RUSTSEC-2026-0429 are FIXED, not
+# renewed: candle 0.11.1 accepts zip ^9.1.3, which removed the blocker (candle
+# 0.10.x pinned zip ^7.2). mem-index now uses candle-core/-nn/-transformers 0.11.1
+# and tokenizers 0.23 (unified with candle's), and the lockfile resolves zip 9.5.0.
 #
-# BLOCKER: candle-core requires zip ^7.2 (0.10.x) and ^8.6 (0.11.0); the fix is
-# zip >= 9.0.0, which no published candle release accepts yet.
-#
-# zip is compiled only with the optional `transformer` feature (mem-index, via
-# the gateway / corpus / ingest / query / mcp features). candle uses it to read
-# .npz and .pth archives by entry name and to write .npz; nothing in candle-core,
-# candle-nn or candle-transformers calls `extract`, and this repo loads
-# model.safetensors. Approved by the owner 2026-10-23.
+# A new entry needs: the advisory id, why it is not reachable or not fixable, the
+# blocker, the owner's approval, and an EXPIRES date. Do not renew by reflex.
 
 [advisories]
-ignore = [
-    "RUSTSEC-2026-0367", # not reachable: setuid/setgid bits kept by zip extract(); no extract() caller in the graph
-    "RUSTSEC-2026-0368", # not reachable: extract() symlink target outside the destination; no extract() caller in the graph
-    "RUSTSEC-2026-0369", # not reachable: extract() applies permissions through symlinks; no extract() caller in the graph
-]
+ignore = []

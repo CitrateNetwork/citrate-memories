@@ -340,7 +340,7 @@ pub fn import_corpus_with(
             .vectors
             .as_ref()
             .filter(|v| vectors_match(v, embedder, weights_sha256))
-            .and_then(|v| corpus.vectors.get(&entry.tenant).map(|b| (v, b)));
+            .zip(corpus.vectors.get(&entry.tenant));
         let mut done = 0usize;
         for batch in bundle.nodes.chunks(IMPORT_BATCH) {
             let mut nodes = Vec::with_capacity(batch.len());
