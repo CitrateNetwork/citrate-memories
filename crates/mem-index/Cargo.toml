@@ -14,13 +14,13 @@ blake3.workspace = true
 # WP-0.4b transformer embedder (feature `transformer`): candle BERT + HF tokenizer.
 # Off by default so the baseline build stays pure-Rust and dependency-light; the
 # HashingEmbedder remains the no-deps fallback.
-candle-core = { version = "0.10", optional = true }
-candle-nn = { version = "0.10", optional = true }
-candle-transformers = { version = "0.10", optional = true }
+candle-core = { version = "0.11.1", optional = true }
+candle-nn = { version = "0.11.1", optional = true }
+candle-transformers = { version = "0.11.1", optional = true }
 # Match the version + `onig` backend candle-core already pulls in (its tokenizers
 # dep is hard + onig-only), so the two unify to a single compiled crate instead of
 # duplicating tokenizers.
-tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 hf-hub = { version = "0.4", optional = true }
 serde_json = { workspace = true, optional = true }
 
