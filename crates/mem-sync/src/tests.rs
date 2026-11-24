@@ -1111,3 +1111,33 @@ fn tripwire_rule8_no_unwrap_or_expect_in_workspace_production_sources() {
     }
     assert!(hits.is_empty(), "Rule 8: unwrap/expect in production source:\n{}", hits.join("\n"));
 }
+
+/// Per-item signature checks also cover Asserted EDGES on both merge paths
+/// (plain edges and load-bearing supersessions): an edge re-pointed after
+/// signing is rejected and changes nothing, even under a valid write grant.
+#[test]
+fn tampered_asserted_edges_are_rejected_per_item() {
+    let signer = Asserter::new(SigningKey::from_bytes(&[5u8; 32]));
+    let a = signer.assert_node("r", NodeKind::Rationale, "claim a", 1);
+    let b = signer.assert_node("r", NodeKind::Rationale, "claim b", 2);
+    let c = signer.assert_node("r", NodeKind::Rationale, "claim c", 3);
+    let dst = store();
+    for n in [&a, &b, &c] {
+        dst.put_node(n).unwrap();
+    }
+    let (aid, bid, cid) = (a.compute_id(), b.compute_id(), c.compute_id());
+
+    let mut plain = signer.assert_edge(aid, bid, EdgeKind::References, 4);
+    plain.to = cid; // re-pointed after signing
+    let mut sup = signer.assert_edge(bid, aid, EdgeKind::Supersedes, 5);
+    sup.quarantined = false;
+    sup.to = cid; // re-pointed after signing
+    let bundle = SyncBundle { repo: "r".into(), exported_at_ms: 1, nodes: vec![], edges: vec![plain, sup] };
+    let out = crate::merge_bundle(&dst, &bundle, &grant_for(&["r"], true), &trust_root(), 100).unwrap();
+    assert_eq!(out.rejected_signatures, 2, "both tampered edges rejected: {out:?}");
+    assert_eq!(out.edges_added, 0);
+    assert_eq!(out.superseded, 0);
+    assert!(dst.out_edges(&aid).unwrap().is_empty());
+    assert!(dst.out_edges(&bid).unwrap().is_empty());
+    assert_eq!(dst.get_node(&cid).unwrap().unwrap().status, Status::Active, "target not superseded");
+}
