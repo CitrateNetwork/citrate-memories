@@ -97,6 +97,8 @@ jobs:
   # citrate-core's client, PBA-L7b-004) only compiles and runs on Windows.
   windows-mem-mcp:
     runs-on: windows-2022
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
