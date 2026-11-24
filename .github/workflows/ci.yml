@@ -42,6 +42,57 @@ jobs:
           cargo clippy -p mem-gateway --features server --all-targets -- -D warnings
           cargo clippy -p mem-sync --features http --all-targets -- -D warnings
 
+  bge-golden:
+    # The bge-base-en-v1.5 golden test (crates/mem-index/tests/bge_golden.rs):
+    # token ids must match the candle 0.10.2 fixture exactly, and each vector
+    # within cosine >= 0.99999 and max abs diff <= 1e-5, or stored indexes would
+    # need a re-embed. It needs the real weights, so it is #[ignore]d in the
+    # workspace run and runs here with --include-ignored, after the pinned
+    # tarball's sha256 is checked. Also clippy for the `transformer` feature,
+    # which no other job builds. Both CPU paths: x86_64 (AVX2) and aarch64
+    # (NEON); the fixture is the x86_64 Linux dump, and aarch64 is within the
+    # same tolerance of it (measured 2.6e-7 max abs diff).
+    name: bge-golden (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      # bge-base-en-v1.5.tar.gz on CitrateNetwork/citrate-core `runtime-deps`
+      # (HF snapshot a5beb1e3), the bytes citrate-core bundles.
+      BGE_SHA256: cea05ebe680cf315e41c965caec9d8e009dd9085b622d4cb9c62fe4faf026c3b
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Fetch the pinned bge-base-en-v1.5 weights (sha256 verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download runtime-deps -R CitrateNetwork/citrate-core \
+            -p bge-base-en-v1.5.tar.gz -D "$RUNNER_TEMP"
+          echo "$BGE_SHA256  $RUNNER_TEMP/bge-base-en-v1.5.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/bge-base-en-v1.5.tar.gz" -C "$RUNNER_TEMP"
+          echo "CITRATE_BGE_MODEL_DIR=$RUNNER_TEMP/bge-base-en-v1.5" >> "$GITHUB_ENV"
+      - name: clippy -D warnings (mem-index transformer)
+        run: cargo clippy -p mem-index --features transformer --all-targets --locked -- -D warnings
+      - name: bge golden test (and the bge end-to-end test)
+        run: |
+          set -euo pipefail
+          cargo test -p mem-index --features transformer --release --locked \
+            -- --include-ignored --show-output 2>&1 | tee "$RUNNER_TEMP/bge-test.log"
+          # Fail if the golden test was filtered out or skipped instead of run.
+          grep -q "test bge_embeddings_match_candle_0_10_2_golden ... ok" "$RUNNER_TEMP/bge-test.log"
+          grep -q "test transformer::tests::bge_base_end_to_end ... ok" "$RUNNER_TEMP/bge-test.log"
+
   cargo-audit:
     # MEM-B-015: fail the build on a known-vulnerable dependency (RUSTSEC). The
     # gateway's h2/hyper HTTP listener is unauthenticated at the framing layer, so

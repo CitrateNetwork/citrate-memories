@@ -132,13 +132,20 @@ impl TransformerEmbedder {
         })
     }
 
-    /// Tokenize, run the forward pass, CLS-pool, and L2-normalise.
-    fn embed_inner(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+    /// The token ids [`embed`](Embedder::embed) feeds the model for `text`:
+    /// `[CLS]`/`[SEP]` added and truncated to 512 tokens. Public so the bge
+    /// golden test can pin tokenization exactly across dependency upgrades.
+    pub fn token_ids(&self, text: &str) -> Result<Vec<u32>, EmbedError> {
         let encoding = self
             .tokenizer
             .encode(text, true)
             .map_err(|e| EmbedError::Tokenize(e.to_string()))?;
-        let ids = encoding.get_ids();
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Tokenize, run the forward pass, CLS-pool, and L2-normalise.
+    fn embed_inner(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        let ids = self.token_ids(text)?;
         if ids.is_empty() {
             // No tokens (e.g. empty/whitespace input): a zero vector is the
             // well-defined "no signal" embedding (matches the hashing baseline).
@@ -147,7 +154,7 @@ impl TransformerEmbedder {
 
         let to_inf = |e: candle_core::Error| EmbedError::Inference(e.to_string());
         // [1, seq]
-        let input_ids = Tensor::new(ids, &self.device)
+        let input_ids = Tensor::new(ids.as_slice(), &self.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(to_inf)?;
         let token_type_ids = input_ids.zeros_like().map_err(to_inf)?;
