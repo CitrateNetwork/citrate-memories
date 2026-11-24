@@ -30,8 +30,10 @@
 use serde_json::Value;
 
 /// Minimum cosine similarity between the fixture vector and the current one.
+#[cfg(feature = "transformer")]
 const MIN_COSINE: f64 = 0.99999;
 /// Maximum absolute difference of any single component.
+#[cfg(feature = "transformer")]
 const MAX_ABS_DIFF: f32 = 1e-5;
 /// bge-base-en-v1.5 hidden size.
 const DIM: usize = 768;
@@ -51,10 +53,9 @@ fn vector(entry: &Value) -> Vec<f32> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digit"))
         .collect();
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    // The length check above makes the remainder empty.
+    let (words, _) = bytes.as_chunks::<4>();
+    words.iter().map(|w| f32::from_le_bytes(*w)).collect()
 }
 
 fn ids(entry: &Value) -> Vec<u32> {
