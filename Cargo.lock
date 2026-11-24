@@ -1881,6 +1881,7 @@ dependencies = [
  "mem-query",
  "mem-store",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

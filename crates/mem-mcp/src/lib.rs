@@ -1035,19 +1035,28 @@ fn node_kind_from_str(s: &str) -> NodeKind {
 /// The daemon and every client must derive the same [`Name`] from the same
 /// positional `<sock-path>` argument, or the two ends bind/connect different
 /// endpoints and IPC silently breaks. The rule is fixed and MUST match the
-/// citrate-core client byte-for-byte:
+/// citrate-core client (`src-tauri/src/ipc_name.rs`) byte-for-byte:
 ///
 /// - **Unix**: the filesystem path `p` is used unchanged (`GenericFilePath`), so
 ///   the endpoint is the exact same Unix domain socket file as the old
 ///   `std::os::unix::net::UnixListener::bind(p)` — on-wire identical to before.
-/// - **Windows**: named pipes are not filesystem paths, so the endpoint is the
-///   *basename* of `p` (`GenericNamespaced`) with every character outside
-///   `[A-Za-z0-9._-]` replaced by `-`. e.g. `".../memory/memdag.sock"` →
-///   `"memdag.sock"`.
+/// - **Windows**: a per-user, per-install namespaced pipe (citrate-core
+///   PBA-L7b-004): `citrate-<hex(sha256("citrate/ipc-pipe/v1" || p || NUL ||
+///   nonce))[..32]>-<slug>`, where `nonce` is the 32 bytes in `<p>.pipe-nonce`
+///   and `slug` is the basename of `p` with every character outside
+///   `[A-Za-z0-9._-]` replaced by `-`. See [`windows_pipe_name`] and
+///   [`pipe_nonce`].
+///
+/// Until this matched, the daemon bound the bare slug (`memdag.sock`) on Windows
+/// while citrate-core connected to the per-install name, so the app never reached
+/// the memory daemon there (the defect citrate-comms fixed in its #24).
 pub mod endpoint {
     use interprocess::local_socket::prelude::*;
     use interprocess::local_socket::Name;
-    use std::io;
+    use std::io::{self, Read, Write};
+
+    /// The length of the per-install pipe nonce (citrate-core `ipc_name::PIPE_NONCE_LEN`).
+    pub const PIPE_NONCE_LEN: usize = 32;
 
     /// Derive the platform-appropriate local-socket [`Name`] for `p` (see the
     /// [module docs](self) for the exact rule).
@@ -1060,15 +1069,124 @@ pub mod endpoint {
         #[cfg(windows)]
         {
             use interprocess::local_socket::GenericNamespaced;
-            let base = std::path::Path::new(p)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("citrate.sock");
-            let slug: String = base
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
-                .collect();
-            slug.to_ns_name::<GenericNamespaced>()
+            let nonce = pipe_nonce(p)?;
+            windows_pipe_name(p, &nonce).to_ns_name::<GenericNamespaced>()
+        }
+    }
+
+    /// PBA-L7b-004: the Windows pipe name for endpoint path `p` and per-install
+    /// `nonce`. Pure, and unit-tested on every platform against citrate-core's
+    /// golden vector. MUST stay byte-identical to citrate-core
+    /// `ipc_name::windows_pipe_name`.
+    pub fn windows_pipe_name(p: &str, nonce: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let base = std::path::Path::new(p)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("citrate.sock");
+        let slug: String = base
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+            .collect();
+        let mut h = Sha256::new();
+        h.update(b"citrate/ipc-pipe/v1");
+        h.update(p.as_bytes());
+        h.update([0u8]);
+        h.update(nonce);
+        let tag = hex::encode(&h.finalize()[..16]);
+        format!("citrate-{tag}-{slug}")
+    }
+
+    /// Read the per-install pipe nonce for `p` from `<p>.pipe-nonce`, creating it
+    /// (32 random bytes, `create_new`) on first use. Whichever end runs first (this
+    /// daemon at bind, or citrate-core at connect) creates it; a concurrent creator
+    /// loses the `create_new` race and reads the winner's bytes, so both ends always
+    /// agree. MUST match citrate-core `ipc_name::pipe_nonce`.
+    pub fn pipe_nonce(p: &str) -> io::Result<[u8; PIPE_NONCE_LEN]> {
+        let path = format!("{p}.pipe-nonce");
+        let read = |path: &str| -> io::Result<[u8; PIPE_NONCE_LEN]> {
+            let mut buf = Vec::with_capacity(PIPE_NONCE_LEN);
+            std::fs::File::open(path)?
+                .take(PIPE_NONCE_LEN as u64 + 1)
+                .read_to_end(&mut buf)?;
+            buf.try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pipe nonce file has the wrong length"))
+        };
+        match read(&path) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            Err(_) => {}
+        }
+        let mut nonce = [0u8; PIPE_NONCE_LEN];
+        getrandom::getrandom(&mut nonce).map_err(|e| io::Error::other(format!("pipe nonce rng: {e}")))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(mut f) => {
+                f.write_all(&nonce)?;
+                Ok(nonce)
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => read(&path),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The vector citrate-core (`ipc_name::tests::pipe_name_matches_comms_golden_vector`)
+        /// and citrate-comms (#24) pin: the same input gives the same name in every repo.
+        #[test]
+        fn pipe_name_matches_citrate_core_golden_vector() {
+            assert_eq!(
+                windows_pipe_name("/tmp/citrate/comms/member.sock", &[0x11u8; 32]),
+                "citrate-5fcf8fcf99579dd1e993f1710d0595c3-member.sock"
+            );
+        }
+
+        /// The memory socket's own name, computed independently (sha256 over the same
+        /// domain-separated input), so a change to the slug or the hash input fails here.
+        #[test]
+        fn memdag_socket_pipe_name_vector() {
+            assert_eq!(
+                windows_pipe_name("/tmp/citrate/memory/memdag.sock", &[0x22u8; 32]),
+                "citrate-77e2966db196095efa4a84860b1ea85d-memdag.sock"
+            );
+        }
+
+        /// Two installs (nonces) and two users (paths) never share a name, and the
+        /// name is never the bare basename the daemon used to bind.
+        #[test]
+        fn pipe_name_is_per_install_and_per_path() {
+            let a = windows_pipe_name("C:\\Users\\a\\memdag.sock", &[1u8; 32]);
+            let b = windows_pipe_name("C:\\Users\\a\\memdag.sock", &[2u8; 32]);
+            let c = windows_pipe_name("C:\\Users\\b\\memdag.sock", &[1u8; 32]);
+            assert_ne!(a, b);
+            assert_ne!(a, c);
+            assert_ne!(a, "memdag.sock");
+            assert!(a.starts_with("citrate-") && a.ends_with("-memdag.sock"), "{a}");
+        }
+
+        /// The nonce is created once, then read back identically; a wrong-length file is refused.
+        #[test]
+        fn pipe_nonce_is_created_once_and_stable() {
+            let dir = std::env::temp_dir().join(format!("mem-mcp-pipe-nonce-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let sock = dir.join("memdag.sock");
+            let p = sock.to_str().unwrap();
+            let first = pipe_nonce(p).unwrap();
+            assert_eq!(pipe_nonce(p).unwrap(), first);
+            assert_eq!(std::fs::read(format!("{p}.pipe-nonce")).unwrap(), first.to_vec());
+            std::fs::write(format!("{p}.pipe-nonce"), [0u8; 5]).unwrap();
+            assert_eq!(pipe_nonce(p).unwrap_err().kind(), io::ErrorKind::InvalidData);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
