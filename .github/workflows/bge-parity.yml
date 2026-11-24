@@ -1,0 +1,104 @@
+name: bge-parity
+
+# Proves that a change to the transformer stack (candle, tokenizers,
+# safetensors) leaves bge-base-en-v1.5 token ids and embeddings unchanged, so
+# stored indexes need no re-embed. The bge_golden_dump example is built and run
+# at the baseline revision (with its own Cargo.lock; this branch's example file
+# is copied in) and at the head, with the pinned weights, then the two dumps
+# are compared by scripts/compare_bge_golden.py.
+#
+# Two architectures, because candle's CPU reductions take different SIMD paths:
+# x86_64 Linux (AVX2, detected at runtime) and aarch64 macOS (NEON).
+#
+# The baseline dumps are uploaded as artifacts. The Linux one is the committed
+# fixture crates/mem-index/tests/fixtures/bge_golden.json (baseline 5aeda317 is
+# candle 0.10.2), which ci.yml's bge-golden job then checks on every push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Baseline revision (default 5aeda317, the candle 0.10.2 lockfile)"
+        required: false
+        default: ""
+  pull_request:
+    paths:
+      - crates/mem-index/Cargo.toml
+      - crates/mem-index/examples/bge_golden_dump.rs
+      - scripts/compare_bge_golden.py
+      - .github/workflows/bge-parity.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bge-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    name: bge-parity (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      BASELINE: ${{ inputs.baseline || '5aeda31723693edf577f0bad238f691586ccde39' }}
+      # bge-base-en-v1.5.tar.gz on CitrateNetwork/citrate-core `runtime-deps`
+      # (HF snapshot a5beb1e3), the same bytes citrate-core bundles.
+      BGE_SHA256: cea05ebe680cf315e41c965caec9d8e009dd9085b622d4cb9c62fe4faf026c3b
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: compare script self-test
+        run: python3 scripts/compare_bge_golden.py --self-test
+      - name: Fetch the pinned bge-base-en-v1.5 weights (sha256 verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download runtime-deps -R CitrateNetwork/citrate-core \
+            -p bge-base-en-v1.5.tar.gz -D "$RUNNER_TEMP"
+          echo "$BGE_SHA256  $RUNNER_TEMP/bge-base-en-v1.5.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/bge-base-en-v1.5.tar.gz" -C "$RUNNER_TEMP"
+          echo "CITRATE_BGE_MODEL_DIR=$RUNNER_TEMP/bge-base-en-v1.5" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/bge-out"
+      - name: Dump at the baseline
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/baseline" "$BASELINE"
+          mkdir -p "$RUNNER_TEMP/baseline/crates/mem-index/examples"
+          cp crates/mem-index/examples/bge_golden_dump.rs "$RUNNER_TEMP/baseline/crates/mem-index/examples/"
+          cd "$RUNNER_TEMP/baseline"
+          candle=$(grep -A1 '^name = "candle-core"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          cargo run --locked --release -p mem-index --features transformer \
+            --example bge_golden_dump -- "$RUNNER_TEMP/bge-out/baseline.json" \
+            "candle-core $candle @ $(git rev-parse --short=8 HEAD)"
+      - name: Dump at the head
+        run: |
+          set -euo pipefail
+          candle=$(grep -A1 '^name = "candle-core"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          cargo run --locked --release -p mem-index --features transformer \
+            --example bge_golden_dump -- "$RUNNER_TEMP/bge-out/head.json" \
+            "candle-core $candle @ $(git rev-parse --short=8 HEAD)"
+      - name: Compare head against the baseline
+        run: |
+          python3 scripts/compare_bge_golden.py \
+            "$RUNNER_TEMP/bge-out/baseline.json" "$RUNNER_TEMP/bge-out/head.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload the dumps
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bge-golden-${{ matrix.os }}
+          path: ${{ runner.temp }}/bge-out/
+          if-no-files-found: warn
+          retention-days: 30

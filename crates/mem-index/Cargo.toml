@@ -41,3 +41,12 @@ transformer = [
     "dep:serde_json",
 ]
 
+[dev-dependencies]
+# tests/bge_golden.rs reads its JSON fixture.
+serde_json.workspace = true
+
+# Writes the bge golden fixture (tests/fixtures/bge_golden.json); the bge-parity
+# workflow runs it at the baseline revision and at the head.
+[[example]]
+name = "bge_golden_dump"
+required-features = ["transformer"]
