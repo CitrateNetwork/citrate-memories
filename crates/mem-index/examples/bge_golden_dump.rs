@@ -92,7 +92,7 @@ fn hex_f32le(v: &[f32]) -> String {
     s
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
     let out = PathBuf::from(
         args.next()
