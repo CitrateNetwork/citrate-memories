@@ -14,13 +14,19 @@ blake3.workspace = true
 # WP-0.4b transformer embedder (feature `transformer`): candle BERT + HF tokenizer.
 # Off by default so the baseline build stays pure-Rust and dependency-light; the
 # HashingEmbedder remains the no-deps fallback.
-candle-core = { version = "0.10", optional = true }
-candle-nn = { version = "0.10", optional = true }
-candle-transformers = { version = "0.10", optional = true }
-# Match the version + `onig` backend candle-core already pulls in (its tokenizers
-# dep is hard + onig-only), so the two unify to a single compiled crate instead of
-# duplicating tokenizers.
-tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+candle-core = { version = "0.11.1", optional = true }
+candle-nn = { version = "0.11.1", optional = true }
+candle-transformers = { version = "0.11.1", optional = true }
+# Match the version + regex backend candle-core already pulls in. candle-core
+# 0.11 has a hard `tokenizers ^0.23.1` dep with default features off and only
+# `fancy-regex`, so asking for the same set unifies to one compiled tokenizers
+# with one regex backend (asking for `onig` as 0.10 did would compile both:
+# onig shadows fancy-regex inside tokenizers, and the C oniguruma build comes
+# back). bge's tokenizer.json never reaches the regex backend: its pipeline is
+# BertNormalizer, BertPreTokenizer (char-class splitting, no regex), WordPiece
+# and a TemplateProcessing [CLS]/[SEP] post-processor. The bge golden test
+# (tests/bge_golden.rs) pins the token ids exactly.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"], optional = true }
 hf-hub = { version = "0.4", optional = true }
 serde_json = { workspace = true, optional = true }
 
@@ -34,3 +40,13 @@ transformer = [
     "dep:hf-hub",
     "dep:serde_json",
 ]
+
+[dev-dependencies]
+# tests/bge_golden.rs reads its JSON fixture.
+serde_json.workspace = true
+
+# Writes the bge golden fixture (tests/fixtures/bge_golden.json); the bge-parity
+# workflow runs it at the baseline revision and at the head.
+[[example]]
+name = "bge_golden_dump"
+required-features = ["transformer"]
