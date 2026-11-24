@@ -93,6 +93,21 @@ jobs:
           grep -q "test bge_embeddings_match_candle_0_10_2_golden ... ok" "$RUNNER_TEMP/bge-test.log"
           grep -q "test transformer::tests::bge_base_end_to_end ... ok" "$RUNNER_TEMP/bge-test.log"
 
+  # The Windows IPC transport (a named pipe whose per-install name must match
+  # citrate-core's client, PBA-L7b-004) only compiles and runs on Windows.
+  windows-mem-mcp:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: clippy -D warnings (mem-mcp, Windows)
+        run: cargo clippy -p mem-mcp --all-targets --locked -- -D warnings
+      - name: cargo test (mem-mcp, Windows)
+        run: cargo test -p mem-mcp --locked
+
   cargo-audit:
     # MEM-B-015: fail the build on a known-vulnerable dependency (RUSTSEC). The
     # gateway's h2/hyper HTTP listener is unauthenticated at the framing layer, so
