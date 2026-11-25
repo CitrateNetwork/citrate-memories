@@ -30,6 +30,10 @@ getrandom = { workspace = true }
 # On unix the GenericFilePath name is the same filesystem socket path as before,
 # so the on-wire transport is byte-identical to the old std UnixListener.
 interprocess = "2"
+# Windows pipe name (PBA-L7b-004): the per-install name citrate-core's client
+# connects to is a SHA-256 over the socket path and a 32-byte nonce. sha2 is
+# already in the tree (Cargo.lock).
+sha2 = "0.10"
 
 # The store key file is opened without following a link and checked for owner and mode.
 [target.'cfg(unix)'.dependencies]
